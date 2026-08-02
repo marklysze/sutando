@@ -97,6 +97,16 @@ Keys whose name starts with `_` (e.g. `_comment`) are stripped before validation
 
 `src/workspace_default.{py,ts}` (the legacy resolver) now delegates to the loader transparently — existing callers don't need code changes.
 
+The JSON Schema is the source of truth for top-level config keys. After adding,
+removing, or renaming one in `docs/sutando-config.schema.json`, run:
+
+```bash
+python3 scripts/gen-config-key-contract.py
+```
+
+This updates the generated catalogs embedded in both loaders. The test suite
+runs the generator in `--check` mode so hand-edited or stale copies fail CI.
+
 ## Protection layers
 
 The workspace must never end up in commits. Three layers enforce this:

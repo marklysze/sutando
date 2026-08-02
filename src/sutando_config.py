@@ -50,16 +50,18 @@ _LOCAL_FILENAME = "sutando.config.local.json"
 # to teach IDEs strictness for autocomplete; the loader itself stays
 # lenient (warn-only) so users with experimental or scratch keys don't
 # break. Per Mini's review #8 on PR #1395.
+# BEGIN GENERATED CONFIG KEYS — scripts/gen-config-key-contract.py
 _KNOWN_TOP_LEVEL_KEYS = {
     "core",
     "workspace",
     "claude_sutando_config_dir",
     "core_config_dirs",
     "vault",
-    "migrate",
     "bridges",
-    "stand",          # this instance's `Stand:` commit-trailer value
+    "migrate",
+    "stand",
 }
+# END GENERATED CONFIG KEYS
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
 

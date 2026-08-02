@@ -66,6 +66,12 @@ Build, migration, release, test, and repository-maintenance scripts are tooling.
 Tooling may inspect multiple layers but is not part of the runtime dependency
 graph.
 
+When the same finite contract must be embedded in more than one runtime,
+tooling generates those runtime declarations from one canonical schema and CI
+checks the generated files. `docs/sutando-config.schema.json` owns the top-level
+Sutando config keys; `scripts/gen-config-key-contract.py` publishes that catalog
+into both loaders without adding a runtime dependency on repository docs.
+
 ### Workspace
 
 The resolved `workspace/` is mutable user state, not product code. Its layout and
