@@ -147,6 +147,12 @@ and retain only provider-specific delivery. For example,
 crash, while Discord, Slack, and Telegram decide how the recovered result is
 sent. Copying the filesystem state machine into each adapter is not permitted.
 
+Monthly task/result archival is part of that same protocol. The shared
+`task_archive.archive_file` operation owns destination selection and the
+established failed-move cleanup rule. Adapters inject their archive roots and
+provider-specific error logger rather than rebuilding the path/move/unlink
+sequence.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known

@@ -87,7 +87,7 @@ try:
 except Exception:  # pragma: no cover — best-effort telemetry
     def _emit_channel(*_a, **_k):  # type: ignore
         return None
-from task_archive import find_task_file  # noqa: E402
+from task_archive import archive_file as _archive_file_shared, find_task_file  # noqa: E402
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task  # noqa: E402
 from discord_addressee import is_addressed_in_shared_channel  # noqa: E402  # pragma: no cover — bridge not unit-imported; addressee logic is covered in discord_addressee.py
 from reply_chain import format_reply_chain, format_reply_chain_ids, format_reply_chain_truncation, walk_reply_chain  # noqa: E402  # pragma: no cover — bridge not unit-imported; chain formatting is covered in reply_chain.py
@@ -346,34 +346,18 @@ def write_owner_activity(channel: str, summary: str, channel_id=None) -> None:
     )
 
 
-def archive_path(kind: str, task_id: str) -> "Path":
-    """Return archive destination for a task or result file, partitioned by
-    year-month so the archive stays browsable.
-
-    kind: "tasks" or "results". task_id: e.g. "task-1776538911450"."""
-    from datetime import datetime
-    ym = datetime.now().strftime("%Y-%m")
-    base = ARCHIVE_TASKS_DIR if kind == "tasks" else ARCHIVE_RESULTS_DIR
-    month_dir = base / ym
-    month_dir.mkdir(parents=True, exist_ok=True)
-    return month_dir / f"{task_id}.txt"
-
-
 def archive_file(src: "Path", kind: str, task_id: str) -> None:
-    """Move src into the archive. Silent on failure — archive is for later
-    analysis, not critical path. Chi's 2026-04-18 ask: "instead of deleting
-    we should archive the tasks. It can be useful for self-improving"."""
-    try:
-        if src.exists():
-            import shutil
-            shutil.move(str(src), str(archive_path(kind, task_id)))
-    except Exception as e:
-        print(f"  archive_file({kind}, {task_id}) failed: {e}", flush=True)
-        # Fall back to unlink so we don't leave stale files.
-        try:
-            src.unlink(missing_ok=True)
-        except Exception:
-            pass
+    """Archive through the shared task/result filesystem policy."""
+    _archive_file_shared(
+        src,
+        kind,
+        task_id,
+        ARCHIVE_TASKS_DIR,
+        ARCHIVE_RESULTS_DIR,
+        on_error=lambda exc: print(
+            f"  archive_file({kind}, {task_id}) failed: {exc}", flush=True
+        ),
+    )
 
 
 def notify_agent_api_task_done(task_id: str, result: str) -> None:
