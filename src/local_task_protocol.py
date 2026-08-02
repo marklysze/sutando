@@ -1,13 +1,13 @@
 """
-Local Task Protocol — read-side reference implementation.
+Local Task Protocol — canonical task-file parsing and serialization.
 
 Interaction-planes refactor, step 3 (read side). The durable local execution
 boundary: this module names the schema of `tasks/*.txt` files and provides the
 canonical pure functions for reading them. It consolidates parsing that today
 is hand-rolled per consumer (task_priority.py, task-bridge's `_isVoiceTask`,
-each bridge's header scan) so new code imports ONE definition. Writers are
-deliberately untouched in this phase — the write-side switch happens per
-bridge, later, with byte-identical golden tests.
+each bridge's header scan) so new code imports ONE definition. Writers migrate
+to :func:`serialize_task` one producer at a time, with byte-identical golden
+tests so field order and task bodies cannot drift.
 
 The result-body half of the protocol already lives in `src/result_markers.py`
 (#873) and stays there; this module is the TASK-file half plus shared schema
@@ -57,7 +57,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Tuple
 
 # ── Schema constants ─────────────────────────────────────────────────────────
 
@@ -158,6 +158,32 @@ def valid_archive_lookup_id(tid: str) -> bool:
     sentinels and path separators.
     """
     return bool(ARCHIVE_LOOKUP_ID_RE.match(tid or "")) and tid not in (".", "..")
+
+
+# ── Canonical task-last serialization ───────────────────────────────────────
+
+def serialize_task(headers: Iterable[Tuple[str, object]], task: str) -> str:
+    """Serialize a trusted-header, task-last Local Task Protocol record.
+
+    ``headers`` is ordered so each producer's established byte order stays
+    explicit during migration. Header names must be protocol vocabulary and
+    values must be one line; untrusted multi-line content belongs only in
+    ``task`` after the trust delimiter.
+    """
+    lines = []
+    seen = set()
+    for key, raw_value in headers:
+        if key == "task" or key not in _KNOWN_KEY_SET:
+            raise ValueError(f"unknown or reserved task header: {key!r}")
+        if key in seen:
+            raise ValueError(f"duplicate task header: {key!r}")
+        value = str(raw_value)
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"task header {key!r} must be one line")
+        seen.add(key)
+        lines.append(f"{key}: {value}\n")
+    lines.append(f"task: {task}\n")
+    return "".join(lines)
 
 
 # ── Header parsing ───────────────────────────────────────────────────────────

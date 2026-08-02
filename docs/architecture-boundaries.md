@@ -153,6 +153,13 @@ established failed-move cleanup rule. Adapters inject their archive roots and
 provider-specific error logger rather than rebuilding the path/move/unlink
 sequence.
 
+Task-file serialization is likewise a protocol operation, not presentation
+logic. New and migrated task-last producers use
+`local_task_protocol.serialize_task`, keeping trusted one-line metadata before
+the `task:` trust delimiter and all untrusted multi-line content after it.
+Producers migrate one at a time behind byte-identical golden tests; existing
+task-mid adapters remain supported until their individual migration lands.
+
 ## Current repository classification
 
 This is the ownership intent for today's paths. Several rows contain known

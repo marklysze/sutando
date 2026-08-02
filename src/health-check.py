@@ -45,6 +45,7 @@ from util_paths import _host_label, claude_home_path, shared_personal_path  # no
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_config import resolve_core_runtime  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
+from local_task_protocol import serialize_task  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -4616,16 +4617,18 @@ def emit_task_for_failures(checks: list[dict], state_file: Optional[Path] = None
     # external data. Consistent with the bridge field-order convention.
     ts_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     bullet_str = "\n".join(f"- {c['name']}: {c['status']} ({c['detail']})" for c in failures)
-    body = (
-        f"id: task-health-{now_ms}\n"
-        f"timestamp: {ts_iso}\n"
-        f"source: health-check\n"
-        f"interaction_type: system_event\n"
-        f"user_id: health-check\n"
-        f"access_tier: owner\n"
-        f"priority: low\n"
-        f"task: Health check found issues. Decide whether to restart, DM owner, or treat as transient:\n"
-        f"{bullet_str}\n"
+    body = serialize_task(
+        (
+            ("id", f"task-health-{now_ms}"),
+            ("timestamp", ts_iso),
+            ("source", "health-check"),
+            ("interaction_type", "system_event"),
+            ("user_id", "health-check"),
+            ("access_tier", "owner"),
+            ("priority", "low"),
+        ),
+        "Health check found issues. Decide whether to restart, DM owner, "
+        f"or treat as transient:\n{bullet_str}",
     )
     task_path = tasks_dir / f"task-health-{now_ms}.txt"
     task_path.write_text(body)
