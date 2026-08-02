@@ -301,3 +301,39 @@ describe('web-voice-transport audioContext accessor', () => {
 		assert.equal(t.audioContext, null, 'surfaces must re-read, never cache across a disconnect');
 	});
 });
+
+describe('web-voice-transport mic mute', () => {
+	const fakeStream = (n = 2) => {
+		const tracks = Array.from({ length: n }, () => ({ enabled: true, stop() {} }));
+		return { getAudioTracks: () => tracks, _tracks: tracks };
+	};
+
+	it('mutes by DISABLING tracks, not stopping them', () => {
+		// Stopping the stream would drop the permission grant on some browsers,
+		// turning unmute into a second getUserMedia prompt. web-client disables;
+		// so must this.
+		const t = new VoiceTransport({});
+		const s = fakeStream();
+		(t as any).micStream = s;
+
+		assert.equal(t.setMicMuted(true), true);
+		assert.deepEqual(s._tracks.map(x => x.enabled), [false, false]);
+		assert.equal(t.micMuted, true);
+	});
+
+	it('unmutes symmetrically', () => {
+		const t = new VoiceTransport({});
+		const s = fakeStream();
+		(t as any).micStream = s;
+		t.setMicMuted(true);
+		t.setMicMuted(false);
+		assert.deepEqual(s._tracks.map(x => x.enabled), [true, true]);
+		assert.equal(t.micMuted, false);
+	});
+
+	it('reports false with no live stream, so the UI can leave its button alone', () => {
+		const t = new VoiceTransport({});
+		assert.equal(t.setMicMuted(true), false);
+		assert.equal(t.micMuted, false, 'no stream is not "muted" — it is "no session"');
+	});
+});

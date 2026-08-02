@@ -442,6 +442,32 @@ export class VoiceTransport {
     silence.connect(ctx.destination);
   }
 
+  /**
+   * Mute or unmute capture by disabling the mic tracks.
+   *
+   * Disabling tracks, rather than tearing the stream down, is what web-client
+   * does today and the distinction matters: the session stays open, the
+   * capture graph stays wired, and unmuting is instant with no getUserMedia
+   * re-prompt. Stopping the stream would drop the mic permission grant on some
+   * browsers and make unmute a second permission dialog.
+   *
+   * Returns false when there is no live stream, so the surface can leave its
+   * button state alone rather than showing "Muted" over a dead session.
+   */
+  setMicMuted(muted: boolean): boolean {
+    if (!this.micStream) return false;
+    this.micStream.getAudioTracks().forEach((t) => {
+      t.enabled = !muted;
+    });
+    return true;
+  }
+
+  /** True when a live stream exists and every audio track is disabled. */
+  get micMuted(): boolean {
+    const tracks = this.micStream?.getAudioTracks() ?? [];
+    return tracks.length > 0 && tracks.every((t) => !t.enabled);
+  }
+
   private stopMic(): void {
     if (this.processor) {
       try {
