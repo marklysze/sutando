@@ -79,6 +79,10 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import recover_orphan_sending_files  # noqa: E402
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
+from discord_task import (  # noqa: E402
+    build_task_content as _build_discord_task_content,
+    select_rulebook_key as _select_discord_rulebook_key,
+)
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -2620,7 +2624,7 @@ def select_rulebook_key(access_tier, is_collaborator):
     existing team consumer is unchanged, and only the in-band rulebook (the
     enforcement surface the core agent follows) swaps.
     """
-    return "team-collaborator" if is_collaborator else access_tier
+    return _select_discord_rulebook_key(access_tier, is_collaborator)
 
 
 async def _handle_restart_command(message, text, access_tier, username, workspace) -> bool:
@@ -3755,32 +3759,23 @@ async def _handle_discord_message(message, force=False):
         # try, so a failure in this f-string build is logged as a FAILED
         # line (see the instrumentation note above) instead of raising
         # before the logging is reached.
-        # Collaborators keep `access_tier: team` (so every existing team consumer —
-        # priority, progress-streamer, dedup — behaves exactly as before) and get an
-        # orthogonal `collaborator: true` marker plus the engage rulebook. The
-        # rulebook is the in-band enforcement surface the core agent follows, so
-        # swapping it is what actually changes handling.
-        collaborator_line = "collaborator: true\n" if is_collaborator else ""
-        rulebook_key = select_rulebook_key(access_tier, is_collaborator)
-        return (
-            f"id: {task_id}\n"
-            f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-            f"source: discord\n"
-            f"interaction_type: message\n"
-            f"{media_headers}"
-            f"channel_id: {message.channel.id}\n"
-            f"channel_name: {channel_name}\n"
-            f"guild_name: {guild_name}\n"
-            f"source_message_id: {message.id}\n"
-            f"{parent_msg_line}"
-            f"user_id: {message.author.id}\n"
-            f"access_tier: {access_tier}\n"
-            f"{collaborator_line}"
-            f"priority: {priority}\n"
-            f"task: {user_task_text}\n"
-            f"{tier_instructions.get(rulebook_key, tier_instructions['other'])}"
-            f"{discord_skill_hints}"
-            f"{secret_notice}"
+        return _build_discord_task_content(
+            task_id=task_id,
+            timestamp=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            media_headers=media_headers,
+            channel_id=message.channel.id,
+            channel_name=channel_name,
+            guild_name=guild_name,
+            source_message_id=message.id,
+            parent_headers=parent_msg_line,
+            user_id=message.author.id,
+            access_tier=access_tier,
+            is_collaborator=is_collaborator,
+            priority=priority,
+            user_task_text=user_task_text,
+            tier_instructions=tier_instructions,
+            skill_hints=discord_skill_hints,
+            secret_notice=secret_notice,
         )
 
     if not _write_task_file(task_file, _build_task_content, username, channel_name,

@@ -205,6 +205,7 @@ def structural() -> list:
     """Guard the inline glue a helper unit test can't reach."""
     fails = []
     src = BRIDGE.read_text()
+    task_src = (REPO / "src" / "discord_task.py").read_text()
 
     # is_collaborator defaults False (fail-closed) before the tier checks.
     if not re.search(r"is_collaborator\s*=\s*False", src):
@@ -220,14 +221,17 @@ def structural() -> list:
     if not re.search(r'elif\s+access_tier\s+in\s+\("team",\s*"other"\)\s+and\s+not\s+is_collaborator\s*:', src):
         fails.append("silent-escalate branch must exclude collaborators (`and not is_collaborator`)")
 
-    # Task-file assembly: rulebook via helper, collaborator marker, wire tier unchanged.
-    if not re.search(r"rulebook_key\s*=\s*select_rulebook_key\(\s*access_tier\s*,\s*is_collaborator", src):
+    # Task-file assembly: handler delegates; pure builder owns the marker,
+    # rulebook selection, and unchanged wire tier.
+    if "_build_discord_task_content(" not in src:
+        fails.append("handler must delegate task-file assembly to discord_task")
+    if not re.search(r"rulebook_key\s*=\s*select_rulebook_key\(\s*access_tier\s*,\s*is_collaborator", task_src):
         fails.append("task-file assembly must set rulebook_key = select_rulebook_key(access_tier, is_collaborator)")
-    if not re.search(r'collaborator_line\s*=\s*"collaborator:\s*true\\n"\s+if\s+is_collaborator', src):
+    if not re.search(r'collaborator_line\s*=\s*"collaborator:\s*true\\n"\s+if\s+is_collaborator', task_src):
         fails.append("task-file assembly must emit a `collaborator: true` marker line when is_collaborator")
-    if not re.search(r"tier_instructions\.get\(\s*rulebook_key", src):
+    if not re.search(r"tier_instructions\.get\(\s*rulebook_key", task_src):
         fails.append("task-file write must look up tier_instructions by rulebook_key")
-    if not re.search(r'f"access_tier:\s*\{access_tier\}\\n"', src):
+    if not re.search(r'f"access_tier:\s*\{access_tier\}\\n"', task_src):
         fails.append("access_tier line must still serialize {access_tier} verbatim (collaborators stay team)")
 
     # The team-collaborator rulebook exists and reasserts the owner-only boundary.

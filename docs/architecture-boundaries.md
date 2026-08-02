@@ -45,6 +45,10 @@ include Discord, Slack, Telegram, Twilio, remote gateways, model providers, and
 OS-specific integrations.
 
 Adapters may depend on the public core API. Core must not import an adapter.
+An adapter's receive handler should orchestrate provider I/O and sequencing;
+deterministic envelope or payload construction belongs in a dependency-light
+adjacent module with exact-output tests. This keeps provider semantics at the
+edge without burying pure construction inside a monolithic event callback.
 
 ### App
 
