@@ -216,6 +216,27 @@ export class VoiceTransport {
   }
 
   /**
+   * The live AudioContext, or null when there is no session.
+   *
+   * READ-ONLY BY CONTRACT: the transport owns this context's lifecycle and
+   * closes it on teardown. Surfaces must not close it or hold it across a
+   * disconnect — re-read the getter instead.
+   *
+   * It is exposed because a surface can legitimately need to make sound on the
+   * SAME context: web-client's `playToolCue` plays short audible cues for tool
+   * calls and deliberately reuses the session context because that one was
+   * created on a user gesture and is therefore already running. A context the
+   * surface created for itself outside a gesture can be born suspended, and
+   * the cue silently would not play — a regression no test would catch, on a
+   * feature that exists by explicit owner request.
+   *
+   * Also read by the debug panel for `state` / `sampleRate`.
+   */
+  get audioContext(): AudioContext | null {
+    return this.audioCtx;
+  }
+
+  /**
    * Open the session. Creates the AudioContext eagerly (call from a user
    * gesture so it isn't born suspended), connects the WS, and starts the mic
    * on open. Rejects only on synchronous setup failure; mic errors surface via

@@ -275,3 +275,29 @@ describe('web-voice-transport send() — surfaces push frames on the same socket
 		assert.equal(t.send({ type: 'text_input' }), false);
 	});
 });
+
+describe('web-voice-transport audioContext accessor', () => {
+	// web-client's playToolCue (owner request 2026-07-09) makes sound on the
+	// SESSION's AudioContext on purpose: that one was created on a user gesture
+	// so it is already running. A context the surface makes for itself outside a
+	// gesture can be born suspended and the cue silently never plays. Exposing
+	// the session context read-only is what lets the surface keep that
+	// behaviour after it stops owning the context.
+	it('is null before a session exists', () => {
+		assert.equal(new VoiceTransport({}).audioContext, null);
+	});
+
+	it('hands back the live context once one exists', () => {
+		const t = new VoiceTransport({});
+		const fake = { state: 'running', sampleRate: 48000 };
+		(t as any).audioCtx = fake;
+		assert.equal(t.audioContext, fake as unknown as AudioContext);
+	});
+
+	it('reports null again after teardown, so a stale context cannot be reused', () => {
+		const t = new VoiceTransport({});
+		(t as any).audioCtx = { state: 'running', close() {} };
+		(t as any).teardownAudio();
+		assert.equal(t.audioContext, null, 'surfaces must re-read, never cache across a disconnect');
+	});
+});
