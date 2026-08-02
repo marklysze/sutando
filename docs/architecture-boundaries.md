@@ -141,6 +141,12 @@ gateway trust-boundary rules, not provider-neutral record-publication mechanics.
 Do not delegate that writer to `src/owner_activity.py` unless those controls and
 their tests move with it.
 
+For ordinary non-secret JSON state without a richer domain writer,
+`atomic_state.write_json` is the persistence primitive: unique per-invocation
+staging, atomic replacement, and failed-stage cleanup. Credential/access state
+keeps its stricter born-private and durability-specific writers; this helper is
+not a reason to weaken those contracts.
+
 ### Shared result-file lifecycle
 
 The task/result filesystem protocol is core infrastructure, including its

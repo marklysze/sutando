@@ -85,6 +85,7 @@ from chat_secret_filter import filter_chat_secrets, secret_handling_instruction 
 from slack_owner import resolve_proactive_owner_id  # noqa: E402
 from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
 from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
+from atomic_state import write_json as _write_atomic_json  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -462,13 +463,14 @@ PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
 
 def _atomic_write_pending_replies(data: dict) -> None:
     """Persist reply routing without exposing a truncated JSON file on crash."""
-    try:
-        PENDING_REPLIES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = PENDING_REPLIES_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(PENDING_REPLIES_FILE)
-    except Exception as e:
-        print(f"  [recovery] could not persist Slack pending replies: {e}", flush=True)
+    _write_atomic_json(
+        PENDING_REPLIES_FILE,
+        data,
+        on_error=lambda exc: print(
+            f"  [recovery] could not persist Slack pending replies: {exc}",
+            flush=True,
+        ),
+    )
 
 
 def load_pending_replies_from_disk() -> dict:

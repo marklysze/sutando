@@ -83,6 +83,7 @@ from discord_task import (  # noqa: E402
     build_task_content as _build_discord_task_content,
     select_rulebook_key as _select_discord_rulebook_key,
 )
+from atomic_state import write_json as _write_atomic_json  # noqa: E402
 
 # Observability: emit channel.discord.<in|out> into the local obs spine
 # (src/observability). Guarded so a missing module never crashes the bridge.
@@ -3847,13 +3848,7 @@ DM_CHECKPOINT_FILE = REPO / "state" / "discord-dm-checkpoint.json"
 
 def _atomic_write_dm_checkpoint(data: dict) -> None:
     """Write JSON atomically — same shape as _atomic_write_pending_replies."""
-    try:
-        DM_CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DM_CHECKPOINT_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(DM_CHECKPOINT_FILE)
-    except Exception:
-        pass
+    _write_atomic_json(DM_CHECKPOINT_FILE, data)
 
 
 def _load_dm_checkpoint() -> dict:
@@ -4072,12 +4067,7 @@ def _atomic_write_pending_replies(data: dict) -> None:
     """Write JSON atomically: tmp + rename. Avoids truncation on mid-write
     crash (rare but real for unattended bridge restarts). Per MacBook's
     review on PR #597."""
-    try:
-        tmp = PENDING_REPLIES_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(PENDING_REPLIES_FILE)
-    except Exception:
-        pass
+    _write_atomic_json(PENDING_REPLIES_FILE, data)
 
 def save_pending_replies():
     """Persist pending_replies channel IDs to disk for crash recovery."""
