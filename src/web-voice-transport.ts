@@ -303,6 +303,31 @@ export class VoiceTransport {
   }
 
   /**
+   * Send a JSON control frame over the live session socket.
+   *
+   * The voice WS is bidirectional: surfaces push frames back to the agent on
+   * the same connection that carries audio — web-client's chat box sends
+   * `{type:'text_input'}` this way. Without this the socket would be
+   * write-only from the transport's side and a surface would have to reach
+   * around it for its own `WebSocket`, which is exactly the inline-copy
+   * coupling this module exists to remove.
+   *
+   * Returns false when there is no OPEN socket rather than throwing: callers
+   * are UI event handlers (a click, a keypress), and a dropped connection is
+   * an ordinary state there, not an exception. The caller decides whether to
+   * warn — silently doing nothing would strand the user's typed message.
+   */
+  send(msg: unknown): boolean {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.ws.send(JSON.stringify(msg));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Stop capture, flush playback, and close the audio graph. Closes the
    * AudioContext IMMEDIATELY (not on a delayed timeout): a deferred close can
    * race a reconnect and kill the freshly-created context. Faithful to

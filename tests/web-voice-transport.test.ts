@@ -241,3 +241,37 @@ describe('web-voice-transport mic-error wording matches the shipped web UI', () 
 		assert.match(classifyMicError('NotFoundError', 'ignored'), /no microphone found/i);
 	});
 });
+
+describe('web-voice-transport send() — surfaces push frames on the same socket', () => {
+	// web-client's chat box does `ws.send(JSON.stringify({type:'text_input'}))`
+	// on the voice socket. Before this existed the surface had to reach around
+	// the transport for its own WebSocket — the exact coupling this module is
+	// meant to remove — so the UI could not switch over without breaking chat.
+	it('serialises and sends when the socket is OPEN', () => {
+		const t = new VoiceTransport({});
+		const sent: string[] = [];
+		(t as any).ws = { readyState: 1, send: (d: string) => sent.push(d) };
+
+		assert.equal(t.send({ type: 'text_input', text: 'hello' }), true);
+		assert.deepEqual(JSON.parse(sent[0]), { type: 'text_input', text: 'hello' });
+	});
+
+	it('returns false rather than throwing when there is no socket', () => {
+		const t = new VoiceTransport({});
+		assert.equal(t.send({ type: 'text_input', text: 'x' }), false);
+	});
+
+	it('returns false when the socket exists but is not OPEN', () => {
+		const t = new VoiceTransport({});
+		(t as any).ws = { readyState: 3, send: () => { throw new Error('closed'); } };
+		assert.equal(t.send({ type: 'ping' }), false);
+	});
+
+	it('reports failure instead of throwing if send() itself throws', () => {
+		const t = new VoiceTransport({});
+		(t as any).ws = { readyState: 1, send: () => { throw new Error('boom'); } };
+		// A UI keypress handler must not explode because the socket died mid-send.
+		assert.doesNotThrow(() => t.send({ type: 'text_input' }));
+		assert.equal(t.send({ type: 'text_input' }), false);
+	});
+});
