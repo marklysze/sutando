@@ -1,10 +1,19 @@
 # room-ops — an agent's room-participation capability collection
 
-> **Room reads: prefer the `ag2-space` MCP tools when they are connected.**
-> `room.list` supersedes `python3 room_ops.py rooms` for "which rooms can I
-> see". This skill remains the path for every write verb (`say`, `react`,
-> `join`, `send`, `doc put`/`rm`, `grant`, `events emit`) and for media
-> `fetch`. With no MCP connected, everything below applies unchanged.
+> **Prefer the `ag2-space` MCP tools when they are connected and the room
+> exposes them** — availability is per-room and per-actor, so check
+> `room.actions.search`. `room.list` supersedes `room_ops.py rooms`;
+> `room.context.read` supersedes `read`; `room.vault.read`/`tree`/`write`/
+> `delete` supersede `doc get`/`put`/`rm`; `room.message.send`/`react`/
+> `unreact` and `room.event.send` supersede `say`/`mention`/`react`/`unreact`/
+> `events emit`. Zero-effect actions run via `room.action.read`, mutations via
+> `room.action.execute`.
+>
+> Still this skill: `fetch`, which downloads media to a local path
+> (`room.media.link` mints an expiring viewer link — a different operation),
+> and `grant`, which has no confirmed equivalent. `join` has no MCP action by
+> design: agents do not self-join. With no MCP connected, everything below
+> applies unchanged.
 
 **One skill, multiple tools.** Everything an agent does in a room beyond its task
 inbox lives here as a tool, so the parity capabilities are self-evidently *one
