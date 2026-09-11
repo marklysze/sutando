@@ -21,6 +21,8 @@ gateway.RESULTS_DIR = root / "results"
 gateway.ARCHIVE_RESULTS_DIR = root / "results" / "archive"
 gateway.LOCAL_TIER = "owner"
 
+assert "question_delivery" in gateway.local_task_protocol.KNOWN_HEADER_KEYS
+
 delivery = {
     "version": 1,
     "delivery_id": "question-delivery-4bd08f",
@@ -48,6 +50,8 @@ task_file = gateway.TASKS_DIR / "task-question-delivery-4bd08f.txt"
 body = task_file.read_text()
 header = next(line for line in body.splitlines() if line.startswith("question_delivery: "))
 assert json.loads(header.split(": ", 1)[1]) == delivery
+parsed = gateway.local_task_protocol.parse_task_headers_trusted(body)
+assert json.loads(parsed.headers["question_delivery"]) == delivery
 assert body.count("access_tier: guest") == 1
 assert "interaction_type: system_event" in body
 

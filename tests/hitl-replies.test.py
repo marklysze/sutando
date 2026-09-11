@@ -91,9 +91,8 @@ class ReplyHandlerTests(unittest.TestCase):
         ):
             with self.subTest(payload=payload):
                 self.assertFalse(self.h.claims(event(payload)))
-                # offer() preserves the handler contract's event-id echo even
-                # for an unclaimed event; HandlerChain consults claims() and
-                # routes this event onward to the backend/ambient path.
+                # The event-id echo remains; HandlerChain checks claims() and
+                # routes the unclaimed event to the backend/ambient path.
                 self.assertEqual(self.h.offer(event(payload)), ["$e1"])
                 self.assertEqual(self.mgr.get(self.req.id).status, "pending")
                 self.assertFalse(list(actions_dir(self.ws).glob("*.json")))

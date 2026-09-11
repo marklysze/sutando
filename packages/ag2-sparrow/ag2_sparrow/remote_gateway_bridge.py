@@ -1727,9 +1727,8 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card",
-                # Backend-owned accepted room-question delivery. This is
-                # correlation data for an ordinary broker task, not local HITL
-                # authority and not an alternative source of access policy.
+                # Backend-owned answer correlation for an ordinary broker task;
+                # never local HITL authority or an alternative access policy.
                 "question_delivery")
 
 # platform_card passes through with exactly these subkeys — a signed pointer
