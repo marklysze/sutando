@@ -127,11 +127,25 @@ def main() -> None:
             "id": "task-proactive", "task": "proactive local work",
             "source": "cron", "user_id": "@qingyun:ag2.space",
         })
-        proactive_headers = parse_task_headers(proactive or "")
+        proactive_headers = parse_task_headers_trusted(proactive or "")
         check("proactive terminal task carries no reply_to source event",
-              proactive_headers.get("source_message_id") is None)
+              proactive is not None
+              and proactive_headers.get("source_message_id") is None)
         check("proactive terminal task carries no thread_root",
-              proactive_headers.get("thread_root") is None)
+              proactive is not None
+              and proactive_headers.get("thread_root") is None)
+
+        contaminated = _drive_gateway_writer(rgb, tmp, {
+            "id": "task-proactive-contaminated", "task": "proactive local work",
+            "source": "cron", "source_message_id": "$leaked",
+            "thread_root": "$leaked-root", "user_id": "@qingyun:ag2.space",
+        })
+        contaminated_headers = parse_task_headers_trusted(contaminated or "")
+        check("CONTROL: trusted parser detects both leaked placement headers",
+              contaminated is not None
+              and (contaminated_headers.get("source_message_id"),
+                   contaminated_headers.get("thread_root"))
+              == ("$leaked", "$leaked-root"))
 
         concurrent_tasks = [
             {"id": "task-concurrent-a", "task": "alpha", "source": "ag2space",
