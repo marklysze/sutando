@@ -225,6 +225,13 @@ one compact-JSON text block). Read `details`, not the prose:
 `recoverable` is **not** the retry signal — `details.dispatch_state` is. An
 `execute` may be re-sent only when `not_dispatched`.
 
+**Sleeping means stop — in chat too.** On `DEVAPP_SLEEPING`, or `room.inspect`
+showing `devapp_app.app_state: sleeping`, do not mention or address the room's
+Dev Agent: no `mention`, no Dev Agent mxid in a `say` / `room.message.send`
+body or in your task result, no asking it to "check", "restart" or "reload"
+the app. A Dev Agent mention queues a task, and that wakes the pod. Tell the
+human the app is sleeping and stop that app task.
+
 **Operation ids.** Every `execute` carries
 `operation_id = sha256(actor + room_id + action + canonical arguments + your task id)`.
 Derived, never random, because a task that dies mid-mutation is re-dispatched
