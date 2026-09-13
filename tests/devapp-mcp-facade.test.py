@@ -42,12 +42,13 @@ except Exception as exc:  # noqa: BLE001 - any import failure means "not availab
 ROOM_A = "!fixture-devapp-a:dev.ag2.space"
 ROOM_B = "!fixture-devapp-b:dev.ag2.space"
 
-# The eight citable façade tools; the ninth is not enumerated in any artifact
-# available here, so nothing below asserts a count of nine.
+# The nine façade tools, from contracts/mcp-facade-v1.schema.json in
+# ag2space-mcp. C0 answer 17 freezes them and adds no public MCP tool.
 FACADE_TOOLS = [
-    "context.current", "room.list", "room.inspect",
+    "ag2.whoami", "room.list", "room.inspect",
     "room.actions.search", "room.actions.describe",
-    "room.action.read", "room.action.execute", "operation.inspect",
+    "room.action.read", "room.action.execute",
+    "operation.inspect", "approval.inspect",
 ]
 
 # A description written by the application, carrying an instruction and a rival
@@ -63,7 +64,7 @@ def body(name):
 
 
 def build_server():
-    """A façade fake: the eight tools above, answering from the C0 samples."""
+    """A façade fake: the nine tools above, answering from the C0 samples."""
     srv = Server("fake-ag2-space")
 
     search_a = body("c0-devapp-actions-search-collision-room-a.response.json")
@@ -157,13 +158,14 @@ def envelope_of(result):
 @unittest.skipUnless(SDK == PINNED_SDK, f"needs mcp=={PINNED_SDK} (have {SDK})")
 class Handshake(unittest.TestCase):
     def test_the_sdk_and_protocol_pin_hold(self):
-        out = Facade().run(lambda call: call("context.current", {"room_id": ROOM_A}))
+        out = Facade().run(lambda call: call("ag2.whoami", {"room_id": ROOM_A}))
         self.assertEqual(out["init"].protocol_version, PINNED_PROTOCOL)
 
     def test_no_app_action_is_exposed_as_a_facade_tool(self):
         """App tools appear only as Action names INSIDE results (C0 answer 17)."""
-        out = Facade().run(lambda call: call("context.current", {"room_id": ROOM_A}))
+        out = Facade().run(lambda call: call("ag2.whoami", {"room_id": ROOM_A}))
         names = [tool.name for tool in out["tools"].tools]
+        self.assertEqual(len(names), 9, "the façade is exactly nine tools")
         self.assertEqual(names, FACADE_TOOLS)
         self.assertFalse([n for n in names if n.startswith("devapp.")],
                          "no devapp.* tool may appear in tools/list")

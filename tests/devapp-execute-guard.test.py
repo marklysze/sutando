@@ -104,7 +104,10 @@ class Matching(Base):
             ["details"]["operation_id"], OP)
 
     def test_non_mcp_and_unrelated_mcp_tools_are_untouched(self):
+        # The other eight façade tools all pass through: only execute is gated.
         for name in ("Bash", "Read", READ, DESCRIBE, SEARCH, INSPECT,
+                     SERVER + "ag2.whoami", SERVER + "approval.inspect",
+                     SERVER + "room.list", SERVER + "room.inspect",
                      "mcp__other__room.action.read"):
             proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": name,
                              "tool_input": {"operation_id": OP}}, self.ledger)
