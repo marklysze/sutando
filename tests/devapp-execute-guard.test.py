@@ -13,7 +13,7 @@ trace is what proves "no second execute" mechanically rather than by prose.
 
 Error shapes are the frozen contract's, loaded from tests/fixtures/devapp-mcp/
 (verbatim C0 samples; digests in that dir's DIGEST file, contract digest
-sha256:425f739caf56ea72293518ffe5db9fcc9f955f943ac6214e4047743fee8eedae).
+sha256:9f191b8da05c352d114febc97166d215bb2369faac05c6179195e7051e285236).
 """
 import json
 import subprocess
@@ -308,23 +308,65 @@ class Traces(Base):
                         "describe precedes the new execute")
 
 
-def inspect_result(status, **extra):
-    """An operation.inspect result in the corrected shape.
+# C0.1 ships a fixture per status except these two, derived below from the real
+# `pending` record with only `status` swapped.
+STATUS_WITHOUT_FIXTURE = {"running", "cancelled"}
 
-    NOT loaded from a vendored fixture: the C0 export at digest
-    sha256:425f739c… still carried the superseded `{operation_id, state}` shape
-    and Backend is re-exporting. This encodes the coordinator's frozen
-    correction — `{"operation": {...}, "correlation_id": …}` with the verdict in
-    `operation.status` — so re-vendoring later can only confirm it.
-    """
-    op = {"operation_id": OP, "status": status}
-    op.update(extra)
-    return {"content": [{"type": "text", "text": json.dumps(
-        {"operation": op, "correlation_id": "corr-1"})}]}
+INSPECT_FIXTURE = {
+    "not_started": "c0-devapp-operation-inspect-not-started.response.json",
+    "pending": "c0-devapp-operation-inspect-pending.response.json",
+    "succeeded": "c0-devapp-operation-inspect-succeeded.response.json",
+    "failed": "c0-devapp-operation-inspect-failed.response.json",
+    "unknown": "c0-devapp-operation-inspect-unknown.response.json",
+}
+
+
+def inspect_body(status):
+    """The C0.1 `{operation: {...}, correlation_id}` body for one status."""
+    name = INSPECT_FIXTURE["pending" if status in STATUS_WITHOUT_FIXTURE else status]
+    doc = json.loads((FIXTURES / name).read_text())["body"]
+    if status in STATUS_WITHOUT_FIXTURE:
+        doc["operation"]["status"] = status
+    return doc
+
+
+def inspect_result(status):
+    """That body delivered as the façade delivers it: one compact-JSON block."""
+    return {"content": [{"type": "text", "text": json.dumps(inspect_body(status))}]}
 
 
 class InspectVerdict(Base):
     """operation.inspect is the way OUT of a block, so the guard reads it."""
+
+    def test_the_record_shape_is_the_one_c0_1_froze(self):
+        """Pins the wrapper and the inner id name against the real fixtures."""
+        doc = inspect_body("unknown")
+        self.assertEqual(sorted(doc), ["correlation_id", "operation"])
+        op = doc["operation"]
+        self.assertEqual(op["operation_id"], OP, "inner id echoes the request's")
+        self.assertEqual(op["status"], "unknown")
+        self.assertEqual(op["dispatch_state"], "dispatched_unknown")
+        self.assertIsNone(op["result"], "unknown never synthesizes a result")
+        for key in ("action", "audit_id", "binding", "completed_at", "created_at",
+                    "error", "retention_expires_at", "room_id", "started_at",
+                    "updated_at"):
+            self.assertIn(key, op)
+
+    def test_not_started_really_did_not_dispatch(self):
+        op = inspect_body("not_started")["operation"]
+        self.assertEqual(op["dispatch_state"], "not_dispatched")
+        self.assertIsNone(op["started_at"], "nothing started, so a resubmit is safe")
+
+    def test_inspecting_someone_elses_operation_is_an_indistinguishable_404(self):
+        """Denial must not let inspection probe rooms, so both denials match."""
+        a = json.loads((FIXTURES / ("c0-devapp-operation-inspect-denied-nonmember"
+                                    ".response.json")).read_text())
+        b = json.loads((FIXTURES / ("c0-devapp-operation-inspect-denied-other-actor"
+                                    ".response.json")).read_text())
+        self.assertEqual(a, b, "the two denials are byte-identical")
+        self.assertEqual(a["status"], 404)
+        self.assertEqual(a["body"]["code"], "NOT_FOUND")
+        self.assertNotIn("room_id", a["body"]["details"], "no room disclosure")
 
     def test_inspect_itself_is_never_blocked(self):
         self.ledger.parent.mkdir(parents=True, exist_ok=True)

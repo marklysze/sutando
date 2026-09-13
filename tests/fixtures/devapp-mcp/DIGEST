@@ -1,13 +1,11 @@
 # Verbatim samples from the frozen DevApp MCP contract.
 contract_version  ag2-devapp-mcp/v1
-devapp_contract_digest  sha256:425f739caf56ea72293518ffe5db9fcc9f955f943ac6214e4047743fee8eedae
+devapp_contract_digest  sha256:9f191b8da05c352d114febc97166d215bb2369faac05c6179195e7051e285236
+source_worktree_commit  399d636e  (C0.1; 41 fixtures)
 #
-# NOT vendored: the operation.inspect samples. That response was corrected
-# after this digest (shape is {operation:{...},correlation_id}, verdict field
-# operation.status) and Backend is re-exporting. Pinning the superseded bytes
-# would encode a shape no producer will emit. The corrected status vocabulary
-# is asserted from the coordinator's frozen statement in
-# tests/devapp-execute-guard.test.py; re-vendor when the new digest lands.
+# No operation.inspect fixture exists for status 'running' or 'cancelled';
+# tests/devapp-execute-guard.test.py derives those two from the real
+# 'pending' record with the status swapped, and says so at the call site.
 #
 # Per-file sha256 of the bytes copied here, so drift from C0 is detectable:
 c0-devapp-action-execute-outcome-unknown.response.json  feb3b15968aa56d72321dcf666233b96c3b57306bc97de49c1f089942f5bc258
@@ -18,5 +16,12 @@ c0-devapp-actions-describe-collision-room-b.response.json  978da0eacd25147bbda88
 c0-devapp-actions-describe-ready.response.json  10245f91ee9e97ce5a620f1369a2669f365c65bdfae2278303edfa5c42cf0815
 c0-devapp-actions-search-collision-room-a.response.json  4a64a3c10ff9d62402433ad77576a9aaf43cf604b29059a7498b98e7de660533
 c0-devapp-actions-search-collision-room-b.response.json  1a699ddd62dd89a32dcfadbfc632242958c34fb1e89a4cb7bda6e1f316f95074
+c0-devapp-operation-inspect-denied-nonmember.response.json  6719e46cb9035dd3db9de9cf33b25b6f4776dbf95526c70d07a3b121a73ce7ed
+c0-devapp-operation-inspect-denied-other-actor.response.json  6719e46cb9035dd3db9de9cf33b25b6f4776dbf95526c70d07a3b121a73ce7ed
+c0-devapp-operation-inspect-failed.response.json  bf7d1cded7bfbd1b52a07891a8134966f44d874e974d57904366ec7006eb552b
+c0-devapp-operation-inspect-not-started.response.json  1d8a6183d3cc8b81633ffc804eef1326bd173469fc853c4ed649457570331654
+c0-devapp-operation-inspect-pending.response.json  414c174d5ee21f87ca881166c0820df5cab90ec2caca4083249d0fd2aa32cb21
+c0-devapp-operation-inspect-succeeded.response.json  ca1ead9bcda7da4408cd1599a384fd1135fbd771ba765c8cae108f08e12ff012
+c0-devapp-operation-inspect-unknown.response.json  ca376bafdd0de1a4e3812c1547aa9c4da393b96ed0018d8af7f07fa288c0246e
 c0-devapp-room-inspect-sleeping.response.json  d9b183b436757ab19f9894778b3994b2a67118115c1eede721362c59791f31e4
 error-catalog.json  f2e0c1278487b7415b95aa311f22ffaa192f28363726da69959ea8d608a131e8
