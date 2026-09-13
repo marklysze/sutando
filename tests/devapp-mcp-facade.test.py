@@ -14,7 +14,7 @@ that round trip is only provable by making it.
 
 Payloads are the vendored C0 samples in tests/fixtures/devapp-mcp/ (per-file
 sha256 in that directory's DIGEST; contract digest
-sha256:9f191b8da05c352d114febc97166d215bb2369faac05c6179195e7051e285236).
+sha256:eebd0e4aaafd7b83163c20ce41cda0a79844449de71cb096d29446ac3fd56a60).
 """
 import json
 import sys

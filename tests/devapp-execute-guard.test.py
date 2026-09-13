@@ -13,7 +13,7 @@ trace is what proves "no second execute" mechanically rather than by prose.
 
 Error shapes are the frozen contract's, loaded from tests/fixtures/devapp-mcp/
 (verbatim C0 samples; digests in that dir's DIGEST file, contract digest
-sha256:9f191b8da05c352d114febc97166d215bb2369faac05c6179195e7051e285236).
+sha256:eebd0e4aaafd7b83163c20ce41cda0a79844449de71cb096d29446ac3fd56a60).
 """
 import json
 import subprocess

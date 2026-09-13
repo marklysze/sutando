@@ -1,7 +1,7 @@
 # Verbatim samples from the frozen DevApp MCP contract.
 contract_version  ag2-devapp-mcp/v1
-devapp_contract_digest  sha256:9f191b8da05c352d114febc97166d215bb2369faac05c6179195e7051e285236
-source_worktree_commit  399d636e  (C0.1; 41 fixtures)
+devapp_contract_digest  sha256:eebd0e4aaafd7b83163c20ce41cda0a79844449de71cb096d29446ac3fd56a60
+source_worktree_commit  a518dec7  (C0.2; 41 fixtures)
 #
 # No operation.inspect fixture exists for status 'running' or 'cancelled';
 # tests/devapp-execute-guard.test.py derives those two from the real
