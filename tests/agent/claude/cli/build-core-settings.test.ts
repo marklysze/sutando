@@ -17,12 +17,12 @@ function buildCore(
 	obsJson?: string,
 	skillTelemetryHook?: string,
 	gmailWriteGuardHook?: string,
-	devappExecuteGuardHook?: string,
+	roomActionGuardHook?: string,
 ): any {
 	const args =
-		devappExecuteGuardHook !== undefined
+		roomActionGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '',
-				gmailWriteGuardHook ?? '', devappExecuteGuardHook]
+				gmailWriteGuardHook ?? '', roomActionGuardHook]
 		: gmailWriteGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
 			: skillTelemetryHook === undefined
@@ -46,7 +46,7 @@ function shellParsedPath(command: string): string {
 
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
-const DEVAPP_GUARD = '/x/hooks/devapp-execute-guard.py';
+const ROOM_ACTION_GUARD = '/x/hooks/room-action-execute-guard.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
 
 describe('build-core-settings.mjs', () => {
@@ -168,8 +168,8 @@ describe('build-core-settings.mjs', () => {
 	const EXECUTE_MATCHER = 'mcp__.*__room[._]action[._]execute';
 	const INSPECT_MATCHER = 'mcp__.*__operation[._]inspect';
 
-	it('registers the DevApp guard on Pre, Post and PostToolUseFailure', () => {
-		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, DEVAPP_GUARD);
+	it('registers the room-action guard on Pre, Post and PostToolUseFailure', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, ROOM_ACTION_GUARD);
 		const pre = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		const post = o.hooks.PostToolUse.map((b: any) => b.matcher);
 		const failure = o.hooks.PostToolUseFailure.map((b: any) => b.matcher);
@@ -181,7 +181,7 @@ describe('build-core-settings.mjs', () => {
 		assert.ok(!pre.includes(INSPECT_MATCHER), 'inspection must never be gated');
 	});
 
-	it('the DevApp matchers select the tool names Claude Code actually emits', () => {
+	it('the room-action matchers select the tool names Claude Code actually emits', () => {
 		const execute = new RegExp(EXECUTE_MATCHER);
 		const inspect = new RegExp(INSPECT_MATCHER);
 		// Claude Code folds the façade's dots to `_`; the server half is the bridge's.
@@ -195,7 +195,7 @@ describe('build-core-settings.mjs', () => {
 		assert.ok(!execute.test('Bash'));
 	});
 
-	it('omitting the DevApp guard path leaves the previous shape untouched', () => {
+	it('omitting the room-action guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);

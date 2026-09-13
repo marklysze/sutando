@@ -1,8 +1,0 @@
-# DevApp room MCP test scope only, never a production dependency: Sutando has no
-# MCP client — the coding-agent CLI is the client. This SDK exists solely so
-# tests/devapp-mcp-facade.test.py can stand up a real façade and prove the
-# structured error survives the MCP tool-error boundary.
-#
-# Exact pin, matching contract ag2-devapp-mcp/v1 (handshake 2025-11-25).
-# The suite SKIPS when this is absent, so CI stays green without it.
-mcp==2.1.1

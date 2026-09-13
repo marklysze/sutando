@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""devapp-execute-guard — refuse a duplicate DevApp `room.action.execute`.
+"""room-action-execute-guard — refuse a duplicate `room.action.execute`.
 
-PreToolUse denies an execute whose operation_id the ledger records as already
-dispatched, and any wake-named MCP tool. PostToolUse / PostToolUseFailure record
-what the façade returned; an operation.inspect verdict of `not_started` is the
-only thing that re-permits a resubmit. The ledger lives in the workspace, not the
-session, because a re-dispatched task runs in a fresh session. The rules are the
-vendored contract's: tests/fixtures/devapp-mcp/error-catalog.json.
+Guards `room.action.execute` on the `ag2-space` MCP connection. PreToolUse denies
+an execute whose operation_id the ledger records as already dispatched, and any
+wake-named MCP tool. PostToolUse / PostToolUseFailure record the error's
+`details.dispatch_state`; an operation.inspect `operation.status` of `not_started`
+is the only thing that re-permits a resubmit. The ledger lives in the workspace,
+not the session, because a re-dispatched task runs in a fresh session.
 
 Keyed by operation_id, so a newly minted id for the same work is not caught here.
-Escape hatch: SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY=1. Fail-open on any error.
+Escape hatch: SUTANDO_ALLOW_ROOM_ACTION_REPLAY=1. Fail-open on any error.
 """
 import fcntl
 import json
@@ -26,19 +26,19 @@ INSPECT_STATUS_NOT_STARTED = "not_started"
 INSPECT_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled",
                     "unknown", "not_started"}
 RESEND_FORBIDDEN = {"dispatched_unknown", "dispatched_failed", "dispatched_completed"}
-# DEVAPP_SLEEPING is not_dispatched, yet only an explicit human wake may follow it.
+# Arrives with not_dispatched, yet only an explicit human wake may follow it.
 NO_AUTOMATIC_WAKE = "wait_for_explicit_wake"
 WAKE_TOKENS = {"wake", "wakeup"}
 
-LEDGER_NAME = "devapp-operations.json"
+LEDGER_NAME = "room-action-operations.json"
 # The contract's operation retention; an older entry matches no stored outcome.
 RETENTION_S = 30 * 24 * 3600
 MAX_ENTRIES = 2000
 
 
 def _ledger_path():
-    """`<workspace>/state/devapp-operations.json` via the repo's own resolver."""
-    override = os.environ.get("SUTANDO_DEVAPP_LEDGER")
+    """`<workspace>/state/room-action-operations.json` via the repo's own resolver."""
+    override = os.environ.get("SUTANDO_ROOM_ACTION_LEDGER")
     if override:
         return override
     root = os.environ.get("SUTANDO_REPO_ROOT") or os.path.dirname(
@@ -77,7 +77,7 @@ def _update(path, operation_id, make_entry):
         if len(data) > MAX_ENTRIES:
             keep = sorted(data.items(), key=lambda kv: float(kv[1].get("ts") or 0))
             data = dict(keep[-MAX_ENTRIES:])
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".devapp-operations.")
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".room-action-operations.")
         try:
             with os.fdopen(fd, "w") as fh:
                 json.dump(data, fh)
@@ -134,7 +134,7 @@ def _find(node, pick, depth=0):
 
 def _envelope(d):
     details = d.get("details")
-    return d if isinstance(details, dict) and details.get("source") == "devapp" else None
+    return d if isinstance(details, dict) and "dispatch_state" in details else None
 
 
 def _operation(d):
@@ -169,16 +169,17 @@ def decide(operation_id, ledger):
                     "(never a new one) and report what it says.")
         return (
             f"Blocked: operation_id {operation_id!r} was already dispatched "
-            f"(dispatch_state={state!r}). The DevApp contract allows an execute "
-            "to be re-sent only when dispatch_state is 'not_dispatched'; "
-            "re-sending this one could apply the mutation twice." + tail
+            f"(dispatch_state={state!r}). The contract allows an execute to be "
+            "re-sent only when dispatch_state is 'not_dispatched'; re-sending "
+            "this one could apply the mutation twice." + tail
         )
     if prior.get("next_action") == NO_AUTOMATIC_WAKE:
         return (
-            f"Blocked: operation_id {operation_id!r} last returned "
-            "DEVAPP_SLEEPING. A sleeping app is never woken by a retry, a "
-            "health probe or error recovery — only by an explicit human wake "
-            "control. Stop this app task and report that the app is sleeping."
+            f"Blocked: operation_id {operation_id!r} last returned next_action "
+            f"{NO_AUTOMATIC_WAKE!r}: the app is sleeping. A sleeping app is never "
+            "woken by a retry, a health probe or error recovery — only by an "
+            "explicit human wake control. Stop this app task and report that "
+            "the app is sleeping."
         )
     return None
 
@@ -187,20 +188,20 @@ def deny(reason):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "deny",
-        "permissionDecisionReason": reason + " [devapp-execute-guard]",
+        "permissionDecisionReason": reason + " [room-action-execute-guard]",
     }}))
 
 
 def main():
-    if os.environ.get("SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY", "").strip() == "1":
+    if os.environ.get("SUTANDO_ALLOW_ROOM_ACTION_REPLAY", "").strip() == "1":
         return 0
     data = json.loads(sys.stdin.read())
     tool_name = str(data.get("tool_name") or "")
     event = data.get("hook_event_name") or "PreToolUse"
 
     if event == "PreToolUse" and is_wake_attempt(tool_name):
-        deny("Blocked: the DevApp contract exposes no wake tool, and nothing in "
-             "this integration may wake a pod. Only an explicit human wake "
+        deny("Blocked: the room-action contract exposes no wake tool, and "
+             "nothing here may wake an app. Only an explicit human wake "
              "control starts a sleeping app.")
         return 0
 
@@ -264,5 +265,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:  # fail-open: never wedge the core on a hook error
-        print(f"[devapp-execute-guard] non-fatal error, allowing: {e}", file=sys.stderr)
+        print(f"[room-action-execute-guard] non-fatal error, allowing: {e}", file=sys.stderr)
         sys.exit(0)

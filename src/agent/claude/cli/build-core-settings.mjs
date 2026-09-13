@@ -27,8 +27,8 @@
 //                    script honors the telemetry opt-out on its own.
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
-//   arg5 (optional): path to hooks/devapp-execute-guard.py — PreToolUse refuses
-//                    a duplicate DevApp execute; the Post events record outcomes.
+//   arg5 (optional): path to hooks/room-action-execute-guard.py — PreToolUse
+//                    refuses a duplicate room.action.execute; Post events record outcomes.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -108,17 +108,17 @@ if (gmailWriteGuardHook.trim()) {
 
 // Claude Code exposes `room.action.execute` as `…__room_action_execute`; both match.
 // An in-band MCP tool error fires PostToolUseFailure, never PostToolUse.
-const devappExecuteGuardHook = process.argv[6] || '';
-let devappExecuteGuardSettings = null;
-if (devappExecuteGuardHook.trim()) {
-	const cmd = `python3 ${shq(devappExecuteGuardHook)}`;
+const roomActionGuardHook = process.argv[6] || '';
+let roomActionGuardSettings = null;
+if (roomActionGuardHook.trim()) {
+	const cmd = `python3 ${shq(roomActionGuardHook)}`;
 	const hook = (matcher) => ({ matcher, hooks: [{ type: 'command', command: cmd }] });
 	const executeMatcher = 'mcp__.*__room[._]action[._]execute';
 	// Narrower than `mcp__.*` so the hook spawns only for wake-named tools.
 	const wakeMatcher = 'mcp__.*[Ww][Aa][Kk][Ee].*';
 	// Recorded, never gated: its `not_started` verdict re-permits a resubmit.
 	const inspectMatcher = 'mcp__.*__operation[._]inspect';
-	devappExecuteGuardSettings = {
+	roomActionGuardSettings = {
 		hooks: {
 			PreToolUse: [hook(executeMatcher), hook(wakeMatcher)],
 			PostToolUse: [hook(executeMatcher), hook(inspectMatcher)],
@@ -130,5 +130,5 @@ if (devappExecuteGuardHook.trim()) {
 process.stdout.write(
 	JSON.stringify(mergeHookSettings(
 		guardSettings, obsSettings, skillTelemetrySettings,
-		gmailWriteGuardSettings, devappExecuteGuardSettings)),
+		gmailWriteGuardSettings, roomActionGuardSettings)),
 );

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Unit + call-trace tests for hooks/devapp-execute-guard.py.
+"""Unit + call-trace tests for hooks/room-action-execute-guard.py.
 
-Run:  python3 tests/devapp-execute-guard.test.py
+Run:  python3 tests/room-action-execute-guard.test.py
 
 Exercised the way Claude Code runs it — subprocess, one hook JSON on stdin,
 decision JSON on stdout (the hook-driver idiom of tests/gmail-write-guard.test.py).
@@ -13,8 +13,8 @@ PostToolUseFailure `error` text, a success as PostToolUse `tool_response` blocks
 guard and returns only the calls the guard permitted, recording each permitted
 call's result first. Asserting on that trace proves "no second execute".
 
-Error shapes are the frozen contract's, loaded from tests/fixtures/devapp-mcp/
-(verbatim C0 samples; digests in that dir's DIGEST file).
+Error shapes are the frozen contract's: verbatim samples vendored under
+tests/fixtures/ (digests in that directory's DIGEST file).
 """
 import json
 import subprocess
@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-HOOK = REPO / "hooks" / "devapp-execute-guard.py"
+HOOK = REPO / "hooks" / "room-action-execute-guard.py"
 FIXTURES = REPO / "tests" / "fixtures" / "devapp-mcp"
 CATALOG = json.loads((FIXTURES / "error-catalog.json").read_text())
 
@@ -73,7 +73,7 @@ def run_hook(payload, ledger):
     return subprocess.run(
         [sys.executable, str(HOOK)], input=json.dumps(payload),
         capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin", "SUTANDO_DEVAPP_LEDGER": str(ledger)})
+        env={"PATH": "/usr/bin:/bin", "SUTANDO_ROOM_ACTION_LEDGER": str(ledger)})
 
 
 def pre(tool, ledger, operation_id=OP):
@@ -125,7 +125,7 @@ def replay(trace, ledger):
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ledger = Path(self.tmp.name) / "state" / "devapp-operations.json"
+        self.ledger = Path(self.tmp.name) / "state" / "room-action-operations.json"
         self.addCleanup(self.tmp.cleanup)
 
     def seed(self, entries):
@@ -412,7 +412,7 @@ class FailOpen(Base):
         proc = subprocess.run([sys.executable, str(HOOK)], input="not json",
                               capture_output=True, text=True,
                               env={"PATH": "/usr/bin:/bin",
-                                   "SUTANDO_DEVAPP_LEDGER": str(self.ledger)})
+                                   "SUTANDO_ROOM_ACTION_LEDGER": str(self.ledger)})
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "")
 
@@ -423,8 +423,8 @@ class FailOpen(Base):
             input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
                               "tool_input": {"operation_id": OP}}),
             capture_output=True, text=True,
-            env={"PATH": "/usr/bin:/bin", "SUTANDO_DEVAPP_LEDGER": str(self.ledger),
-                 "SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY": "1"})
+            env={"PATH": "/usr/bin:/bin", "SUTANDO_ROOM_ACTION_LEDGER": str(self.ledger),
+                 "SUTANDO_ALLOW_ROOM_ACTION_REPLAY": "1"})
         self.assertIsNone(decision(proc))
 
 
@@ -450,7 +450,7 @@ class LedgerDurability(Base):
             list(pool.map(lambda op: failure(EXECUTE, self.ledger, unknown, op), ids))
         self.assertEqual(sorted(json.loads(self.ledger.read_text())), sorted(ids))
         leftovers = [p.name for p in self.ledger.parent.iterdir()
-                     if p.name.startswith(".devapp-operations.")]
+                     if p.name.startswith(".room-action-operations.")]
         self.assertEqual(leftovers, [], "no temp file left behind")
 
 

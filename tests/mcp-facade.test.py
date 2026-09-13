@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Fake AG2 Space MCP façade + call-trace scenarios over the real MCP SDK.
 
-Run:  python3 tests/devapp-mcp-facade.test.py
-Needs the pinned SDK (test-scope only — see requirements-devapp-mcp.txt):
-      python3 -m pip install -r requirements-devapp-mcp.txt
+Run:  python3 tests/mcp-facade.test.py
+Needs the pinned SDK (test-scope only — see requirements-mcp-test.txt):
+      python3 -m pip install -r requirements-mcp-test.txt
 Without it the suite SKIPS rather than fails: CI does not install it today.
 
 Why a real server rather than asserting on fixtures directly: Sutando has no MCP
 client of its own, so the one thing it could not otherwise verify is whether the
-structured DevApp error survives the MCP tool-error boundary at all. C0 delivers
+structured error survives the MCP tool-error boundary at all. C0 delivers
 errors in-band (`is_error: true`, envelope as one compact-JSON text block), and
 that round trip is only provable by making it.
 
@@ -42,7 +42,7 @@ ROOM_A = "!fixture-devapp-a:dev.ag2.space"
 ROOM_B = "!fixture-devapp-b:dev.ag2.space"
 
 # The nine façade tools, from contracts/mcp-facade-v1.schema.json in
-# ag2space-mcp. C0 answer 17 freezes them and adds no public MCP tool.
+# ag2space-mcp. The contract freezes them and adds no public MCP tool.
 FACADE_TOOLS = [
     "ag2.whoami", "room.list", "room.inspect",
     "room.actions.search", "room.actions.describe",
@@ -302,6 +302,6 @@ class HostileDescription(unittest.TestCase):
 if __name__ == "__main__":
     if SDK != PINNED_SDK:
         print(f"SKIP: needs mcp=={PINNED_SDK}, have {SDK!r}; "
-              f"pip install -r requirements-devapp-mcp.txt to run this suite")
+              f"pip install -r requirements-mcp-test.txt to run this suite")
         sys.exit(0)
     unittest.main(verbosity=2)
