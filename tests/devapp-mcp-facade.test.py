@@ -12,9 +12,8 @@ structured DevApp error survives the MCP tool-error boundary at all. C0 delivers
 errors in-band (`is_error: true`, envelope as one compact-JSON text block), and
 that round trip is only provable by making it.
 
-Payloads are the vendored C0 samples in tests/fixtures/devapp-mcp/ (per-file
-sha256 in that directory's DIGEST; contract digest
-sha256:eebd0e4aaafd7b83163c20ce41cda0a79844449de71cb096d29446ac3fd56a60).
+Payloads are the vendored C0 samples in tests/fixtures/devapp-mcp/ (contract
+digest and per-file sha256 in that directory's DIGEST).
 """
 import json
 import sys

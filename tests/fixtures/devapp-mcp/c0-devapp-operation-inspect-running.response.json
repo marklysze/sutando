@@ -14,14 +14,14 @@
       "completed_at": null,
       "correlation_id": "${CORRELATION_ID}",
       "created_at": "2026-09-14T09:10:00Z",
-      "dispatch_state": "not_dispatched",
+      "dispatch_state": "dispatched_unknown",
       "error": null,
       "operation_id": "op-tasks-create-7f3a",
       "result": null,
       "retention_expires_at": "2026-10-14T09:10:00Z",
       "room_id": "!fixture-devapp-a:dev.ag2.space",
-      "started_at": null,
-      "status": "pending",
+      "started_at": "2026-09-14T09:10:00Z",
+      "status": "running",
       "updated_at": "2026-09-14T09:10:00Z"
     }
   },

@@ -298,26 +298,14 @@ class Traces(Base):
         self.assertEqual(replay(trace, self.ledger), [EXECUTE, DESCRIBE, EXECUTE])
 
 
-# C0.1 ships a fixture per status except these two, derived below from the real
-# `pending` record with only `status` swapped.
-STATUS_WITHOUT_FIXTURE = {"running", "cancelled"}
-
-INSPECT_FIXTURE = {
-    "not_started": "c0-devapp-operation-inspect-not-started.response.json",
-    "pending": "c0-devapp-operation-inspect-pending.response.json",
-    "succeeded": "c0-devapp-operation-inspect-succeeded.response.json",
-    "failed": "c0-devapp-operation-inspect-failed.response.json",
-    "unknown": "c0-devapp-operation-inspect-unknown.response.json",
-}
+INSPECT_STATUSES = ("not_started", "pending", "running", "succeeded", "failed",
+                    "cancelled", "unknown")
 
 
 def inspect_body(status):
-    """The C0.1 `{operation: {...}, correlation_id}` body for one status."""
-    name = INSPECT_FIXTURE["pending" if status in STATUS_WITHOUT_FIXTURE else status]
-    doc = json.loads((FIXTURES / name).read_text())["body"]
-    if status in STATUS_WITHOUT_FIXTURE:
-        doc["operation"]["status"] = status
-    return doc
+    """The `{operation: {...}, correlation_id}` body of that status's C0 fixture."""
+    name = f"c0-devapp-operation-inspect-{status.replace('_', '-')}.response.json"
+    return json.loads((FIXTURES / name).read_text())["body"]
 
 
 class InspectVerdict(Base):
@@ -336,10 +324,25 @@ class InspectVerdict(Base):
                     "updated_at"):
             self.assertIn(key, op)
 
+    def test_every_status_has_a_real_fixture_echoing_its_status(self):
+        for status in INSPECT_STATUSES:
+            op = inspect_body(status)["operation"]
+            self.assertEqual(op["status"], status)
+            self.assertEqual(op["operation_id"], OP)
+
     def test_not_started_really_did_not_dispatch(self):
         op = inspect_body("not_started")["operation"]
         self.assertEqual(op["dispatch_state"], "not_dispatched")
         self.assertIsNone(op["started_at"], "nothing started, so a resubmit is safe")
+
+    def test_pending_is_recorded_but_unsent_and_running_is_in_flight(self):
+        """Pending sent nothing yet, but may start any moment, so it stays refused."""
+        self.assertEqual(inspect_body("pending")["operation"]["dispatch_state"],
+                         "not_dispatched")
+        self.assertEqual(inspect_body("running")["operation"]["dispatch_state"],
+                         "dispatched_unknown")
+        self.assertEqual(inspect_body("cancelled")["operation"]["dispatch_state"],
+                         "not_dispatched")
 
     def test_inspecting_someone_elses_operation_is_an_indistinguishable_404(self):
         """Denial must not let inspection probe rooms, so both denials match."""
