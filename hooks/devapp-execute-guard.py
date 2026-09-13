@@ -1,84 +1,37 @@
 #!/usr/bin/env python3
-"""devapp-execute-guard — PreToolUse/PostToolUse guard for DevApp room Actions.
+"""devapp-execute-guard — refuse a duplicate DevApp `room.action.execute`.
 
-Sutando's task layer is at-least-once: a task whose outcome is unknown is
-re-dispatched (``src/watch-tasks-stream.sh`` handler fallback + initial sweep,
-``skills/worker-pool`` died-mid-work release, the codex notifier's completion
-timeout) and re-run by a FRESH session with no memory of the first attempt. A
-mutation that was already dispatched would therefore be sent a second time. An
-instruction cannot prevent that, because the re-run never reads the first run's
-transcript — so the ledger this hook keeps lives under the WORKSPACE, not the
-session.
+PreToolUse denies an execute whose operation_id the ledger records as already
+dispatched, and any wake-named MCP tool. PostToolUse / PostToolUseFailure record
+what the façade returned; an operation.inspect verdict of `not_started` is the
+only thing that re-permits a resubmit. The ledger lives in the workspace, not the
+session, because a re-dispatched task runs in a fresh session. The rules are the
+vendored contract's: tests/fixtures/devapp-mcp/error-catalog.json.
 
-The rules are the frozen contract's, not this hook's invention
-(``contracts/devapp-mcp/v1/error-catalog.json``, digest recorded in
-``tests/fixtures/devapp-mcp/DIGEST``):
-
-  * ``retry_decision``: the resend signal is ``details.dispatch_state``, never
-    ``recoverable``. An execute may be resent only when ``not_dispatched``.
-  * ``next_action: wait_for_explicit_wake`` (DEVAPP_SLEEPING) is ``not_dispatched``
-    but is still NOT retryable — only an explicit human wake control starts a
-    pod, and ``guarantees.no_automatic_wake`` is part of the contract.
-  * ``ACTION_OUTCOME_UNKNOWN`` carries ``details.operation_id`` and demands
-    ``operation.inspect`` on that same id — never a new id, never a resubmit.
-
-Scope — deliberately narrow:
-  * Only MCP tools (``mcp__…``) whose trailing tool segment is exactly
-    ``room.action.execute``.
-  * Reads (``room.action.read``), discovery and ``operation.inspect`` are never
-    blocked — inspection is the contract's way out of a blocked operation.
-  * Non-matching tools: no-op (exit 0), safe under a broad matcher.
-
-Naming risk. Claude Code renders an MCP tool as ``mcp__<server>__<tool>``. The
-server half is whatever the Desktop credential bridge called the connection, so
-this keys on the tool half, which C0 answer 17 freezes. Two consequences: a
-second MCP server exposing a tool of that name would also be guarded
-(conservative, and none exists); and if the façade ever renames the tool this
-silently stops matching and stops guarding — which is why
-``tests/devapp-execute-guard.test.py`` pins the string rather than trusting it.
-
-Known limit. The ledger is keyed by ``operation_id``, so an agent that invents a
-NEW id for the same work walks straight past this hook. The derivation rule
-(same task inputs produce the same id) and Core's request fingerprint are what
-close that, not this guard — pinned by ``test_a_freshly_minted_id_is_NOT_…``.
-
-Escape hatch: ``SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY=1`` disables the guard.
-
-Fail-OPEN on any error — a crashing hook must never wedge the core (same
-contract as skip-ask-user-question.py and gmail-write-guard.py).
+Keyed by operation_id, so a newly minted id for the same work is not caught here.
+Escape hatch: SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY=1. Fail-open on any error.
 """
+import fcntl
 import json
 import os
 import sys
+import tempfile
 import time
 
-# Matched on the tool half of `mcp__<server>__<tool>`: the server half is named
-# by the Desktop bridge, the tool half is frozen by the contract.
-MATCHED_TOOL = "room.action.execute"
+# Claude Code folds `.` to `_` in MCP tool names; tool_segment() does the same.
+EXECUTE_TOOL = "room_action_execute"
+INSPECT_TOOL = "operation_inspect"
 
-# Watched because `not_started` is the only verdict that re-permits a resubmit;
-# without it the guard would wedge the contract's own recovery path.
-INSPECT_TOOL = "operation.inspect"
 INSPECT_STATUS_NOT_STARTED = "not_started"
-# pending/running/unknown: do not resubmit, inspect again later or report.
-# succeeded/failed: final, nothing to resubmit.
 INSPECT_STATUSES = {"pending", "running", "succeeded", "failed", "cancelled",
                     "unknown", "not_started"}
-
-# C0 error-catalog.json -> retry_decision.resend_execute_forbidden_when.
 RESEND_FORBIDDEN = {"dispatched_unknown", "dispatched_failed", "dispatched_completed"}
-
-# C0 error-catalog.json -> next_actions. Sleeping is not_dispatched yet must not
-# be retried: only an explicit human wake control starts the pod.
+# DEVAPP_SLEEPING is not_dispatched, yet only an explicit human wake may follow it.
 NO_AUTOMATIC_WAKE = "wait_for_explicit_wake"
-
-# There is no wake tool in the contract (C0 answer 17: no public MCP tool is
-# added). A tool that looks like one is therefore off-contract, not a shortcut.
-WAKE_TOKENS = {"wake", "wakeup", "unsleep", "resume_app", "start_app"}
+WAKE_TOKENS = {"wake", "wakeup"}
 
 LEDGER_NAME = "devapp-operations.json"
-# C0 operation record retention is 30 days; a ledger entry older than that can
-# no longer be matched against a stored outcome, so keeping it only misleads.
+# The contract's operation retention; an older entry matches no stored outcome.
 RETENTION_S = 30 * 24 * 3600
 MAX_ENTRIES = 2000
 
@@ -99,103 +52,94 @@ def _load(path):
     try:
         with open(path) as fh:
             data = json.load(fh)
-        return data if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
+    except ValueError:
+        # Unreadable: the next write starts a fresh ledger instead of staying disabled.
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _save(path, data):
-    """Atomic replace: a reader must never see a half-written ledger."""
-    cutoff = time.time() - RETENTION_S
-    data = {k: v for k, v in data.items() if float(v.get("ts") or 0) >= cutoff}
-    if len(data) > MAX_ENTRIES:
-        keep = sorted(data.items(), key=lambda kv: float(kv[1].get("ts") or 0))
-        data = dict(keep[-MAX_ENTRIES:])
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, path)
-    return data
+def _update(path, operation_id, make_entry):
+    """Locked read-modify-write: concurrent sessions share one workspace ledger."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = _load(path)
+        prior = data.get(operation_id)
+        entry = make_entry(prior if isinstance(prior, dict) else {})
+        entry["ts"] = time.time()
+        data[operation_id] = entry
+        cutoff = time.time() - RETENTION_S
+        data = {k: v for k, v in data.items()
+                if isinstance(v, dict) and float(v.get("ts") or 0) >= cutoff}
+        if len(data) > MAX_ENTRIES:
+            keep = sorted(data.items(), key=lambda kv: float(kv[1].get("ts") or 0))
+            data = dict(keep[-MAX_ENTRIES:])
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".devapp-operations.")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def tool_segment(tool_name):
     """The tool half of `mcp__<server>__<tool>`, or None for a non-MCP tool."""
     if not isinstance(tool_name, str) or not tool_name.startswith("mcp__"):
         return None
-    return tool_name.rsplit("__", 1)[-1]
+    return tool_name.rsplit("__", 1)[-1].replace(".", "_")
 
 
 def is_wake_attempt(tool_name):
-    """True for an MCP tool whose name reads as a wake verb (none exists)."""
+    """True for an MCP tool whose name reads as a wake verb (the contract has none)."""
     seg = tool_segment(tool_name)
-    if seg is None:
-        return False
-    lowered = seg.lower()
-    tokens = set(lowered.replace(".", "_").split("_"))
-    return bool(tokens & WAKE_TOKENS)
+    return seg is not None and bool(set(seg.lower().split("_")) & WAKE_TOKENS)
 
 
-def find_envelope(node, depth=0):
-    """Locate the DevApp error envelope anywhere in a tool response.
-
-    The façade delivers it as an in-band tool error: a compact-JSON text block,
-    so it may arrive parsed, or as a string inside a content list.
-    """
+def _find(node, pick, depth=0):
+    """First non-None `pick(dict)` anywhere in a tool result, JSON text included."""
     if depth > 8:
         return None
     if isinstance(node, str):
-        stripped = node.strip()
-        if stripped.startswith("{"):
-            try:
-                return find_envelope(json.loads(stripped), depth + 1)
-            except (ValueError, TypeError):
-                return None
-        return None
+        start, end = node.find("{"), node.rfind("}")
+        if start < 0 or end < start:
+            return None
+        try:
+            node = json.loads(node[start:end + 1])
+        except ValueError:
+            return None
+        return _find(node, pick, depth + 1)
     if isinstance(node, dict):
-        details = node.get("details")
-        if isinstance(details, dict) and details.get("source") == "devapp":
-            return node
-        for value in node.values():
-            found = find_envelope(value, depth + 1)
-            if found is not None:
-                return found
+        hit = pick(node)
+        if hit is not None:
+            return hit
+        children = node.values()
+    elif isinstance(node, list):
+        children = node
+    else:
         return None
-    if isinstance(node, list):
-        for value in node:
-            found = find_envelope(value, depth + 1)
-            if found is not None:
-                return found
+    for child in children:
+        hit = _find(child, pick, depth + 1)
+        if hit is not None:
+            return hit
     return None
 
 
-def find_operation(node, depth=0):
-    """Locate the `operation` object in an operation.inspect result."""
-    if depth > 8:
-        return None
-    if isinstance(node, str):
-        stripped = node.strip()
-        if stripped.startswith("{"):
-            try:
-                return find_operation(json.loads(stripped), depth + 1)
-            except (ValueError, TypeError):
-                return None
-        return None
-    if isinstance(node, dict):
-        op = node.get("operation")
-        if isinstance(op, dict) and op.get("status") in INSPECT_STATUSES:
-            return op
-        for value in node.values():
-            found = find_operation(value, depth + 1)
-            if found is not None:
-                return found
-        return None
-    if isinstance(node, list):
-        for value in node:
-            found = find_operation(value, depth + 1)
-            if found is not None:
-                return found
-    return None
+def _envelope(d):
+    details = d.get("details")
+    return d if isinstance(details, dict) and details.get("source") == "devapp" else None
+
+
+def _operation(d):
+    op = d.get("operation")
+    return op if isinstance(op, dict) and op.get("status") in INSPECT_STATUSES else None
 
 
 def decide(operation_id, ledger):
@@ -205,8 +149,6 @@ def decide(operation_id, ledger):
         return None
     status = prior.get("inspect_status")
     if status == INSPECT_STATUS_NOT_STARTED:
-        # Inspection proved nothing was started: the contract permits exactly
-        # this resubmit, under the same id.
         return None
     if status in ("pending", "running", "unknown"):
         return (
@@ -263,7 +205,7 @@ def main():
         return 0
 
     segment = tool_segment(tool_name)
-    if segment not in (MATCHED_TOOL, INSPECT_TOOL):
+    if segment not in (EXECUTE_TOOL, INSPECT_TOOL):
         return 0
 
     tool_input = data.get("tool_input") or {}
@@ -272,35 +214,39 @@ def main():
         return 0
 
     path = _ledger_path()
-    ledger = _load(path)
 
     if segment == INSPECT_TOOL:
-        # Never blocked, only recorded. The id comes from the REQUEST, so this
-        # does not depend on the id field name inside the operation object.
-        if event == "PreToolUse":
+        # Never blocked, only recorded; the id comes from the request.
+        if event != "PostToolUse":
             return 0
-        op = find_operation(data.get("tool_response"))
+        op = _find(data.get("tool_response"), _operation)
         if op is None:
             return 0
-        entry = dict(ledger.get(operation_id) or {})
-        entry["inspect_status"] = op.get("status")
-        entry.setdefault("dispatch_state", op.get("dispatch_state"))
-        entry["ts"] = time.time()
-        ledger[operation_id] = entry
-        _save(path, ledger)
+
+        def merge(prior):
+            entry = dict(prior)
+            entry["inspect_status"] = op.get("status")
+            entry.setdefault("dispatch_state", op.get("dispatch_state"))
+            return entry
+
+        _update(path, operation_id, merge)
         return 0
 
     if event == "PreToolUse":
-        reason = decide(operation_id, ledger)
+        reason = decide(operation_id, _load(path))
         if reason:
             deny(reason)
         return 0
 
-    # PostToolUse / PostToolUseFailure: record what the façade reported so the
-    # NEXT run — which may be a fresh session after a crash — can refuse.
-    envelope = find_envelope(data.get("tool_response"))
+    if event == "PostToolUseFailure":
+        # An error without an envelope (timeout, dropped connection) may still have run.
+        envelope, fallback = _find(data.get("error"), _envelope), "dispatched_unknown"
+    elif event == "PostToolUse":
+        envelope, fallback = _find(data.get("tool_response"), _envelope), "dispatched_completed"
+    else:
+        return 0
     if envelope is None:
-        entry = {"dispatch_state": "dispatched_completed", "next_action": "none"}
+        entry = {"dispatch_state": fallback}
     else:
         details = envelope.get("details") or {}
         entry = {
@@ -308,9 +254,7 @@ def main():
             "next_action": details.get("next_action"),
             "code": envelope.get("code"),
         }
-    entry["ts"] = time.time()
-    ledger[operation_id] = entry
-    _save(path, ledger)
+    _update(path, operation_id, lambda _prior: entry)
     return 0
 
 

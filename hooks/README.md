@@ -185,6 +185,34 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `devapp-execute-guard.py`
+
+Refuses a **second `room.action.execute` for a DevApp operation that was already
+dispatched**, and any wake-named MCP tool. The task layer is at-least-once: a task
+whose outcome is unknown is re-run by a fresh session, which would re-send the
+mutation. The hook keeps a workspace ledger (`<workspace>/state/devapp-operations.json`,
+keyed by `operation_id`) so that re-run is refused. The rules are the vendored
+contract's (`tests/fixtures/devapp-mcp/error-catalog.json`): re-send only on
+`dispatch_state: not_dispatched`, never after `DEVAPP_SLEEPING`, and after
+`ACTION_OUTCOME_UNKNOWN` only once `operation.inspect` reports `not_started`.
+
+Limit: a newly minted `operation_id` for the same work is not caught here; the
+id-derivation rule and Core's request fingerprint cover that. Claude runtime
+only — the Codex core registers no equivalent hook.
+
+Escape hatch: `SUTANDO_ALLOW_DEVAPP_EXECUTE_REPLAY=1`. Fail-OPEN on hook errors.
+
+### Registration
+
+**Auto-registered** for every Claude core session by `build-core-settings.mjs`:
+`PreToolUse` on `mcp__.*__room[._]action[._]execute` and `mcp__.*[Ww][Aa][Kk][Ee].*`;
+`PostToolUse` on the execute matcher and `mcp__.*__operation[._]inspect`;
+`PostToolUseFailure` on the execute matcher. Claude Code exposes the façade's
+`room.action.execute` as `mcp__<server>__room_action_execute`, and an in-band
+tool error fires `PostToolUseFailure` (payload `error`), not `PostToolUse`.
+
+Test: `python3 tests/devapp-execute-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

@@ -165,36 +165,34 @@ describe('build-core-settings.mjs', () => {
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
 	});
 
-	it('registers the DevApp guard on BOTH Pre and Post when its path is supplied', () => {
+	const EXECUTE_MATCHER = 'mcp__.*__room[._]action[._]execute';
+	const INSPECT_MATCHER = 'mcp__.*__operation[._]inspect';
+
+	it('registers the DevApp guard on Pre, Post and PostToolUseFailure', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, DEVAPP_GUARD);
-		// Pre decides; Post records the dispatch_state the Pre decision reads.
-		// A Pre-only registration would deny nothing, so both are asserted.
 		const pre = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		const post = o.hooks.PostToolUse.map((b: any) => b.matcher);
-		assert.ok(pre.includes('mcp__.*__room\\.action\\.execute'));
-		assert.ok(post.includes('mcp__.*__room\\.action\\.execute'));
-		// operation.inspect is the way out of a block: without its Post
-		// registration a `not_started` verdict could never unblock a resubmit.
-		assert.ok(post.includes('mcp__.*__operation\\.inspect'));
-		assert.ok(!pre.includes('mcp__.*__operation\\.inspect'),
-			'inspection must never be gated');
+		const failure = o.hooks.PostToolUseFailure.map((b: any) => b.matcher);
+		assert.ok(pre.includes(EXECUTE_MATCHER));
+		assert.ok(post.includes(EXECUTE_MATCHER));
+		// An in-band tool error (ACTION_OUTCOME_UNKNOWN) only fires PostToolUseFailure.
+		assert.deepEqual(failure, [EXECUTE_MATCHER]);
+		assert.ok(post.includes(INSPECT_MATCHER));
+		assert.ok(!pre.includes(INSPECT_MATCHER), 'inspection must never be gated');
 	});
 
-	it('the DevApp execute matcher selects the façade tool and nothing else', () => {
-		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, DEVAPP_GUARD);
-		const blk = o.hooks.PreToolUse.find(
-			(b: any) => b.matcher === 'mcp__.*__room\\.action\\.execute',
-		);
-		const re = new RegExp(blk.matcher);
-		// The server half is chosen by the Desktop credential bridge, so the
-		// matcher must survive any name it picks.
-		assert.ok(re.test('mcp__ag2-space__room.action.execute'));
-		assert.ok(re.test('mcp__ag2space-dev__room.action.execute'));
-		// Zero-effect reads, discovery and inspection are never blocked.
-		assert.ok(!re.test('mcp__ag2-space__room.action.read'));
-		assert.ok(!re.test('mcp__ag2-space__room.actions.search'));
-		assert.ok(!re.test('mcp__ag2-space__operation.inspect'));
-		assert.ok(!re.test('Bash'));
+	it('the DevApp matchers select the tool names Claude Code actually emits', () => {
+		const execute = new RegExp(EXECUTE_MATCHER);
+		const inspect = new RegExp(INSPECT_MATCHER);
+		// Claude Code folds the façade's dots to `_`; the server half is the bridge's.
+		assert.ok(execute.test('mcp__ag2-space__room_action_execute'));
+		assert.ok(execute.test('mcp__ag2space-dev__room_action_execute'));
+		assert.ok(execute.test('mcp__ag2-space__room.action.execute'));
+		assert.ok(inspect.test('mcp__ag2-space__operation_inspect'));
+		assert.ok(!execute.test('mcp__ag2-space__room_action_read'));
+		assert.ok(!execute.test('mcp__ag2-space__room_actions_search'));
+		assert.ok(!execute.test('mcp__ag2-space__operation_inspect'));
+		assert.ok(!execute.test('Bash'));
 	});
 
 	it('omitting the DevApp guard path leaves the previous shape untouched', () => {
@@ -202,5 +200,6 @@ describe('build-core-settings.mjs', () => {
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
 		assert.equal(o.hooks.PostToolUse.length, 1); // skill telemetry only
+		assert.equal(o.hooks.PostToolUseFailure, undefined);
 	});
 });

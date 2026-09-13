@@ -5,21 +5,23 @@ Run:  python3 tests/devapp-execute-guard.test.py
 
 Exercised the way Claude Code runs it — subprocess, one hook JSON on stdin,
 decision JSON on stdout (the hook-driver idiom of tests/gmail-write-guard.test.py).
+Payload shapes are the ones Claude Code 2.1.270 sent to a hook for a real MCP
+server: tool names with dots folded to `_`, an in-band tool error delivered as
+PostToolUseFailure `error` text, a success as PostToolUse `tool_response` blocks.
 
 `replay()` is the trace oracle: it walks a CANDIDATE tool-call trace through the
-guard and returns only the calls the guard actually permitted, recording each
-permitted call's result through PostToolUse first. Asserting on that returned
-trace is what proves "no second execute" mechanically rather than by prose.
+guard and returns only the calls the guard permitted, recording each permitted
+call's result first. Asserting on that trace proves "no second execute".
 
 Error shapes are the frozen contract's, loaded from tests/fixtures/devapp-mcp/
-(verbatim C0 samples; digests in that dir's DIGEST file, contract digest
-sha256:eebd0e4aaafd7b83163c20ce41cda0a79844449de71cb096d29446ac3fd56a60).
+(verbatim C0 samples; digests in that dir's DIGEST file).
 """
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -28,13 +30,28 @@ FIXTURES = REPO / "tests" / "fixtures" / "devapp-mcp"
 CATALOG = json.loads((FIXTURES / "error-catalog.json").read_text())
 
 SERVER = "mcp__ag2-space__"
-EXECUTE = SERVER + "room.action.execute"
-READ = SERVER + "room.action.read"
-DESCRIBE = SERVER + "room.actions.describe"
-SEARCH = SERVER + "room.actions.search"
-INSPECT = SERVER + "operation.inspect"
+EXECUTE = SERVER + "room_action_execute"
+READ = SERVER + "room_action_read"
+DESCRIBE = SERVER + "room_actions_describe"
+SEARCH = SERVER + "room_actions_search"
+INSPECT = SERVER + "operation_inspect"
+WAKE = SERVER + "devapp_app_wake"
 
 OP = "op-tasks-create-7f3a"
+
+# Recorded verbatim from Claude Code 2.1.270 calling a stdio MCP server whose
+# `room.action.execute` returned an ACTION_OUTCOME_UNKNOWN tool error.
+RECORDED_FAILURE = {
+    "hook_event_name": "PostToolUseFailure",
+    "tool_name": "mcp__ag2-space__room_action_execute",
+    "tool_input": {"room_id": "!r:x", "operation_id": "op-probe-1"},
+    "error": "{\"code\": \"ACTION_OUTCOME_UNKNOWN\", \"message\": \"outcome unknown\", "
+             "\"recoverable\": false, \"details\": {\"source\": \"devapp\", "
+             "\"dispatch_state\": \"dispatched_unknown\", \"next_action\": "
+             "\"inspect_operation\", \"operation_id\": \"op-probe-1\", "
+             "\"correlation_id\": \"c1\"}}",
+    "is_interrupt": False,
+}
 
 
 def envelope(name):
@@ -43,17 +60,37 @@ def envelope(name):
 
 
 def tool_error(name):
-    """C0 delivery form: in-band tool error, envelope as one compact-JSON block."""
-    return {"isError": True,
-            "content": [{"type": "text", "text": json.dumps(envelope(name))}]}
+    """PostToolUseFailure `error`: the façade's one compact-JSON text block."""
+    return json.dumps(envelope(name))
+
+
+def blocks(payload):
+    """PostToolUse `tool_response` for an MCP success: the content blocks."""
+    return [{"type": "text", "text": json.dumps(payload)}]
 
 
 def run_hook(payload, ledger):
-    proc = subprocess.run(
+    return subprocess.run(
         [sys.executable, str(HOOK)], input=json.dumps(payload),
         capture_output=True, text=True,
         env={"PATH": "/usr/bin:/bin", "SUTANDO_DEVAPP_LEDGER": str(ledger)})
-    return proc
+
+
+def pre(tool, ledger, operation_id=OP):
+    return run_hook({"hook_event_name": "PreToolUse", "tool_name": tool,
+                     "tool_input": {"operation_id": operation_id}}, ledger)
+
+
+def post(tool, ledger, response, operation_id=OP):
+    return run_hook({"hook_event_name": "PostToolUse", "tool_name": tool,
+                     "tool_input": {"operation_id": operation_id},
+                     "tool_response": response}, ledger)
+
+
+def failure(tool, ledger, error, operation_id=OP):
+    return run_hook({"hook_event_name": "PostToolUseFailure", "tool_name": tool,
+                     "tool_input": {"operation_id": operation_id},
+                     "error": error, "is_interrupt": False}, ledger)
 
 
 def decision(proc):
@@ -70,15 +107,18 @@ def replay(trace, ledger):
     """Return the sub-trace the guard permitted, feeding results back as it goes."""
     allowed = []
     for call in trace:
-        pre = run_hook({"hook_event_name": "PreToolUse", "tool_name": call["tool"],
-                        "tool_input": call.get("input", {})}, ledger)
-        if decision(pre) == "deny":
+        tool_input = call.get("input", {})
+        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": call["tool"],
+                         "tool_input": tool_input}, ledger)
+        if decision(proc) == "deny":
             continue
         allowed.append(call["tool"])
-        if "response" in call:
+        if "error" in call:
+            run_hook({"hook_event_name": "PostToolUseFailure", "tool_name": call["tool"],
+                      "tool_input": tool_input, "error": call["error"]}, ledger)
+        elif "response" in call:
             run_hook({"hook_event_name": "PostToolUse", "tool_name": call["tool"],
-                      "tool_input": call.get("input", {}),
-                      "tool_response": call["response"]}, ledger)
+                      "tool_input": tool_input, "tool_response": call["response"]}, ledger)
     return allowed
 
 
@@ -88,41 +128,39 @@ class Base(unittest.TestCase):
         self.ledger = Path(self.tmp.name) / "state" / "devapp-operations.json"
         self.addCleanup(self.tmp.cleanup)
 
+    def seed(self, entries):
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text(json.dumps(entries))
+
 
 class Matching(Base):
-    def test_the_matched_tool_name_is_the_one_the_contract_froze(self):
-        """C0 answer 17 freezes the facade names; the hook keys on the tool half.
+    def test_the_matched_tool_name_is_the_one_claude_code_emits(self):
+        """If this string drifts the guard silently stops guarding."""
+        self.assertIn('EXECUTE_TOOL = "room_action_execute"', HOOK.read_text())
+        self.assertEqual(RECORDED_FAILURE["tool_name"], EXECUTE)
 
-        If this string drifts the guard silently stops guarding, so it is pinned
-        against a contract fixture rather than only against the hook's own copy.
-        """
-        src = HOOK.read_text()
-        self.assertIn('MATCHED_TOOL = "room.action.execute"', src)
-        # The fixtures address the same route the tool projects.
-        self.assertEqual(
-            envelope("c0-devapp-action-execute-outcome-unknown.response.json")
-            ["details"]["operation_id"], OP)
+    def test_the_recorded_cli_failure_payload_is_recorded_and_then_denies(self):
+        run_hook(RECORDED_FAILURE, self.ledger)
+        stored = json.loads(self.ledger.read_text())["op-probe-1"]
+        self.assertEqual(stored["dispatch_state"], "dispatched_unknown")
+        self.assertEqual(stored["code"], "ACTION_OUTCOME_UNKNOWN")
+        self.assertEqual(decision(pre(EXECUTE, self.ledger, "op-probe-1")), "deny")
 
     def test_non_mcp_and_unrelated_mcp_tools_are_untouched(self):
-        # The other eight façade tools all pass through: only execute is gated.
         for name in ("Bash", "Read", READ, DESCRIBE, SEARCH, INSPECT,
-                     SERVER + "ag2.whoami", SERVER + "approval.inspect",
-                     SERVER + "room.list", SERVER + "room.inspect",
-                     "mcp__other__room.action.read"):
-            proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": name,
-                             "tool_input": {"operation_id": OP}}, self.ledger)
+                     SERVER + "ag2_whoami", SERVER + "approval_inspect",
+                     SERVER + "room_list", SERVER + "room_inspect",
+                     "mcp__other__room_action_read"):
+            proc = pre(name, self.ledger)
             self.assertIsNone(decision(proc), f"{name} must pass through")
             self.assertEqual(proc.stdout.strip(), "", f"{name} must be silent")
 
-    def test_a_server_rename_still_matches_because_we_key_on_the_tool_half(self):
-        for server in ("mcp__ag2-space__", "mcp__ag2space-dev__", "mcp__AG2__"):
-            self.ledger.parent.mkdir(parents=True, exist_ok=True)
-            self.ledger.write_text(json.dumps(
-                {OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}}))
-            proc = run_hook({"hook_event_name": "PreToolUse",
-                             "tool_name": server + "room.action.execute",
-                             "tool_input": {"operation_id": OP}}, self.ledger)
-            self.assertEqual(decision(proc), "deny", server)
+    def test_any_server_name_and_the_dotted_form_still_match(self):
+        for tool in ("mcp__ag2-space__room_action_execute",
+                     "mcp__ag2space-dev__room_action_execute",
+                     "mcp__ag2-space__room.action.execute"):
+            self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
+            self.assertEqual(decision(pre(tool, self.ledger)), "deny", tool)
 
     def test_an_execute_with_no_operation_id_is_not_blocked(self):
         """Missing id is the backend's business to reject, not a reason to wedge."""
@@ -134,9 +172,7 @@ class Matching(Base):
 
 class DispatchStateRule(Base):
     def test_a_first_execute_is_always_allowed(self):
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
-        self.assertIsNone(decision(proc))
+        self.assertIsNone(decision(pre(EXECUTE, self.ledger)))
 
     def test_resend_is_allowed_only_on_not_dispatched(self):
         """Mirrors error-catalog.json -> retry_decision, read from the fixture."""
@@ -144,79 +180,54 @@ class DispatchStateRule(Base):
         forbidden = CATALOG["retry_decision"]["resend_execute_forbidden_when"]
         self.assertEqual(allowed, ["not_dispatched"])
         for state in allowed + forbidden:
-            self.ledger.parent.mkdir(parents=True, exist_ok=True)
-            self.ledger.write_text(json.dumps(
-                {OP: {"dispatch_state": state, "next_action": "retry_later",
-                      "ts": 9e9}}))
-            proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                             "tool_input": {"operation_id": OP}}, self.ledger)
+            self.seed({OP: {"dispatch_state": state, "next_action": "retry_later",
+                            "ts": 9e9}})
             if state in forbidden:
-                self.assertEqual(decision(proc), "deny", state)
+                self.assertEqual(decision(pre(EXECUTE, self.ledger)), "deny", state)
             else:
-                self.assertIsNone(decision(proc), state)
+                self.assertIsNone(decision(pre(EXECUTE, self.ledger)), state)
 
     def test_recoverable_true_does_not_authorize_a_resend(self):
-        """The tool error says recoverable:true; dispatch_state still forbids it.
-
-        This is the whole point of the contract's `not_a_signal: recoverable`.
-        """
+        """The contract's `not_a_signal: recoverable`: dispatch_state decides."""
         env = envelope("c0-devapp-action-execute-tool-error.response.json")
         self.assertTrue(env["recoverable"])
         self.assertEqual(env["details"]["dispatch_state"], "dispatched_failed")
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": EXECUTE,
-                  "tool_input": {"operation_id": env["details"]["operation_id"]},
-                  "tool_response": tool_error(
-                      "c0-devapp-action-execute-tool-error.response.json")},
-                 self.ledger)
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": env["details"]["operation_id"]}},
-                        self.ledger)
-        self.assertEqual(decision(proc), "deny")
-
-    def test_the_envelope_is_read_out_of_the_in_band_tool_error_block(self):
-        """The façade ships the envelope as compact JSON inside a text block."""
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": EXECUTE,
-                  "tool_input": {"operation_id": OP},
-                  "tool_response": tool_error(
-                      "c0-devapp-action-execute-outcome-unknown.response.json")},
-                 self.ledger)
-        stored = json.loads(self.ledger.read_text())[OP]
-        self.assertEqual(stored["dispatch_state"], "dispatched_unknown")
-        self.assertEqual(stored["code"], "ACTION_OUTCOME_UNKNOWN")
+        op = env["details"]["operation_id"]
+        failure(EXECUTE, self.ledger,
+                tool_error("c0-devapp-action-execute-tool-error.response.json"), op)
+        self.assertEqual(decision(pre(EXECUTE, self.ledger, op)), "deny")
 
     def test_a_success_is_recorded_as_dispatched_completed(self):
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": EXECUTE,
-                  "tool_input": {"operation_id": OP},
-                  "tool_response": {"content": [{"type": "text", "text": "{\"ok\":true}"}]}},
-                 self.ledger)
+        post(EXECUTE, self.ledger, blocks({"ok": True}))
         self.assertEqual(json.loads(self.ledger.read_text())[OP]["dispatch_state"],
                          "dispatched_completed")
+
+    def test_a_failure_without_an_envelope_is_recorded_as_unknown(self):
+        """A client-side timeout or dropped connection may still have run."""
+        failure(EXECUTE, self.ledger, "MCP error -32001: Request timed out")
+        self.assertEqual(json.loads(self.ledger.read_text())[OP]["dispatch_state"],
+                         "dispatched_unknown")
+        proc = pre(EXECUTE, self.ledger)
+        self.assertEqual(decision(proc), "deny")
+        self.assertIn("operation.inspect", reason(proc))
 
 
 class Sleeping(Base):
     def test_sleeping_is_not_dispatched_yet_still_not_retryable(self):
-        """not_dispatched would permit a resend; wait_for_explicit_wake must not.
-
-        A retry loop on a sleeping app is the shape that would pressure someone
-        into waking it, which the contract forbids outright.
-        """
+        """not_dispatched would permit a resend; wait_for_explicit_wake must not."""
         env = envelope("c0-devapp-action-read-sleeping.response.json")
         self.assertEqual(env["details"]["dispatch_state"], "not_dispatched")
         self.assertEqual(env["details"]["next_action"], "wait_for_explicit_wake")
-        self.ledger.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger.write_text(json.dumps(
-            {OP: {"dispatch_state": "not_dispatched",
-                  "next_action": "wait_for_explicit_wake", "ts": 9e9}}))
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
+        failure(EXECUTE, self.ledger,
+                tool_error("c0-devapp-action-read-sleeping.response.json"))
+        proc = pre(EXECUTE, self.ledger)
         self.assertEqual(decision(proc), "deny")
         self.assertIn("sleeping", reason(proc).lower())
 
     def test_any_wake_shaped_mcp_tool_is_refused(self):
-        """C0 adds no public MCP tool, so a wake tool is off-contract by name."""
-        for name in ("mcp__ag2-space__devapp.app.wake",
-                     "mcp__ag2-space__room.app.wake_pod",
-                     "mcp__ag2-space__devapp.mcp.unsleep"):
+        """The contract adds no wake tool, so one is off-contract by name."""
+        for name in (WAKE, SERVER + "room_app_wake_pod",
+                     SERVER + "devapp.app.wakeup"):
             proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": name,
                              "tool_input": {}}, self.ledger)
             self.assertEqual(decision(proc), "deny", name)
@@ -228,45 +239,33 @@ class Traces(Base):
 
     def test_sleeping_produces_no_wake_call_and_no_retry_loop(self):
         sleeping = tool_error("c0-devapp-action-read-sleeping.response.json")
-        # A candidate trace in which the agent misbehaves: it retries the
-        # execute three times and then tries to wake the pod.
+        # A misbehaving candidate: three executes, then a wake attempt.
         trace = [
             {"tool": SEARCH},
             {"tool": DESCRIBE},
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": sleeping},
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": sleeping},
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": sleeping},
-            {"tool": "mcp__ag2-space__devapp.app.wake"},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": sleeping},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": sleeping},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": sleeping},
+            {"tool": WAKE},
         ]
         allowed = replay(trace, self.ledger)
         self.assertEqual(allowed, [SEARCH, DESCRIBE, EXECUTE])
-        self.assertEqual(allowed.count(EXECUTE), 1, "no retry loop")
-        self.assertNotIn("mcp__ag2-space__devapp.app.wake", allowed, "no wake call")
 
     def test_unknown_mutation_yields_no_second_execute_and_inspect_is_reachable(self):
         unknown = tool_error("c0-devapp-action-execute-outcome-unknown.response.json")
         trace = [
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": unknown},
-            # The wrong move: resubmit under the same id.
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": unknown},
             {"tool": EXECUTE, "input": {"operation_id": OP}},
-            # The right move, and it must stay available.
             {"tool": INSPECT, "input": {"operation_id": OP}},
         ]
         allowed = replay(trace, self.ledger)
-        self.assertEqual(allowed.count(EXECUTE), 1, "no second execute")
-        self.assertIn(INSPECT, allowed, "operation.inspect stays reachable")
-        self.assertEqual(allowed[-1], INSPECT)
+        self.assertEqual(allowed, [EXECUTE, INSPECT])
 
     def test_a_freshly_minted_id_is_NOT_stopped_by_this_hook(self):
-        """The guard's limit, pinned so nobody mistakes it for full coverage.
-
-        It keys on operation_id, so an agent that invents a new id for the same
-        work walks straight past it. Only the derivation rule (same inputs →
-        same id) and Core's fingerprint close that hole.
-        """
+        """The guard's limit: keyed on operation_id, so a new id walks past it."""
         unknown = tool_error("c0-devapp-action-execute-outcome-unknown.response.json")
         allowed = replay([
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": unknown},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": unknown},
             {"tool": EXECUTE, "input": {"operation_id": "op-freshly-minted"}},
         ], self.ledger)
         self.assertEqual(allowed, [EXECUTE, EXECUTE])
@@ -274,15 +273,10 @@ class Traces(Base):
     def test_the_inspected_id_is_the_original_one(self):
         env = envelope("c0-devapp-action-execute-outcome-unknown.response.json")
         self.assertEqual(env["details"]["next_action"], "inspect_operation")
-        # The id to inspect is carried on the failure itself, not re-derived.
         self.assertEqual(env["details"]["operation_id"], OP)
 
     def test_a_freshly_minted_id_for_the_same_work_is_still_caught_by_core(self):
-        """The guard stops the same id; Core's fingerprint stops a new one.
-
-        Both halves are needed, and the contract says so — record that here so a
-        future change cannot quietly drop one and call the other sufficient.
-        """
+        """The guard stops the same id; Core's fingerprint stops a new one."""
         binding = CATALOG["operation_binding"]
         self.assertEqual(binding["core_fingerprint"],
                          ["actor", "room_id", "action", "arguments_digest",
@@ -294,18 +288,14 @@ class Traces(Base):
         env = envelope("c0-devapp-action-read-stale-revision.response.json")
         self.assertEqual(env["code"], "CONFLICT")
         self.assertEqual(env["details"]["next_action"], "describe_again")
-        # CONFLICT is not_dispatched, so the guard does NOT block the retry —
-        # the ordering is the agent's to get right, and the trace shows it.
+        # not_dispatched, so the guard does not block; the ordering is the agent's.
         self.assertEqual(env["details"]["dispatch_state"], "not_dispatched")
         trace = [
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": conflict},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": conflict},
             {"tool": DESCRIBE},
             {"tool": EXECUTE, "input": {"operation_id": "op-after-describe"}},
         ]
-        allowed = replay(trace, self.ledger)
-        self.assertEqual(allowed, [EXECUTE, DESCRIBE, EXECUTE])
-        self.assertLess(allowed.index(DESCRIBE), len(allowed) - 1,
-                        "describe precedes the new execute")
+        self.assertEqual(replay(trace, self.ledger), [EXECUTE, DESCRIBE, EXECUTE])
 
 
 # C0.1 ships a fixture per status except these two, derived below from the real
@@ -330,16 +320,10 @@ def inspect_body(status):
     return doc
 
 
-def inspect_result(status):
-    """That body delivered as the façade delivers it: one compact-JSON block."""
-    return {"content": [{"type": "text", "text": json.dumps(inspect_body(status))}]}
-
-
 class InspectVerdict(Base):
     """operation.inspect is the way OUT of a block, so the guard reads it."""
 
     def test_the_record_shape_is_the_one_c0_1_froze(self):
-        """Pins the wrapper and the inner id name against the real fixtures."""
         doc = inspect_body("unknown")
         self.assertEqual(sorted(doc), ["correlation_id", "operation"])
         op = doc["operation"]
@@ -369,75 +353,57 @@ class InspectVerdict(Base):
         self.assertNotIn("room_id", a["body"]["details"], "no room disclosure")
 
     def test_inspect_itself_is_never_blocked(self):
-        self.ledger.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger.write_text(json.dumps(
-            {OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}}))
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": INSPECT,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
-        self.assertIsNone(decision(proc))
+        self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
+        self.assertIsNone(decision(pre(INSPECT, self.ledger)))
 
     def test_not_started_is_the_only_status_that_re_permits_a_resubmit(self):
         outcomes = {"not_started": None, "pending": "deny", "running": "deny",
                     "unknown": "deny", "succeeded": "deny", "failed": "deny",
                     "cancelled": "deny"}
         for status, expected in outcomes.items():
-            self.ledger.parent.mkdir(parents=True, exist_ok=True)
-            self.ledger.write_text(json.dumps(
-                {OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}}))
-            run_hook({"hook_event_name": "PostToolUse", "tool_name": INSPECT,
-                      "tool_input": {"operation_id": OP},
-                      "tool_response": inspect_result(status)}, self.ledger)
-            proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                             "tool_input": {"operation_id": OP}}, self.ledger)
-            self.assertEqual(decision(proc), expected, status)
+            self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
+            post(INSPECT, self.ledger, blocks(inspect_body(status)))
+            self.assertEqual(decision(pre(EXECUTE, self.ledger)), expected, status)
 
     def test_pending_is_refused_as_not_proof_it_did_not_run(self):
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": INSPECT,
-                  "tool_input": {"operation_id": OP},
-                  "tool_response": inspect_result("pending")}, self.ledger)
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
+        post(INSPECT, self.ledger, blocks(inspect_body("pending")))
+        proc = pre(EXECUTE, self.ledger)
         self.assertEqual(decision(proc), "deny")
         self.assertIn("not proof", reason(proc))
 
     def test_the_id_comes_from_the_request_not_the_operation_object(self):
-        """The inner id field name is not yet re-exported; don't depend on it."""
-        payload = inspect_result("not_started")
-        payload["content"][0]["text"] = json.dumps(
-            {"operation": {"status": "not_started"}, "correlation_id": "c"})
-        self.ledger.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger.write_text(json.dumps(
-            {OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}}))
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": INSPECT,
-                  "tool_input": {"operation_id": OP},
-                  "tool_response": payload}, self.ledger)
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
-        self.assertIsNone(decision(proc))
+        self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
+        post(INSPECT, self.ledger,
+             blocks({"operation": {"status": "not_started"}, "correlation_id": "c"}))
+        self.assertIsNone(decision(pre(EXECUTE, self.ledger)))
 
     def test_the_full_recovery_trace(self):
         unknown = tool_error("c0-devapp-action-execute-outcome-unknown.response.json")
         trace = [
-            {"tool": EXECUTE, "input": {"operation_id": OP}, "response": unknown},
+            {"tool": EXECUTE, "input": {"operation_id": OP}, "error": unknown},
             {"tool": EXECUTE, "input": {"operation_id": OP}},          # refused
             {"tool": INSPECT, "input": {"operation_id": OP},
-             "response": inspect_result("not_started")},
+             "response": blocks(inspect_body("not_started"))},
             {"tool": EXECUTE, "input": {"operation_id": OP}},          # now allowed
         ]
-        allowed = replay(trace, self.ledger)
-        self.assertEqual(allowed, [EXECUTE, INSPECT, EXECUTE])
-        self.assertLess(allowed.index(INSPECT), len(allowed) - 1,
-                        "inspect precedes the permitted resubmit")
+        self.assertEqual(replay(trace, self.ledger), [EXECUTE, INSPECT, EXECUTE])
 
 
 class FailOpen(Base):
     def test_a_broken_ledger_allows_rather_than_wedges(self):
         self.ledger.parent.mkdir(parents=True, exist_ok=True)
         self.ledger.write_text("{ not json")
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
+        proc = pre(EXECUTE, self.ledger)
         self.assertEqual(proc.returncode, 0)
         self.assertIsNone(decision(proc))
+
+    def test_a_broken_ledger_is_rebuilt_by_the_next_write(self):
+        """Otherwise one torn file would disable the guard for good."""
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text("{ not json")
+        failure(EXECUTE, self.ledger,
+                tool_error("c0-devapp-action-execute-outcome-unknown.response.json"))
+        self.assertEqual(decision(pre(EXECUTE, self.ledger)), "deny")
 
     def test_garbage_stdin_allows_rather_than_wedges(self):
         proc = subprocess.run([sys.executable, str(HOOK)], input="not json",
@@ -448,9 +414,7 @@ class FailOpen(Base):
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_the_escape_hatch_disables_the_guard(self):
-        self.ledger.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger.write_text(json.dumps(
-            {OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}}))
+        self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
         proc = subprocess.run(
             [sys.executable, str(HOOK)],
             input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
@@ -463,31 +427,28 @@ class FailOpen(Base):
 
 class LedgerDurability(Base):
     def test_the_ledger_outlives_the_process_that_wrote_it(self):
-        """The duplicate arrives in a FRESH session, so session state is useless.
-
-        Each run_hook call is its own process; the deny below therefore proves
-        the record survived, which is the only reason this guard works at all.
-        """
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": EXECUTE,
-                  "tool_input": {"operation_id": OP},
-                  "tool_response": tool_error(
-                      "c0-devapp-action-execute-outcome-unknown.response.json")},
-                 self.ledger)
+        """The duplicate arrives in a FRESH session, so session state is useless."""
+        failure(EXECUTE, self.ledger,
+                tool_error("c0-devapp-action-execute-outcome-unknown.response.json"))
         self.assertTrue(self.ledger.is_file())
-        proc = run_hook({"hook_event_name": "PreToolUse", "tool_name": EXECUTE,
-                         "tool_input": {"operation_id": OP}}, self.ledger)
-        self.assertEqual(decision(proc), "deny")
+        self.assertEqual(decision(pre(EXECUTE, self.ledger)), "deny")
 
     def test_expired_entries_stop_blocking(self):
         """C0 retention is 30 days; a record older than that matches nothing."""
-        self.ledger.parent.mkdir(parents=True, exist_ok=True)
-        self.ledger.write_text(json.dumps(
-            {OP: {"dispatch_state": "dispatched_unknown", "ts": 1.0}}))
-        # A write prunes; then the stale entry no longer denies.
-        run_hook({"hook_event_name": "PostToolUse", "tool_name": EXECUTE,
-                  "tool_input": {"operation_id": "op-other"},
-                  "tool_response": {"content": []}}, self.ledger)
+        self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 1.0}})
+        post(EXECUTE, self.ledger, blocks({"ok": True}), "op-other")
         self.assertNotIn(OP, json.loads(self.ledger.read_text()))
+
+    def test_concurrent_writers_lose_no_entry(self):
+        """Parallel sessions share one workspace ledger; each record must survive."""
+        ids = [f"op-{i}" for i in range(16)]
+        unknown = tool_error("c0-devapp-action-execute-outcome-unknown.response.json")
+        with ThreadPoolExecutor(max_workers=len(ids)) as pool:
+            list(pool.map(lambda op: failure(EXECUTE, self.ledger, unknown, op), ids))
+        self.assertEqual(sorted(json.loads(self.ledger.read_text())), sorted(ids))
+        leftovers = [p.name for p in self.ledger.parent.iterdir()
+                     if p.name.startswith(".devapp-operations.")]
+        self.assertEqual(leftovers, [], "no temp file left behind")
 
 
 if __name__ == "__main__":
