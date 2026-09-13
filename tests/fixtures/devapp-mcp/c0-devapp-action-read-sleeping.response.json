@@ -1,0 +1,23 @@
+{
+  "body": {
+    "code": "DEVAPP_SLEEPING",
+    "correlation_id": "${CORRELATION_ID}",
+    "details": {
+      "action": "devapp.app.tasks_list",
+      "app_state": "sleeping",
+      "catalog_revision": "sha256:8a9f8abf21afbddb60d06e72bbc412f96fd30c0ae364874e47a8fd881241dbe1",
+      "category": "DEVAPP_SLEEPING",
+      "dispatch_state": "not_dispatched",
+      "next_action": "wait_for_explicit_wake",
+      "room_id": "!fixture-devapp-a:dev.ag2.space",
+      "source": "devapp"
+    },
+    "message": "the room app is sleeping",
+    "recoverable": false,
+    "suggested_action": "report that the app is sleeping; an explicit human wake control is the only way to start it"
+  },
+  "headers": {
+    "x-correlation-id": "${CORRELATION_ID}"
+  },
+  "status": 409
+}

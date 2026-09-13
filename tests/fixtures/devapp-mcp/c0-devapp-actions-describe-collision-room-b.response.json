@@ -1,0 +1,87 @@
+{
+  "body": {
+    "action": "devapp.app.tasks_list",
+    "action_revision": "sha256:a1af8c9638e4b4edefcf7a1bc93efe7f214241112b8c7dcfe07ab05929b63d41",
+    "approval_requirement": "none",
+    "catalog_version": "sha256:3e2e7f20c9a752a9eb8162f6abffe74d88ec01c1e79afa406816f5e7bd8f5437",
+    "correlation_id": "${CORRELATION_ID}",
+    "decision": "allow",
+    "effect": "zero_effect",
+    "idempotency_requirement": "none",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    },
+    "output_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tasks": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "created_at": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "open",
+                  "done"
+                ],
+                "type": "string"
+              },
+              "title": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "status",
+              "created_at"
+            ],
+            "type": "object"
+          },
+          "maxItems": 50,
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks",
+        "next_cursor"
+      ],
+      "type": "object"
+    },
+    "policy_version": "policy-v1",
+    "risk": "low",
+    "safe_denial": null,
+    "summary": "List the sample app's tasks for one project.",
+    "target_kind": "room",
+    "title": "List tasks"
+  },
+  "headers": {
+    "x-correlation-id": "${CORRELATION_ID}"
+  },
+  "status": 200
+}

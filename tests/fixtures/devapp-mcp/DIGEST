@@ -1,0 +1,22 @@
+# Verbatim samples from the frozen DevApp MCP contract.
+contract_version  ag2-devapp-mcp/v1
+devapp_contract_digest  sha256:425f739caf56ea72293518ffe5db9fcc9f955f943ac6214e4047743fee8eedae
+#
+# NOT vendored: the operation.inspect samples. That response was corrected
+# after this digest (shape is {operation:{...},correlation_id}, verdict field
+# operation.status) and Backend is re-exporting. Pinning the superseded bytes
+# would encode a shape no producer will emit. The corrected status vocabulary
+# is asserted from the coordinator's frozen statement in
+# tests/devapp-execute-guard.test.py; re-vendor when the new digest lands.
+#
+# Per-file sha256 of the bytes copied here, so drift from C0 is detectable:
+c0-devapp-action-execute-outcome-unknown.response.json  feb3b15968aa56d72321dcf666233b96c3b57306bc97de49c1f089942f5bc258
+c0-devapp-action-execute-tool-error.response.json  2456d3c8a8dd153ba66b36815e8b6a2ca9654b221b3447646e90c120acf10f86
+c0-devapp-action-read-sleeping.response.json  5bec83e44044968e9fae45277ae63d862421c86210dcddaf281d3d783d795210
+c0-devapp-action-read-stale-revision.response.json  251a46d6880e69bd59d4ac002b5fa6436b75f41ce6062ed03fa1bfa98a4798c5
+c0-devapp-actions-describe-collision-room-b.response.json  978da0eacd25147bbda8887aa7f00131901be75c4f676c5ea3ff4b41313c1ea5
+c0-devapp-actions-describe-ready.response.json  10245f91ee9e97ce5a620f1369a2669f365c65bdfae2278303edfa5c42cf0815
+c0-devapp-actions-search-collision-room-a.response.json  4a64a3c10ff9d62402433ad77576a9aaf43cf604b29059a7498b98e7de660533
+c0-devapp-actions-search-collision-room-b.response.json  1a699ddd62dd89a32dcfadbfc632242958c34fb1e89a4cb7bda6e1f316f95074
+c0-devapp-room-inspect-sleeping.response.json  d9b183b436757ab19f9894778b3994b2a67118115c1eede721362c59791f31e4
+error-catalog.json  f2e0c1278487b7415b95aa311f22ffaa192f28363726da69959ea8d608a131e8

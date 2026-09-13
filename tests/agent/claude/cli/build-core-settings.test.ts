@@ -17,9 +17,13 @@ function buildCore(
 	obsJson?: string,
 	skillTelemetryHook?: string,
 	gmailWriteGuardHook?: string,
+	devappExecuteGuardHook?: string,
 ): any {
 	const args =
-		gmailWriteGuardHook !== undefined
+		devappExecuteGuardHook !== undefined
+			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '',
+				gmailWriteGuardHook ?? '', devappExecuteGuardHook]
+		: gmailWriteGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
 			: skillTelemetryHook === undefined
 				? obsJson === undefined
@@ -42,6 +46,7 @@ function shellParsedPath(command: string): string {
 
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
+const DEVAPP_GUARD = '/x/hooks/devapp-execute-guard.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
 
 describe('build-core-settings.mjs', () => {
@@ -158,5 +163,44 @@ describe('build-core-settings.mjs', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
+	});
+
+	it('registers the DevApp guard on BOTH Pre and Post when its path is supplied', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, DEVAPP_GUARD);
+		// Pre decides; Post records the dispatch_state the Pre decision reads.
+		// A Pre-only registration would deny nothing, so both are asserted.
+		const pre = o.hooks.PreToolUse.map((b: any) => b.matcher);
+		const post = o.hooks.PostToolUse.map((b: any) => b.matcher);
+		assert.ok(pre.includes('mcp__.*__room\\.action\\.execute'));
+		assert.ok(post.includes('mcp__.*__room\\.action\\.execute'));
+		// operation.inspect is the way out of a block: without its Post
+		// registration a `not_started` verdict could never unblock a resubmit.
+		assert.ok(post.includes('mcp__.*__operation\\.inspect'));
+		assert.ok(!pre.includes('mcp__.*__operation\\.inspect'),
+			'inspection must never be gated');
+	});
+
+	it('the DevApp execute matcher selects the façade tool and nothing else', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, DEVAPP_GUARD);
+		const blk = o.hooks.PreToolUse.find(
+			(b: any) => b.matcher === 'mcp__.*__room\\.action\\.execute',
+		);
+		const re = new RegExp(blk.matcher);
+		// The server half is chosen by the Desktop credential bridge, so the
+		// matcher must survive any name it picks.
+		assert.ok(re.test('mcp__ag2-space__room.action.execute'));
+		assert.ok(re.test('mcp__ag2space-dev__room.action.execute'));
+		// Zero-effect reads, discovery and inspection are never blocked.
+		assert.ok(!re.test('mcp__ag2-space__room.action.read'));
+		assert.ok(!re.test('mcp__ag2-space__room.actions.search'));
+		assert.ok(!re.test('mcp__ag2-space__operation.inspect'));
+		assert.ok(!re.test('Bash'));
+	});
+
+	it('omitting the DevApp guard path leaves the previous shape untouched', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
+		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
+		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
+		assert.equal(o.hooks.PostToolUse.length, 1); // skill telemetry only
 	});
 });

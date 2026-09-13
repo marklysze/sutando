@@ -1,0 +1,41 @@
+{
+  "body": {
+    "correlation_id": "${CORRELATION_ID}",
+    "room": {
+      "catalog_version": "${STATIC_CATALOG_VERSION}",
+      "context_id": null,
+      "name": "Fixture DevApp Room",
+      "policy_version": "policy-v1",
+      "profile": "devapp-v1",
+      "profile_contract": {
+        "profile": "devapp-v1",
+        "revision": "${PROFILE_CONTRACT_REVISION}",
+        "state_contracts": {}
+      },
+      "room_id": "!fixture-devapp-a:dev.ag2.space",
+      "room_type": "devapp",
+      "safe_metadata": {
+        "devapp_app": {
+          "app_state": "sleeping",
+          "catalog": {
+            "action_count": 2,
+            "catalog_revision": "sha256:8a9f8abf21afbddb60d06e72bbc412f96fd30c0ae364874e47a8fd881241dbe1",
+            "last_successful_discovery_at": "2026-09-14T09:00:00Z",
+            "stale": false
+          },
+          "contract_version": "ag2-devapp-mcp/v1",
+          "diagnostic": null,
+          "intent": "enabled",
+          "last_observation_at": "2026-09-14T10:00:00Z",
+          "pod_generation": 7,
+          "release_id": "tasks-sample/2026.09.14+a1",
+          "source": "devapp"
+        }
+      }
+    }
+  },
+  "headers": {
+    "x-correlation-id": "${CORRELATION_ID}"
+  },
+  "status": 200
+}

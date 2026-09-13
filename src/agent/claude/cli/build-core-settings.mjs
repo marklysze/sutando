@@ -27,6 +27,11 @@
 //                    script honors the telemetry opt-out on its own.
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
+//   arg5 (optional): path to hooks/devapp-execute-guard.py — registered under
+//                    BOTH PreToolUse (refuse a duplicate DevApp execute) and
+//                    PostToolUse (record the dispatch_state that decides it).
+//                    Both are required: the Pre decision is only as good as the
+//                    Post record it reads.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -104,6 +109,41 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
+// DevApp duplicate-execute guard. Registered on BOTH events with the SAME
+// matcher: Pre refuses the resend, Post records the dispatch_state it refuses
+// on. Matching the tool half (`…__room.action.execute`) rather than a server
+// name, because the Desktop credential bridge chooses the server half.
+const devappExecuteGuardHook = process.argv[6] || '';
+let devappExecuteGuardSettings = null;
+if (devappExecuteGuardHook.trim()) {
+	const cmd = `python3 ${shq(devappExecuteGuardHook)}`;
+	const executeMatcher = 'mcp__.*__room\\.action\\.execute';
+	// Second PreToolUse matcher, narrow on purpose rather than a blanket
+	// `mcp__.*`: C0 answer 17 freezes that no wake tool exists, so a wake-named
+	// MCP tool is off-contract and the hook must be able to see it — but paying
+	// a hook spawn on EVERY mcp call to catch a tool that cannot exist is not
+	// worth it. The hook no-ops for anything it does not own.
+	const wakeMatcher = 'mcp__.*[Ww][Aa][Kk][Ee].*';
+	// operation.inspect is the contract's way OUT of a blocked operation: only
+	// its `not_started` verdict re-permits a resubmit. Without this PostToolUse
+	// registration the guard would wedge the recovery path it exists to protect.
+	const inspectMatcher = 'mcp__.*__operation\\.inspect';
+	devappExecuteGuardSettings = {
+		hooks: {
+			PreToolUse: [
+				{ matcher: executeMatcher, hooks: [{ type: 'command', command: cmd }] },
+				{ matcher: wakeMatcher, hooks: [{ type: 'command', command: cmd }] },
+			],
+			PostToolUse: [
+				{ matcher: executeMatcher, hooks: [{ type: 'command', command: cmd }] },
+				{ matcher: inspectMatcher, hooks: [{ type: 'command', command: cmd }] },
+			],
+		},
+	};
+}
+
 process.stdout.write(
-	JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings)),
+	JSON.stringify(mergeHookSettings(
+		guardSettings, obsSettings, skillTelemetrySettings,
+		gmailWriteGuardSettings, devappExecuteGuardSettings)),
 );
