@@ -17,13 +17,9 @@ function buildCore(
 	obsJson?: string,
 	skillTelemetryHook?: string,
 	gmailWriteGuardHook?: string,
-	roomActionGuardHook?: string,
 ): any {
 	const args =
-		roomActionGuardHook !== undefined
-			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '',
-				gmailWriteGuardHook ?? '', roomActionGuardHook]
-		: gmailWriteGuardHook !== undefined
+		gmailWriteGuardHook !== undefined
 			? [CORE_BUILDER, guardPath, obsJson ?? '', skillTelemetryHook ?? '', gmailWriteGuardHook]
 			: skillTelemetryHook === undefined
 				? obsJson === undefined
@@ -46,7 +42,6 @@ function shellParsedPath(command: string): string {
 
 const GUARD = '/x/hooks/skip-ask-user-question.py';
 const SKILL_TELEMETRY = '/x/hooks/skill-usage-telemetry.py';
-const ROOM_ACTION_GUARD = '/x/hooks/room-action-execute-guard.py';
 const GMAIL_WRITE_GUARD = '/x/hooks/gmail-write-guard.py';
 
 describe('build-core-settings.mjs', () => {
@@ -163,52 +158,5 @@ describe('build-core-settings.mjs', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
-	});
-
-	const EXECUTE_MATCHER = 'mcp__.*__room[._]action[._]execute';
-	const INSPECT_MATCHER = 'mcp__.*__operation[._]inspect';
-
-	it('registers the room-action guard on Pre, Post and PostToolUseFailure', () => {
-		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, ROOM_ACTION_GUARD);
-		const pre = o.hooks.PreToolUse.map((b: any) => b.matcher);
-		const post = o.hooks.PostToolUse.map((b: any) => b.matcher);
-		const failure = o.hooks.PostToolUseFailure.map((b: any) => b.matcher);
-		assert.ok(pre.includes(EXECUTE_MATCHER));
-		assert.ok(post.includes(EXECUTE_MATCHER));
-		// An in-band tool error (ACTION_OUTCOME_UNKNOWN) only fires PostToolUseFailure.
-		assert.deepEqual(failure, [EXECUTE_MATCHER]);
-		assert.ok(post.includes(INSPECT_MATCHER));
-		assert.ok(!pre.includes(INSPECT_MATCHER), 'inspection must never be gated');
-	});
-
-	it('the room-action matchers select the tool names Claude Code actually emits', () => {
-		const execute = new RegExp(EXECUTE_MATCHER);
-		const inspect = new RegExp(INSPECT_MATCHER);
-		// Claude Code folds the façade's dots to `_`; the server half is the bridge's.
-		assert.ok(execute.test('mcp__ag2-space__room_action_execute'));
-		assert.ok(execute.test('mcp__ag2space-dev__room_action_execute'));
-		assert.ok(execute.test('mcp__ag2-space__room.action.execute'));
-		assert.ok(inspect.test('mcp__ag2-space__operation_inspect'));
-		assert.ok(!execute.test('mcp__ag2-space__room_action_read'));
-		assert.ok(!execute.test('mcp__ag2-space__room_actions_search'));
-		assert.ok(!execute.test('mcp__ag2-space__operation_inspect'));
-		assert.ok(!execute.test('Bash'));
-	});
-
-	it('the wake matcher is scoped to the ag2-space connection', () => {
-		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, ROOM_ACTION_GUARD);
-		const wake = o.hooks.PreToolUse.map((b: any) => b.matcher)
-			.find((m: string) => /[Ww]\]\[[Aa]/.test(m));
-		assert.equal(wake, 'mcp__ag2-space__.*[Ww][Aa][Kk][Ee].*');
-		assert.ok(new RegExp(wake).test('mcp__ag2-space__app_wake'));
-		assert.ok(!new RegExp(wake).test('mcp__homeassistant__wake_on_lan'));
-	});
-
-	it('omitting the room-action guard path leaves the previous shape untouched', () => {
-		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
-		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
-		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
-		assert.equal(o.hooks.PostToolUse.length, 1); // skill telemetry only
-		assert.equal(o.hooks.PostToolUseFailure, undefined);
 	});
 });

@@ -27,8 +27,6 @@
 //                    script honors the telemetry opt-out on its own.
 //   arg4 (optional): path to hooks/gmail-write-guard.py — registered under
 //                    PreToolUse for the Gmail MCP connector's write tools.
-//   arg5 (optional): path to hooks/room-action-execute-guard.py — PreToolUse
-//                    refuses a duplicate room.action.execute; Post events record outcomes.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -106,29 +104,6 @@ if (gmailWriteGuardHook.trim()) {
 	};
 }
 
-// Claude Code exposes `room.action.execute` as `…__room_action_execute`; both match.
-// An in-band MCP tool error fires PostToolUseFailure, never PostToolUse.
-const roomActionGuardHook = process.argv[6] || '';
-let roomActionGuardSettings = null;
-if (roomActionGuardHook.trim()) {
-	const cmd = `python3 ${shq(roomActionGuardHook)}`;
-	const hook = (matcher) => ({ matcher, hooks: [{ type: 'command', command: cmd }] });
-	const executeMatcher = 'mcp__.*__room[._]action[._]execute';
-	// Wake-named tools on the room-action connection only; other servers are not ours.
-	const wakeMatcher = 'mcp__ag2-space__.*[Ww][Aa][Kk][Ee].*';
-	// Recorded, never gated: its `not_started` verdict re-permits a resubmit.
-	const inspectMatcher = 'mcp__.*__operation[._]inspect';
-	roomActionGuardSettings = {
-		hooks: {
-			PreToolUse: [hook(executeMatcher), hook(wakeMatcher)],
-			PostToolUse: [hook(executeMatcher), hook(inspectMatcher)],
-			PostToolUseFailure: [hook(executeMatcher)],
-		},
-	};
-}
-
 process.stdout.write(
-	JSON.stringify(mergeHookSettings(
-		guardSettings, obsSettings, skillTelemetrySettings,
-		gmailWriteGuardSettings, roomActionGuardSettings)),
+	JSON.stringify(mergeHookSettings(guardSettings, obsSettings, skillTelemetrySettings, gmailWriteGuardSettings)),
 );

@@ -1,8 +1,0 @@
-# Test scope only, never a production dependency: Sutando has no MCP client —
-# the coding-agent CLI is the client. tests/mcp-facade.test.py uses this SDK to
-# stand up a real MCP server and prove a structured tool error survives the MCP
-# tool-error boundary.
-#
-# Exact pin, matching the ag2-space façade's handshake (2025-11-25).
-# The suite SKIPS when this is absent, so CI stays green without it.
-mcp==2.1.1
