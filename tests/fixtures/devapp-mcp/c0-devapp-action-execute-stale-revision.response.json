@@ -1,0 +1,23 @@
+{
+  "body": {
+    "code": "CONFLICT",
+    "correlation_id": "${CORRELATION_ID}",
+    "details": {
+      "action": "devapp.app.tasks_create",
+      "action_revision": "sha256:cc41dc8e5218135c01511ad2b138bb4de2ee9482d2b832c749e51cc867259abc",
+      "catalog_revision": "sha256:8a9f8abf21afbddb60d06e72bbc412f96fd30c0ae364874e47a8fd881241dbe1",
+      "category": "DEVAPP_REVISION_CONFLICT",
+      "dispatch_state": "not_dispatched",
+      "next_action": "describe_again",
+      "room_id": "!fixture-devapp-a:dev.ag2.space",
+      "source": "devapp"
+    },
+    "message": "Action schema changed after discovery",
+    "recoverable": true,
+    "suggested_action": "describe the Action again"
+  },
+  "headers": {
+    "x-correlation-id": "${CORRELATION_ID}"
+  },
+  "status": 409
+}

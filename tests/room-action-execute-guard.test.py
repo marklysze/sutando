@@ -211,6 +211,27 @@ class DispatchStateRule(Base):
         self.assertEqual(decision(proc), "deny")
         self.assertIn("operation.inspect", reason(proc))
 
+    def test_every_vendored_execute_error_follows_the_dispatch_state_rule(self):
+        """Each real execute error as Claude Code delivers it, then an identical resend."""
+        forbidden = set(CATALOG["retry_decision"]["resend_execute_forbidden_when"])
+        names = sorted(p.name for p in FIXTURES.glob("c0-devapp-action-execute-*.response.json")
+                       if p.name != "c0-devapp-action-execute-ok.response.json")
+        self.assertGreaterEqual(len(names), 5)
+        for name in names:
+            self.ledger.unlink(missing_ok=True)
+            failure(EXECUTE, self.ledger, tool_error(name))
+            blocked = envelope(name)["details"]["dispatch_state"] in forbidden
+            self.assertEqual(decision(pre(EXECUTE, self.ledger)),
+                             "deny" if blocked else None, name)
+
+    def test_the_real_execute_ok_is_recorded_as_dispatched_completed(self):
+        ok = envelope("c0-devapp-action-execute-ok.response.json")
+        self.assertEqual(ok["operation"]["dispatch_state"], "dispatched_completed")
+        post(EXECUTE, self.ledger, blocks(ok))
+        self.assertEqual(json.loads(self.ledger.read_text())[OP]["dispatch_state"],
+                         "dispatched_completed")
+        self.assertEqual(decision(pre(EXECUTE, self.ledger)), "deny")
+
 
 class Sleeping(Base):
     def test_sleeping_is_not_dispatched_yet_still_not_retryable(self):

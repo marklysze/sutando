@@ -46,6 +46,17 @@
       "zero_effect_only": true
     },
     {
+      "category": "DEVAPP_OPERATION_CONFLICT",
+      "code": "CONFLICT",
+      "dispatch_state": "not_dispatched",
+      "http_status": 409,
+      "message": "operation_id is already bound to another request",
+      "next_action": "inspect_operation",
+      "operation_id": "required",
+      "recoverable": false,
+      "suggested_action": "inspect the original operation; use its arguments, or choose a new operation_id"
+    },
+    {
       "category": "DEVAPP_REVISION_CONFLICT",
       "code": "CONFLICT",
       "dispatch_state": "not_dispatched",
@@ -55,6 +66,17 @@
       "operation_id": "absent",
       "recoverable": true,
       "suggested_action": "describe the Action again"
+    },
+    {
+      "category": "DEVAPP_INVALID_ARGUMENTS",
+      "code": "INVALID_INPUT",
+      "dispatch_state": "not_dispatched",
+      "http_status": 400,
+      "message": "arguments do not match the registered Action schema",
+      "next_action": "correct_arguments",
+      "operation_id": "absent",
+      "recoverable": true,
+      "suggested_action": "describe the Action and correct its arguments"
     },
     {
       "category": "ACTION_NOT_FOUND",
