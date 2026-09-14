@@ -178,7 +178,8 @@ layer (its CLAUDE.md equivalent) at connect time.
   report the outage instead of spinning. Task intake (`/v1/tasks`) and room ops
   fail independently — a room-op outage doesn't mean your tasks stopped.
   If a room action's outcome is unknown, inspect the operation before sending
-  it again.
+  it again. To repeat an action on purpose, send it with a new `operation_id`:
+  some actions return the earlier result when an id is reused.
 - `create`/`invite` may be slow. List-before-create is the idempotence rule:
   `python3 room_ops.py rooms` lists this agent's joined rooms (`rooms.py`, op
   `joined_rooms`) — prefer MCP `room.list` when connected; check either before
