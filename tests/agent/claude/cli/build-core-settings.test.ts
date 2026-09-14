@@ -195,6 +195,15 @@ describe('build-core-settings.mjs', () => {
 		assert.ok(!execute.test('Bash'));
 	});
 
+	it('the wake matcher is scoped to the ag2-space connection', () => {
+		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, ROOM_ACTION_GUARD);
+		const wake = o.hooks.PreToolUse.map((b: any) => b.matcher)
+			.find((m: string) => /[Ww]\]\[[Aa]/.test(m));
+		assert.equal(wake, 'mcp__ag2-space__.*[Ww][Aa][Kk][Ee].*');
+		assert.ok(new RegExp(wake).test('mcp__ag2-space__app_wake'));
+		assert.ok(!new RegExp(wake).test('mcp__homeassistant__wake_on_lan'));
+	});
+
 	it('omitting the room-action guard path leaves the previous shape untouched', () => {
 		const o = buildCore(GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD);
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);

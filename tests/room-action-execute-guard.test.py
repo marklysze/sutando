@@ -147,10 +147,13 @@ class Matching(Base):
         self.assertEqual(decision(pre(EXECUTE, self.ledger, "op-probe-1")), "deny")
 
     def test_non_mcp_and_unrelated_mcp_tools_are_untouched(self):
+        # Seeded, so a tool the hook wrongly matched would be denied, not pass by default.
+        self.seed({OP: {"dispatch_state": "dispatched_unknown", "ts": 9e9}})
         for name in ("Bash", "Read", READ, DESCRIBE, SEARCH, INSPECT,
                      SERVER + "ag2_whoami", SERVER + "approval_inspect",
                      SERVER + "room_list", SERVER + "room_inspect",
-                     "mcp__other__room_action_read"):
+                     "mcp__other__room_action_read",
+                     "mcp__homeassistant__wake_on_lan"):
             proc = pre(name, self.ledger)
             self.assertIsNone(decision(proc), f"{name} must pass through")
             self.assertEqual(proc.stdout.strip(), "", f"{name} must be silent")
@@ -291,6 +294,15 @@ class Traces(Base):
         ], self.ledger)
         self.assertEqual(allowed, [EXECUTE, EXECUTE])
 
+    def test_a_session_that_dies_mid_call_leaves_no_record(self):
+        """The other limit: outcomes are recorded on return, so a crash mid-call is not caught."""
+        allowed = replay([
+            {"tool": EXECUTE, "input": {"operation_id": OP}},   # no result ever arrives
+            {"tool": EXECUTE, "input": {"operation_id": OP}},
+        ], self.ledger)
+        self.assertEqual(allowed, [EXECUTE, EXECUTE])
+        self.assertFalse(self.ledger.exists())
+
     def test_the_inspected_id_is_the_original_one(self):
         env = envelope("c0-devapp-action-execute-outcome-unknown.response.json")
         self.assertEqual(env["details"]["next_action"], "inspect_operation")
@@ -420,6 +432,7 @@ class FailOpen(Base):
         proc = pre(EXECUTE, self.ledger)
         self.assertEqual(proc.returncode, 0)
         self.assertIsNone(decision(proc))
+        self.assertIn(f"unreadable ledger {self.ledger}", proc.stderr)
 
     def test_a_broken_ledger_is_rebuilt_by_the_next_write(self):
         """Otherwise one torn file would disable the guard for good."""

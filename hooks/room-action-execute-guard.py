@@ -3,12 +3,14 @@
 
 Guards `room.action.execute` on the `ag2-space` MCP connection. PreToolUse denies
 an execute whose operation_id the ledger records as already dispatched, and any
-wake-named MCP tool. PostToolUse / PostToolUseFailure record the error's
-`details.dispatch_state`; an operation.inspect `operation.status` of `not_started`
-is the only thing that re-permits a resubmit. The ledger lives in the workspace,
-not the session, because a re-dispatched task runs in a fresh session.
+wake-named tool on that connection. PostToolUse / PostToolUseFailure record the
+error's `details.dispatch_state`; an operation.inspect `operation.status` of
+`not_started` is the only thing that re-permits a resubmit. The ledger lives in
+the workspace, not the session, because a re-dispatched task runs in a fresh
+session.
 
-Keyed by operation_id, so a newly minted id for the same work is not caught here.
+Not caught here, both covered server-side: a session that dies mid-call leaves no
+record (outcomes are recorded on return), and a newly minted operation_id.
 Escape hatch: SUTANDO_ALLOW_ROOM_ACTION_REPLAY=1. Fail-open on any error.
 """
 import fcntl
@@ -29,6 +31,8 @@ RESEND_FORBIDDEN = {"dispatched_unknown", "dispatched_failed", "dispatched_compl
 # Arrives with not_dispatched, yet only an explicit human wake may follow it.
 NO_AUTOMATIC_WAKE = "wait_for_explicit_wake"
 WAKE_TOKENS = {"wake", "wakeup"}
+# Another server's wake tool is none of this guard's business.
+WAKE_SERVER = "ag2-space"
 
 LEDGER_NAME = "room-action-operations.json"
 # The contract's operation retention; an older entry matches no stored outcome.
@@ -55,7 +59,9 @@ def _load(path):
     except FileNotFoundError:
         return {}
     except ValueError:
-        # Unreadable: the next write starts a fresh ledger instead of staying disabled.
+        # Fail open, but loudly: every recorded dispatch is forgotten at once.
+        print(f"[room-action-execute-guard] unreadable ledger {path}; starting fresh",
+              file=sys.stderr)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -98,9 +104,10 @@ def tool_segment(tool_name):
 
 
 def is_wake_attempt(tool_name):
-    """True for an MCP tool whose name reads as a wake verb (the contract has none)."""
-    seg = tool_segment(tool_name)
-    return seg is not None and bool(set(seg.lower().split("_")) & WAKE_TOKENS)
+    """True for a wake-named tool on the room-action connection (the contract has none)."""
+    if not isinstance(tool_name, str) or not tool_name.startswith(f"mcp__{WAKE_SERVER}__"):
+        return False
+    return bool(set(tool_segment(tool_name).lower().split("_")) & WAKE_TOKENS)
 
 
 def _find(node, pick, depth=0):

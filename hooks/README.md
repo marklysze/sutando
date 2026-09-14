@@ -188,7 +188,7 @@ Test: `python3 tests/gmail-write-guard.test.py`.
 ## `room-action-execute-guard.py`
 
 Refuses a **second `room.action.execute` for an operation that was already
-dispatched** on the `ag2-space` MCP connection, and any wake-named MCP tool. The
+dispatched** on the `ag2-space` MCP connection, and any wake-named tool on it. The
 task layer is at-least-once: a task whose outcome is unknown is re-run by a fresh
 session, which would re-send the mutation. The hook keeps a workspace ledger
 (`<workspace>/state/room-action-operations.json`, keyed by `operation_id`) so that
@@ -198,16 +198,22 @@ re-run is refused. It follows two contract fields: an error's
 `operation.status` (after an unknown outcome, only `not_started` re-permits a
 resubmit).
 
-Limit: a newly minted `operation_id` for the same work is not caught here; the
-id-derivation rule and the server's request fingerprint cover that. Claude
-runtime only — the Codex core registers no equivalent hook.
+Limits, both covered server-side rather than here. Outcomes are recorded when
+the call returns, so a session that dies mid-call leaves no record and a fresh
+session's same-id resend is allowed; the server replays a known `operation_id`
+instead of running it again. Recording at PreToolUse instead would strand a
+call that never reached the server, since only an `operation.inspect` verdict of
+`not_started` unblocks one. And a newly minted `operation_id` for the same work
+is not caught; the id-derivation rule and the server's request fingerprint
+cover that. Claude runtime only — the Codex core registers no equivalent hook.
 
 Escape hatch: `SUTANDO_ALLOW_ROOM_ACTION_REPLAY=1`. Fail-OPEN on hook errors.
 
 ### Registration
 
 **Auto-registered** for every Claude core session by `build-core-settings.mjs`:
-`PreToolUse` on `mcp__.*__room[._]action[._]execute` and `mcp__.*[Ww][Aa][Kk][Ee].*`;
+`PreToolUse` on `mcp__.*__room[._]action[._]execute` and
+`mcp__ag2-space__.*[Ww][Aa][Kk][Ee].*` (wake-named tools on that connection only);
 `PostToolUse` on the execute matcher and `mcp__.*__operation[._]inspect`;
 `PostToolUseFailure` on the execute matcher. Claude Code exposes the façade's
 `room.action.execute` as `mcp__<server>__room_action_execute`, and an in-band

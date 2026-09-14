@@ -114,8 +114,8 @@ if (roomActionGuardHook.trim()) {
 	const cmd = `python3 ${shq(roomActionGuardHook)}`;
 	const hook = (matcher) => ({ matcher, hooks: [{ type: 'command', command: cmd }] });
 	const executeMatcher = 'mcp__.*__room[._]action[._]execute';
-	// Narrower than `mcp__.*` so the hook spawns only for wake-named tools.
-	const wakeMatcher = 'mcp__.*[Ww][Aa][Kk][Ee].*';
+	// Wake-named tools on the room-action connection only; other servers are not ours.
+	const wakeMatcher = 'mcp__ag2-space__.*[Ww][Aa][Kk][Ee].*';
 	// Recorded, never gated: its `not_started` verdict re-permits a resubmit.
 	const inspectMatcher = 'mcp__.*__operation[._]inspect';
 	roomActionGuardSettings = {
