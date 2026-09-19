@@ -333,7 +333,18 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
   esac
 fi
 
-STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
+# Only a real Stop event may move the turn boundary; a hand run of this script
+# (no Stop payload on stdin) reports the same decision and records nothing.
+HOOK_PAYLOAD=""
+[ -t 0 ] || IFS= read -r -d '' -t 2 HOOK_PAYLOAD || true
+COMMIT=()
+if SUTANDO_HOOK_PAYLOAD="$HOOK_PAYLOAD" "$PYBIN" -c 'import json,os,sys
+try: d = json.loads(os.environ.get("SUTANDO_HOOK_PAYLOAD") or "{}")
+except ValueError: d = {}
+sys.exit(0 if isinstance(d, dict) and d.get("hook_event_name") == "Stop" else 1)' 2>/dev/null; then
+  COMMIT=(--commit)
+fi
+STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate "${COMMIT[@]}" 2>/dev/null)"
 STOP_RC=$?
 
 # Fail OPEN on anything but an explicit refusal (rc 1 AND a reason): a gate that
