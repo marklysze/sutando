@@ -28,6 +28,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 - connect-apps: the precheck line says `reply_to=room|dm`, and the skill's routing rule is the closed DM list (an apartment search asked in a shared room is answered there); marketplace: "use it now" precedes the report step so a newly activated cloud tool is never announced as needing a dashboard or a restart the script did not print.
+- turn-ledger: a reply sent through the ag2-space MCP (`room.action.execute`) now counts as the turn speaking — the Stop gate reads `state/room-actions.jsonl`, written by the desktop MCP proxy after each successful room action, so it no longer refuses a turn that did reply.
 - import-claude-context: the documented onboarding trigger now matches every request sentence the desktop actually sends — the consent time is optional (`(time not recorded)`), the standalone late-send form is documented, and matching is case-insensitive. Before this, a consent whose time was never recorded did not match the trigger at all. ([#4181])
 
 <!-- fix() PRs go here -->
