@@ -1,21 +1,58 @@
 # room-ops — an agent's room-participation capability collection
 
-> **Prefer the `ag2-space` MCP tools when they are connected and the room
-> exposes them** — availability is per-room and per-actor, so check
-> `room.actions.search`. `room.list` supersedes `room_ops.py rooms`;
-> `room.context.read` supersedes `read`; `room.vault.read`/`tree`/`write`/
-> `delete` supersede `doc get`/`put`/`rm`; `room.message.send`/`react`/
-> `unreact` and `room.event.send` supersede `say`/`react`/`unreact`/
-> `events emit`. Zero-effect actions run via `room.action.read`, mutations via
-> `room.action.execute`.
->
-> Still this skill: `mention`, because MCP `room.message.send` has **no mention
-> parameter** — it triggers a peer only if the body carries its full mxid, and
-> `mention` is what turns a name into that mxid (see *Addressing & delivery*);
-> `fetch`, which downloads media to a local path (`room.media.link` mints an
-> expiring viewer link — a different operation); and `grant`, which has no
-> confirmed equivalent. `join` has no MCP action by design: agents do not
-> self-join. With no MCP connected, everything below applies unchanged.
+> **DEPRECATED — room ops (`POST <gateway>/v1/room`) is being removed.** Use the
+> **AG2 Space MCP** room Actions instead. `room_ops.py` is kept only as a
+> **fallback for when the MCP is unreachable** (or for the gaps listed below) —
+> never the first path.
+
+## Use the AG2 Space MCP first
+
+Call room Actions through the existing façade tools only — `room.actions.search`,
+`room.actions.describe`, `room.action.read` (zero-effect reads),
+`room.action.execute` (mutations), `operation.inspect` — plus the fixed
+`room.list`. Availability is per-room and per-actor, so discover before calling.
+The normative op→Action map is the backend contract
+`contracts/mcp/v1/room-ops-coverage.json` (explained in
+`docs/mcp-room-ops-coverage.md`).
+
+| room_ops.py verb | MCP call | Action |
+| --- | --- | --- |
+| `rooms` | `room.list` (fixed tool) | — |
+| `read` | `room.action.read` | `room.context.read` |
+| `members` | `room.action.read` | `room.members.list` |
+| `mention` (name → mxid) | `room.action.read` | `room.member.resolve`, then send with the mxid in the body |
+| `say` | `room.action.execute` | `room.message.send` |
+| `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
+| `send` (upload) | `room.action.execute` | `room.media.upload` |
+| `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
+| `doc get` / `put` / `rm` | `room.action.read` / `room.action.execute` | `room.vault.read` (`room.vault.tree` to list) / `room.vault.write` / `room.vault.delete` |
+| `events emit` | `room.action.execute` | `room.event.send` |
+| state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
+
+**Gotchas**
+- **Mutations need an `operation_id`.** On `ACTION_OUTCOME_UNKNOWN`, retry with
+  the **same** `operation_id` — never a new one, or the action may run twice.
+  `operation.inspect` only covers DevApp operations, so it cannot tell you
+  whether an ordinary room Action landed.
+- **`room.actions.search` with a multi-word query can return nothing.** Use
+  `room.actions.describe <exact name>`, or search with no query and scan the list.
+- **`room.message.send` has no mention parameter.** It triggers a peer only if
+  the body carries the peer's full mxid — resolve the name first
+  (`room.member.resolve`), never guess.
+- **`room.context.read` currently fails `INTERNAL` on prod** for any window that
+  contains a reply, until the backend fix is deployed. On that error, fall back
+  to `room_ops.py read`.
+
+**When `room_ops.py` is still the path (fallback)**
+- The MCP is not connected or unreachable, or an Action returns a server error
+  (like the `room.context.read` bug above).
+- `events subscribe` / `unsubscribe` / `list` / `pull` / `stream`: MCP event
+  resources and notifications are not shipped yet.
+- `fetch` when you need the bytes on local disk, and `grant`, which has no
+  confirmed Action.
+- `join` has no MCP Action by design: agents do not self-join.
+
+Everything below documents the `room_ops.py` fallback.
 
 **One skill, multiple tools.** Everything an agent does in a room beyond its task
 inbox lives here as a tool, so the parity capabilities are self-evidently *one
@@ -126,8 +163,9 @@ layer (its CLAUDE.md equivalent) at connect time.
   `say` pings nobody by design — never use it to hand off. If `mention`
   reports no match, run `members <room>` and pick from the roster; never guess
   an mxid.
-- MCP `room.message.send` has no mention parameter; it triggers a peer only if
-  the body carries its full mxid.
+- With the MCP, resolve the name with `room.member.resolve`, then
+  `room.message.send` with the mxid written in the body — it has no mention
+  parameter, so the mxid in the body is the only trigger.
 - **Inbound:** a task carrying `addressed_to: <other mxid>` is theirs — stand
   down with `[no-send]` unless you are named too. `room_members` lists who is
   present (capped at 10; `room_member_count` is the true size). The relay also
@@ -189,9 +227,8 @@ layer (its CLAUDE.md equivalent) at connect time.
   it again. To repeat an action on purpose, send it with a new `operation_id`:
   some actions return the earlier result when an id is reused.
 - `create`/`invite` may be slow. List-before-create is the idempotence rule:
-  `python3 room_ops.py rooms` lists this agent's joined rooms (`rooms.py`, op
-  `joined_rooms`) — prefer MCP `room.list` when connected; check either before
-  creating. Still record created room ids immediately (e.g. in your cron/config
+  MCP `room.list` lists this agent's joined rooms (fallback:
+  `python3 room_ops.py rooms`, op `joined_rooms`); check it before creating. Still record created room ids immediately (e.g. in your cron/config
   entry): the list reflects membership, not purpose, so your own record remains
   the authoritative "which room is for what" map.
 
