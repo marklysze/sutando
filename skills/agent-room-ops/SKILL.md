@@ -44,13 +44,9 @@ The normative op→Action map is the backend contract
   (`room.member.resolve`, never guess), then pass the mxid in `mentions` and
   write it in the body too (the relay scans both). Parameters vary per room, so
   `room.actions.describe room.message.send` before relying on `mentions`.
-- **`room.context.read` currently fails `INTERNAL` on prod** for any window that
-  contains a reply, until the backend fix is deployed. On that error, fall back
-  to `room_ops.py read`.
 
 **When `room_ops.py` is still the path (fallback)**
-- The MCP is not connected or unreachable, or an Action returns a server error
-  (like the `room.context.read` bug above).
+- The MCP is not connected or unreachable, or an Action returns a server error.
 - `events subscribe` / `unsubscribe` / `list` / `pull` / `stream`: MCP event
   resources and notifications are not shipped yet.
 - `fetch` when you need the bytes on local disk, and `grant`, which has no
