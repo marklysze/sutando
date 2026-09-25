@@ -33,7 +33,8 @@ The normative op→Action map is the backend contract
 - **Mutations need an `operation_id`.** What to do on `ACTION_OUTCOME_UNKNOWN`
   depends on the Action:
   - Built-in `room.*` Actions: retry with the **same** `operation_id`, never a
-    new one, or the action may run twice.
+    new one, or the action may run twice. A reused id can return the earlier
+    result, so to repeat an action on purpose, use a new id.
   - `devapp.app.*` Actions have no duplicate protection — every call runs. Pass
     the error's `details.operation_id` to `operation.inspect` first, and send
     again only if it shows the call was not dispatched (backend
