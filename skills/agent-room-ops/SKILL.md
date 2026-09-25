@@ -20,7 +20,7 @@ The normative op→Action map is the backend contract
 | `rooms` | `room.list` (fixed tool) | — |
 | `read` | `room.action.read` | `room.context.read` |
 | `members` | `room.action.read` | `room.members.list` |
-| `mention` (name → mxid) | `room.action.read` | `room.member.resolve`, then send with the mxid in the body |
+| `mention` (name → mxid) | `room.action.read` | `room.member.resolve`, then `room.message.send` with the mxid in `mentions` |
 | `say` | `room.action.execute` | `room.message.send` |
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
@@ -30,15 +30,20 @@ The normative op→Action map is the backend contract
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
 **Gotchas**
-- **Mutations need an `operation_id`.** On `ACTION_OUTCOME_UNKNOWN`, retry with
-  the **same** `operation_id` — never a new one, or the action may run twice.
-  `operation.inspect` only covers DevApp operations, so it cannot tell you
-  whether an ordinary room Action landed.
+- **Mutations need an `operation_id`.** What to do on `ACTION_OUTCOME_UNKNOWN`
+  depends on the Action:
+  - Built-in `room.*` Actions: retry with the **same** `operation_id`, never a
+    new one, or the action may run twice.
+  - `devapp.app.*` Actions have no duplicate protection — every call runs. Pass
+    the error's `details.operation_id` to `operation.inspect` first, and send
+    again only if it shows the call was not dispatched (backend
+    `docs/devapp-mcp.md`).
 - **`room.actions.search` with a multi-word query can return nothing.** Use
   `room.actions.describe <exact name>`, or search with no query and scan the list.
-- **`room.message.send` has no mention parameter.** It triggers a peer only if
-  the body carries the peer's full mxid — resolve the name first
-  (`room.member.resolve`), never guess.
+- **To hand off with `room.message.send`, resolve the name first**
+  (`room.member.resolve`, never guess), then pass the mxid in `mentions` and
+  write it in the body too (the relay scans both). Parameters vary per room, so
+  `room.actions.describe room.message.send` before relying on `mentions`.
 - **`room.context.read` currently fails `INTERNAL` on prod** for any window that
   contains a reply, until the backend fix is deployed. On that error, fall back
   to `room_ops.py read`.
@@ -163,9 +168,9 @@ layer (its CLAUDE.md equivalent) at connect time.
   `say` pings nobody by design — never use it to hand off. If `mention`
   reports no match, run `members <room>` and pick from the roster; never guess
   an mxid.
-- With the MCP, resolve the name with `room.member.resolve`, then
-  `room.message.send` with the mxid written in the body — it has no mention
-  parameter, so the mxid in the body is the only trigger.
+- With the MCP, resolve the name with `room.member.resolve`, then call
+  `room.message.send` with the mxid in `mentions` and in the body. Check its
+  parameters with `room.actions.describe` first; they vary per room.
 - **Inbound:** a task carrying `addressed_to: <other mxid>` is theirs — stand
   down with `[no-send]` unless you are named too. `room_members` lists who is
   present (capped at 10; `room_member_count` is the true size). The relay also
