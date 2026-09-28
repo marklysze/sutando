@@ -35,6 +35,8 @@ HEARTBEAT_STALE_S = 90.0
 BEAT_FUTURE_TOLERANCE_S = 5.0
 STATUS_STALE_S = 90.0
 WEDGE_STALE_S = 180.0
+# Motion changes by the second: an older "the pane was moving" says nothing about now.
+WEDGE_MOTION_FRESH_S = 30.0
 POOL_STALE_S = 900.0
 ACTIVITY_LIVE_S = 120.0
 ACTIVITY_TAIL_BYTES = 256 * 1024
@@ -139,7 +141,7 @@ def _wedge_source(ws: Path, now: float) -> dict:
     motion = IDLE if verdict.get("raw_static") else MOVING
     names = list(verdict.get("current_abnormal") or [])
     if kind == "working":
-        op = _opinion(MOVING, HEALTHY)
+        op = _opinion(MOVING if age <= WEDGE_MOTION_FRESH_S else None, HEALTHY)
     elif kind == "idle":
         op = _opinion(IDLE, HEALTHY)
     elif kind == "retry-loop":

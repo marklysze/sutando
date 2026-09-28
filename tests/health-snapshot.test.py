@@ -164,6 +164,14 @@ class CliWedge(Base):
         c = self.core()
         self.assertEqual((c["motion"], c["condition"], c["reason"]), ("idle", "abnormal", "quota-limit"))
 
+    def test_a_working_reading_older_than_the_motion_window_is_not_moving(self):
+        self.ws.supervisor("idle-ready")
+        self._window([], [], last_age=10)
+        self.assertEqual(self.core()["motion"], "moving")
+        self._window([], [], last_age=hs.WEDGE_MOTION_FRESH_S + 40)
+        c = self.core()
+        self.assertEqual((c["motion"], c["condition"]), ("idle", "healthy"))
+
     def test_an_old_window_gives_no_opinion(self):
         self.ws.supervisor("idle-ready")
         self._window(["retrying"], [], last_age=hs.WEDGE_STALE_S + 60)
