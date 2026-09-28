@@ -123,6 +123,17 @@ class CoreVerdicts(Base):
         ])
         self.assertEqual(self.core()["motion"], "moving")
 
+    def test_a_written_or_archived_result_ends_the_task_without_a_done_row(self):
+        self.ws.supervisor("idle-ready")
+        self.ws.lines("state/agent-activity.jsonl", [
+            {"ts": NOW - 10, "kind": "processing", "task": {"id": "task-a"}}])
+        self.assertEqual(self.core()["motion"], "moving")
+        self.ws.touch("results/task-a.txt")
+        self.assertEqual(self.core()["motion"], "idle")
+        (self.ws.root / "results" / "task-a.txt").unlink()
+        self.ws.touch("results/archive/task-a-1790000000.txt")
+        self.assertEqual(self.core()["motion"], "idle")
+
     def test_finished_or_old_activity_is_not_moving(self):
         self.ws.supervisor("idle-ready")
         self.ws.lines("state/agent-activity.jsonl", [

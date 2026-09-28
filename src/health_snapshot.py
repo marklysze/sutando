@@ -150,6 +150,13 @@ def _wedge_source(ws: Path, now: float) -> dict:
     return {**src, "opinion": op}
 
 
+def _has_result(ws: Path, tid: str) -> bool:
+    """A result file is the task's last write, so its presence ends the task; the bridge
+    archives it within seconds as results/archive/<id>-<ts>.txt."""
+    results = ws / "results"
+    return (results / f"{tid}.txt").exists() or any((results / "archive").glob(f"{tid}-*.txt"))
+
+
 def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:
     """{agent id: last row ts} for tasks with no `done` row whose newest row is recent."""
     path = ws / "state" / "agent-activity.jsonl"
@@ -178,7 +185,7 @@ def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:
             done.add(tid)
     out = {}
     for tid, ts in last.items():
-        if tid in done or now - ts > ACTIVITY_LIVE_S:
+        if tid in done or now - ts > ACTIVITY_LIVE_S or _has_result(ws, tid):
             continue
         owner = next((w for w in worker_ids if (ws / "deliveries" / w / f"{tid}.txt").exists()), "core")
         out[owner] = max(ts, out.get(owner, 0))
