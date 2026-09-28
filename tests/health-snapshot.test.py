@@ -195,6 +195,20 @@ class Workers(Base):
         self.assertEqual((w["motion"], w["condition"], w["reason"]), ("unknown", "abnormal", "offline"))
         self.assertEqual(w["since"], NOW - hs.HEARTBEAT_STALE_S - 30)
 
+    def test_alive_follows_the_beat_before_any_screen_verdict_exists(self):
+        self.ws.worker()
+        self.assertIsNone(self.snap(agent="workers")["agents"][0]["alive"])
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["motion"], w["condition"]), (True, "unknown", "unknown"))
+        self.ws.touch(f"state/watchers/{WID}.alive", age=hs.HEARTBEAT_STALE_S + 1)
+        self.assertIs(self.snap(agent="workers")["agents"][0]["alive"], False)
+
+    def test_core_alive_follows_its_heartbeat(self):
+        self.assertIsNone(self.core()["alive"])
+        self.ws.touch(f"state/cores/{HOST}.alive", age=5)
+        self.assertIs(self.core()["alive"], True)
+
     def test_a_future_dated_beat_is_offline_too(self):
         self.ws.worker()
         self.ws.touch(f"state/watchers/{WID}.alive", age=-60)

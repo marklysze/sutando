@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Health snapshot — one read-only answer per agent (core and workers) from existing state files.
 
-Each agent reads as motion (idle | moving | unknown) × condition (healthy | abnormal | unknown),
+Each agent carries `alive` (true | false | null, from its beat file) and reads as motion (idle | moving | unknown) × condition (healthy | abnormal | unknown),
 plus a reason when abnormal. Sources are the files the heartbeat, supervisors, cli_wedge, the pool
 supervisor and the activity hooks already write; nothing here probes a process or a pane, and
 nothing is written. A source past its freshness window gives no opinion rather than a stale one.
@@ -218,6 +218,11 @@ def _pool_source(entry, sampled_at, now: float) -> dict:
     return {**src, "opinion": None}
 
 
+def _alive(beat: dict):
+    """True / False from a beat source, None when there is no beat to judge."""
+    return {"fresh": True, "stale": False}.get(beat.get("value"))
+
+
 def _verdict(agent: dict, sources: dict) -> dict:
     """Abnormal from any source wins; moving from any source wins. The first abnormal source,
     in the order given, names the reason."""
@@ -283,7 +288,8 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             "activity": _activity_source("core", activity, now),
             "self_report": _status_source(ws, now),
         }
-        agents.append((_verdict({"id": "core", "role": "core", "label": None}, sources), sources))
+        agents.append((_verdict({"id": "core", "role": "core", "label": None,
+                                 "alive": _alive(sources["heartbeat"])}, sources), sources))
 
     if agent != "core":
         pool, pool_mtime = _read_json(ws / "state" / "pool-supervision.json")
@@ -305,7 +311,8 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
             }
-            agents.append((_verdict({"id": wid, "role": "worker", "label": label}, sources), sources))
+            agents.append((_verdict({"id": wid, "role": "worker", "label": label,
+                                     "alive": _alive(sources["watcher_beat"])}, sources), sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else
