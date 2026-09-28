@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -44,6 +45,46 @@ ps, wi = sup.ps, sup.wi
 RECOVERED, ALREADY_RUNNING, INDETERMINATE, PAUSED, NO_SESSION, FAILED = (
     "recovered", "already-running", "indeterminate", "paused", "no-recorded-session",
     "failed")
+SUSPENDED = "suspended"
+SUSPENDED_REL = Path("state") / "pool-suspended"
+
+
+def suspended_path(workspace) -> Path:
+    return Path(workspace) / SUSPENDED_REL
+
+
+def suspension(workspace) -> str | None:
+    """The recorded reason the pool is suspended, or None. Never expires: only a
+    deliberate app quit writes it, and the app's next start lifts it."""
+    try:
+        return suspended_path(workspace).read_text().strip() or SUSPENDED
+    except OSError:
+        return None
+
+
+def suspend(workspace, reason: str, now: float | None = None) -> str:
+    path = suspended_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(f"{reason} {int(now if now is not None else time.time())}\n")
+    os.replace(tmp, path)
+    return path.read_text().strip()
+
+
+def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
+    """Lift a suspension and bring back, now, every worker it left dead: a deliberate
+    quit is not a failure, so those workers skip the death ladder and start it afresh."""
+    was = suspension(workspace)
+    suspended_path(workspace).unlink(missing_ok=True)
+    restarted = {}
+    if was:
+        obs = sup.observe(workspace, time.time(), runner=runner or subprocess.run)
+        dead = [w for w, o in obs.items() if o.session_alive is False and not o.paused]
+        restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
+        state = sup.load_state(workspace)
+        sup.save_state(workspace, replace(state, workers={
+            w: e for w, e in state.workers.items() if w not in restarted}))
+    return {"was_suspended": was, "restarted": restarted}
 
 
 def _last_run(workspace, worker_id) -> dict:
@@ -248,6 +289,11 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     rearms = {}
     cards = {}
     for worker_id, decision in decisions.items():
+        # Re-read per action: an app quit can land mid-sweep, just before its tmux kill-server.
+        if decision != ps.ESCALATE and suspension(workspace):
+            if decision == ps.RECOVER:
+                done[worker_id] = {"worker_id": worker_id, "outcome": SUSPENDED}
+            continue
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
@@ -270,21 +316,33 @@ def main(argv=None) -> int:
     p.add_argument("--repo", required=True)
     p.add_argument("--recipient", help="check and remedy one worker")
     p.add_argument("--sweep", action="store_true", help="check and remedy the pool")
+    p.add_argument("--suspend", metavar="REASON",
+                   help="stop remedying until --resume (the app writes this on a real quit)")
+    p.add_argument("--resume", action="store_true",
+                   help="lift a suspension, restart the workers it left dead, then sweep")
     p.add_argument("--dry-run", action="store_true",
                    help="decide and report, but neither remedy nor advance the ladder")
     a = p.parse_args(argv)
-    if bool(a.recipient) == bool(a.sweep):
-        p.error("pass exactly one of --recipient or --sweep")
+    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume))) != 1:
+        p.error("pass exactly one of --recipient, --sweep, --suspend or --resume")
+    if a.suspend:
+        print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
+        return 0
+    resumed = resume(a.workspace, a.repo) if a.resume else None
+    held = suspension(a.workspace)
     try:
         tick = sup.tick(a.workspace, time.time(),
                         worker_ids=[a.recipient] if a.recipient else None,
-                        persist=not a.dry_run)
+                        persist=not a.dry_run and not held)
     except (wi.IdentityError, ValueError) as e:
         print(f"refused: {e}", file=sys.stderr)
         return 2
-    acted = ({"recoveries": {}, "rearms": {}, "cards": {}, "escalations": [], "dry_run": True}
-             if a.dry_run else apply(a.workspace, a.repo, tick["decisions"]))
-    if not a.dry_run:
+    idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
+    acted = ({**idle, "dry_run": True} if a.dry_run else {**idle, "suspended": held} if held
+             else apply(a.workspace, a.repo, tick["decisions"]))
+    if resumed is not None:
+        acted["resume"] = resumed
+    if not a.dry_run and not held and not suspension(a.workspace):
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
         acted["escapes"] = wc.drive_escapes(a.workspace)
@@ -294,7 +352,8 @@ def main(argv=None) -> int:
         acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
-    failed = [w for w, r in acted["recoveries"].items() if r["outcome"] == FAILED]
+    outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())
+    failed = [r for r in outcomes if r["outcome"] == FAILED]
     return 1 if failed else 0
 
 

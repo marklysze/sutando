@@ -541,6 +541,23 @@ An OS timer, 300 s, independent of any agent session.
 
 Sub-agent activity counts as progress. A future-dated beat counts as stale.
 
+**Suspension.** The host that owns the pool can stop it healing workers while that host is
+deliberately down, and bring them straight back when it returns:
+
+```
+pool_remedy.py --workspace WS --repo REPO --suspend <reason>   # writes state/pool-suspended
+pool_remedy.py --workspace WS --repo REPO --resume             # lifts it, then one sweep
+```
+
+- While `state/pool-suspended` exists, a sweep observes only: no restart, re-arm, card or
+  supervisor start, and the death ladder does not advance. The marker is re-read before every
+  action, so a suspension that lands mid-sweep stops the rest of it.
+- `--resume` restarts every non-paused worker whose session is gone, outside the ladder (a
+  deliberate stop is not a failure), and clears their ladder evidence. Without a marker it is
+  just a sweep.
+- The marker never expires; only `--resume` lifts it. It is separate from the owner's
+  per-worker `paused` marker, which the host must not use.
+
 ### Stage 1 — single-core delivery, no routing
 
 **No luggage.** New code on `main`, written to this document, against what `main`
