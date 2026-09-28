@@ -31,6 +31,7 @@ HEALTHY, ABNORMAL = "healthy", "abnormal"
 # Same windows the existing readers use: .alive and a "running" self-report go stale at 90 s,
 # a cli_wedge reading at 180 s (agent_availability), a pool sample after 3 of its 300 s periods.
 HEARTBEAT_STALE_S = 90.0
+BEAT_FUTURE_TOLERANCE_S = 5.0
 STATUS_STALE_S = 90.0
 WEDGE_STALE_S = 180.0
 POOL_STALE_S = 900.0
@@ -91,8 +92,9 @@ def _supervisor_source(path: Path, ws: Path, now: float) -> dict:
     return {**src, "opinion": _opinion(motion, condition, reason, mtime if condition == ABNORMAL else None)}
 
 
-def _heartbeat_source(ws: Path, now: float) -> dict:
-    path = ws / "state" / "cores" / f"{_host_label()}.alive"
+def _heartbeat_source(ws: Path, now: float, path: Path | None = None) -> dict:
+    """Liveness from a beat file's mtime: the core's .alive, or a worker watcher's beat."""
+    path = path or ws / "state" / "cores" / f"{_host_label()}.alive"
     try:
         mtime = path.stat().st_mtime
     except OSError:
@@ -101,7 +103,8 @@ def _heartbeat_source(ws: Path, now: float) -> dict:
     if mtime is None:
         # Absent is not dead: the desktop core runs for ~2 min before anything starts the heartbeat.
         return {**src, "value": "missing", "opinion": None}
-    if now - mtime > HEARTBEAT_STALE_S:
+    # A future-dated beat is as untrustworthy as an old one.
+    if now - mtime > HEARTBEAT_STALE_S or mtime - now > BEAT_FUTURE_TOLERANCE_S:
         return {**src, "value": "stale", "opinion": _opinion(None, ABNORMAL, "offline", mtime)}
     return {**src, "value": "fresh", "opinion": None}
 
@@ -219,6 +222,10 @@ def _verdict(agent: dict, sources: dict) -> dict:
     """Abnormal from any source wins; moving from any source wins. The first abnormal source,
     in the order given, names the reason."""
     ops = [s["opinion"] for s in sources.values() if s.get("opinion")]
+    # A dead agent's last words (e.g. a supervisor file left at idle-ready) say nothing now.
+    offline = next((o for o in ops if o["reason"] == "offline"), None)
+    if offline:
+        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": "offline", "since": offline["since"]}
     motions = {o["motion"] for o in ops if o["motion"]}
     bad = [o for o in ops if o["condition"] == ABNORMAL]
     good = [o for o in ops if o["condition"] == HEALTHY]
@@ -291,6 +298,7 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             sources = {
                 "supervisor": (_supervisor_source(seat, ws, now) if seat else
                                {"path": None, "age_s": None, "value": None, "opinion": None}),
+                "watcher_beat": _heartbeat_source(ws, now, ws / "state" / "watchers" / f"{wid}.alive"),
                 "pool": _pool_source((pool_rows or {}).get(wid), sampled, now),
                 "roster": {"path": "state/roster.json", "age_s": None, "value": {"state": state},
                            "opinion": (None if state in (None, "live") else

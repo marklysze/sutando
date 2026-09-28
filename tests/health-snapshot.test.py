@@ -106,7 +106,7 @@ class CoreVerdicts(Base):
         self.assertEqual(self.core()["condition"], "healthy")
         self.ws.touch(f"state/cores/{HOST}.alive", age=hs.HEARTBEAT_STALE_S + 5)
         c = self.core()
-        self.assertEqual((c["condition"], c["reason"]), ("abnormal", "offline"))
+        self.assertEqual((c["motion"], c["condition"], c["reason"]), ("unknown", "abnormal", "offline"))
 
     def test_fresh_running_self_report_is_moving_and_a_stale_one_is_not(self):
         self.ws.supervisor("idle-ready")
@@ -183,6 +183,22 @@ class Workers(Base):
         w = self.snap(agent=WID)["agents"]
         self.assertEqual(len(w), 1)
         self.assertEqual((w[0]["label"], w[0]["motion"], w[0]["condition"]), ("Browser Debug", "idle", "healthy"))
+
+    def test_a_stale_watcher_beat_is_offline_whatever_the_supervisor_file_last_said(self):
+        self.ws.worker()
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=60)
+        self.ws.touch(f"state/watchers/{WID}.alive", age=10)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+        self.ws.touch(f"state/watchers/{WID}.alive", age=hs.HEARTBEAT_STALE_S + 30)
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["motion"], w["condition"], w["reason"]), ("unknown", "abnormal", "offline"))
+        self.assertEqual(w["since"], NOW - hs.HEARTBEAT_STALE_S - 30)
+
+    def test_a_future_dated_beat_is_offline_too(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=-60)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["reason"], "offline")
 
     def test_raw_id_label_reads_as_no_label(self):
         self.ws.worker()
