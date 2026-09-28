@@ -93,6 +93,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
+- **`health_snapshot.py`** — Health snapshot — one read-only answer per agent (core and workers) from existing state files.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
