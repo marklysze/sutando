@@ -214,6 +214,23 @@ class Workers(Base):
         self.ws.touch(f"state/watchers/{WID}.alive", age=-60)
         self.assertEqual(self.snap(agent="workers")["agents"][0]["reason"], "offline")
 
+    def test_a_supervisor_verdict_from_a_previous_incarnation_is_ignored(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=450)
+        self.ws.json(f"state/workers/{WID}/current.json", {"incarnation_id": "b"})
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 60))
+        self.ws.json(f"state/workers/{WID}/incarnations.json", {"incarnations": [
+            {"incarnation_id": "a", "started_at": "2026-09-01T00:00:00Z"},
+            {"incarnation_id": "b", "started_at": started}]})
+        w = self.snap(agent="workers", view="full")["agents"][0]
+        self.assertEqual((w["alive"], w["condition"]), (True, "unknown"))
+        self.assertTrue(w["sources"]["supervisor"]["value"]["previous_run"])
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=10)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+
     def test_raw_id_label_reads_as_no_label(self):
         self.ws.worker()
         self.assertIsNone(self.snap(agent="workers")["agents"][0]["label"])

@@ -17,6 +17,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -259,6 +260,20 @@ def _workers(ws: Path):
     return out
 
 
+def _worker_started_at(ws: Path, wid: str):
+    """Epoch start of the worker's current incarnation, or None when its records are unreadable."""
+    base = ws / "state" / "workers" / wid
+    current, _ = _read_json(base / "current.json")
+    records, _ = _read_json(base / "incarnations.json")
+    inc = current.get("incarnation_id") if isinstance(current, dict) else None
+    rows = records.get("incarnations") if isinstance(records, dict) else None
+    row = next((r for r in rows or [] if isinstance(r, dict) and r.get("incarnation_id") == inc), None)
+    try:
+        return datetime.fromisoformat(str(row["started_at"]).replace("Z", "+00:00")).timestamp()
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
 def _worker_supervisor_paths(ws: Path) -> dict:
     """{session name: path} for per-seat supervisor files (core-supervisor.<session>.json)."""
     out = {}
@@ -301,9 +316,15 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             if agent not in ("all", "workers", wid):
                 continue
             seat = next((p for s, p in seats.items() if s.endswith(wid)), None)
+            supervisor = (_supervisor_source(seat, ws, now) if seat else
+                          {"path": None, "age_s": None, "value": None, "opinion": None})
+            started = _worker_started_at(ws, wid)
+            # A verdict written before this incarnation began is the previous run's, not this one's.
+            if seat and started is not None and supervisor["age_s"] is not None and now - supervisor["age_s"] < started:
+                supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "previous_run": True},
+                              "opinion": None}
             sources = {
-                "supervisor": (_supervisor_source(seat, ws, now) if seat else
-                               {"path": None, "age_s": None, "value": None, "opinion": None}),
+                "supervisor": supervisor,
                 "watcher_beat": _heartbeat_source(ws, now, ws / "state" / "watchers" / f"{wid}.alive"),
                 "pool": _pool_source((pool_rows or {}).get(wid), sampled, now),
                 "roster": {"path": "state/roster.json", "age_s": None, "value": {"state": state},
