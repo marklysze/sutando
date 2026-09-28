@@ -26,7 +26,7 @@ python3 src/health_snapshot.py [--agent <which>] [--view <view>] [--workspace <d
 | `401` | an API token is configured and not sent |
 | `403` | `view=full` from a browser (`Origin` header) or a non-loopback client without the token |
 
-Neither view sends CORS headers, so a web page on another origin cannot read either.
+A `200` answer carries no CORS headers, so a web page on another origin cannot read either view.
 
 ## Response
 
@@ -75,7 +75,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 
 | Source | File | Freshness |
 |---|---|---|
-| `supervisor` | `state/core-supervisor.<session>.json` whose `session` ends with the worker id | ignored if written before the worker's current incarnation started (`state/workers/<id>/current.json` + `incarnations.json`) |
+| `supervisor` | `state/core-supervisor.<session>.json` whose `session` is `<name>-<worker id>` (exact id match) | ignored if written before the worker's current incarnation started (`state/workers/<id>/current.json` + `incarnations.json`) |
 | `watcher_beat` | `state/watchers/<id>.alive` mtime | 90 s |
 | `pool` | the worker's entry in `state/pool-supervision.json` | 900 s since `last_sample_at` (3 missed 300 s samples) |
 | `roster` | the worker's `state` in `state/roster.json` | none |
@@ -122,7 +122,7 @@ for about 2 minutes after boot); older than 90 s, or more than 5 s in the future
 **Self-report**: `running` with a `ts` at most 90 s old → moving. Anything else → no opinion.
 
 **Activity**: a task is live while it has rows, no `done` row, no result file
-(`results/<id>.txt` or `results/archive/<id>-*.txt`), and its newest row is at most 120 s old.
+(`results/<id>.txt`, or `results/archive/[<YYYY-MM>/]<id>[-<ts>].txt`), and its newest row is at most 120 s old.
 A live task → moving for the agent it was delivered to (a worker if
 `deliveries/<worker id>/<task id>.txt` exists, else the core).
 

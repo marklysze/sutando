@@ -135,6 +135,21 @@ class CoreVerdicts(Base):
         self.ws.touch("results/archive/task-a-1790000000.txt")
         self.assertEqual(self.core()["motion"], "idle")
 
+    def test_every_archive_layout_ends_the_task_and_a_longer_id_does_not(self):
+        layouts = ["results/task-a.txt", "results/archive/task-a-1790000000.txt",
+                   "results/archive/task-a.txt", "results/archive/2026-09/task-a.txt",
+                   "results/archive/2026-09/task-a-1790000000.txt"]
+        self.ws.supervisor("idle-ready")
+        self.ws.lines("state/agent-activity.jsonl", [
+            {"ts": NOW - 10, "kind": "processing", "task": {"id": "task-a"}}])
+        for rel in layouts:
+            with self.subTest(layout=rel):
+                self.ws.touch(rel)
+                self.assertEqual(self.core()["motion"], "idle")
+                (self.ws.root / rel).unlink()
+        self.ws.touch("results/archive/2026-09/task-ab-1790000000.txt")
+        self.assertEqual(self.core()["motion"], "moving")
+
     def test_finished_or_old_activity_is_not_moving(self):
         self.ws.supervisor("idle-ready")
         self.ws.lines("state/agent-activity.jsonl", [
@@ -284,6 +299,12 @@ class Workers(Base):
         self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
                            name=f"core-supervisor.sutando-worker-{WID}.json", age=10)
         self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+
+    def test_the_seat_file_matches_the_worker_id_exactly(self):
+        self.ws.worker()
+        self.ws.supervisor("logged-out", session=f"sutando-worker-x{WID}",
+                           name=f"core-supervisor.sutando-worker-x{WID}.json")
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "unknown")
 
     def test_raw_id_label_reads_as_no_label(self):
         self.ws.worker()

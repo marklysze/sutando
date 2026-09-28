@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime
@@ -157,10 +158,13 @@ def _wedge_source(ws: Path, now: float) -> dict:
 
 
 def _has_result(ws: Path, tid: str) -> bool:
-    """A result file is the task's last write, so its presence ends the task; the bridge
-    archives it within seconds as results/archive/<id>-<ts>.txt."""
+    """A result file is the task's last write, so its presence ends the task. Archivers move it
+    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt."""
     results = ws / "results"
-    return (results / f"{tid}.txt").exists() or any((results / "archive").glob(f"{tid}-*.txt"))
+    if (results / f"{tid}.txt").exists():
+        return True
+    name = re.compile(re.escape(tid) + r"(?:-\d+)?\.txt")
+    return any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt"))
 
 
 def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:
@@ -317,7 +321,7 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
         for wid, label, state in workers:
             if agent not in ("all", "workers", wid):
                 continue
-            seat = next((p for s, p in seats.items() if s.endswith(wid)), None)
+            seat = next((p for s, p in seats.items() if s.rsplit("-", 1)[-1] == wid), None)
             supervisor = (_supervisor_source(seat, ws, now) if seat else
                           {"path": None, "age_s": None, "value": None, "opinion": None})
             started = _worker_started_at(ws, wid)
