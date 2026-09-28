@@ -21,9 +21,9 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import cli_wedge  # noqa: E402
-from util_paths import _host_label  # noqa: E402
-from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+import cli_wedge
+from util_paths import _host_label
+from workspace_default import resolve_workspace, status_read_path
 
 VIEWS = ("summary", "full")
 IDLE, MOVING, UNKNOWN = "idle", "moving", "unknown"
