@@ -102,6 +102,8 @@ Consequences, by design:
 
 ## Per-agent snapshot: `GET /health`
 
+Full decision rules: [`docs/health-snapshot.md`](health-snapshot.md).
+
 `src/health_snapshot.py` answers "how is each agent doing?" for the core **and every
 worker**, read-only, from the files the watchers above already write (`.alive`, the
 supervisor files, the `cli_wedge` window, `pool-supervision.json`, `agent-activity.jsonl`,
