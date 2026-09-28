@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.server
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -172,6 +173,21 @@ class CliWedge(Base):
         c = self.core()
         self.assertEqual((c["motion"], c["condition"]), ("idle", "healthy"))
 
+    def test_a_still_clean_pane_is_idle_healthy(self):
+        self._window([], [], static=True)
+        c = self.core()
+        self.assertEqual((c["motion"], c["condition"]), ("idle", "healthy"))
+
+    def test_other_abnormal_text_names_the_first_pattern(self):
+        self._window([], ["needs-login"], static=True)
+        c = self.core()
+        self.assertEqual((c["motion"], c["condition"], c["reason"]), ("idle", "abnormal", "needs-login"))
+
+    def test_a_single_sample_is_no_opinion(self):
+        self.ws.lines("state/cli-wedge/window.jsonl", [
+            {"ts": NOW, "state": "s", "raw_state": "r", "patterns": [], "abnormal": []}])
+        self.assertIsNone(self.core(view="full")["sources"]["cli_wedge"]["opinion"])
+
     def test_an_old_window_gives_no_opinion(self):
         self.ws.supervisor("idle-ready")
         self._window(["retrying"], [], last_age=hs.WEDGE_STALE_S + 60)
@@ -181,6 +197,36 @@ class CliWedge(Base):
         self.ws.supervisor("logged-out")
         self._window(["retrying"], [])
         self.assertEqual(self.core()["reason"], "needs-login")
+
+
+class EdgeInputs(Base):
+    def test_an_unknown_supervisor_state_gives_no_opinion(self):
+        self.ws.supervisor("some-future-state")
+        self.assertEqual(self.core()["condition"], "unknown")
+
+    def test_a_path_outside_the_workspace_is_reported_by_name(self):
+        self.assertEqual(hs._rel(Path("/elsewhere/core-status.json"), self.ws.root), "core-status.json")
+
+    def test_an_empty_or_unreadable_window_gives_no_opinion(self):
+        self.ws.supervisor("idle-ready")
+        self.ws.lines("state/cli-wedge/window.jsonl", [])
+        self.assertIsNone(self.core(view="full")["sources"]["cli_wedge"]["opinion"])
+        self.ws.lines("state/cli-wedge/window.jsonl", [{"ts": NOW, "state": "s", "patterns": []}])
+        with mock.patch.object(hs.cli_wedge, "classify_window", side_effect=RuntimeError("boom")):
+            self.assertIsNone(self.core(view="full")["sources"]["cli_wedge"]["opinion"])
+
+    def test_malformed_activity_rows_are_skipped(self):
+        self.ws.supervisor("idle-ready")
+        path = self.ws.root / "state" / "agent-activity.jsonl"
+        path.write_text("not json\n" + json.dumps({"ts": NOW - 5, "kind": "processing"}) + "\n"
+                        + json.dumps({"ts": "late", "task": {"id": "task-x"}}) + "\n")
+        self.assertEqual(self.core()["motion"], "idle")
+
+    def test_cli_main_prints_the_snapshot(self):
+        self.ws.supervisor("idle-ready")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(hs.main(["--workspace", str(self.ws.root), "--agent", "core"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["agents"][0]["id"], "core")
 
 
 class Workers(Base):
@@ -249,6 +295,12 @@ class Workers(Base):
             WID: {"wedge_escalated": True, "wedge_first_detected_at": NOW - 400}}})
         w = self.snap(agent="workers")["agents"][0]
         self.assertEqual((w["condition"], w["reason"], w["since"]), ("abnormal", "wedged", NOW - 400))
+
+    def test_a_fresh_pool_sample_without_escalation_gives_no_opinion(self):
+        self.ws.worker()
+        self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {
+            WID: {"consecutive": 1}}})
+        self.assertIsNone(self.snap(agent="workers", view="full")["agents"][0]["sources"]["pool"]["opinion"])
 
     def test_a_stale_pool_sample_gives_no_opinion(self):
         self.ws.worker()
@@ -340,6 +392,26 @@ class Route(Base):
                 return r.status, json.loads(r.read()), r.headers
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read()), e.headers
+
+    def _direct(self, path, headers=None, token=""):
+        """Drive do_GET on the calling thread, where the coverage tracer sees it."""
+        h = self.api.Handler.__new__(self.api.Handler)
+        h.path, h.headers, h.client_address = path, headers or {}, ("127.0.0.1", 0)
+        sent = []
+        h.send_private_json = lambda status, body: sent.append((status, body))
+        h.send_json = lambda status, body: sent.append((status, body))
+        with mock.patch.object(self.api, "API_TOKEN", token):
+            h.do_GET()
+        return sent[-1]
+
+    def test_direct_summary_full_and_refusals(self):
+        status, body = self._direct("/health?agent=core")
+        self.assertEqual((status, body["agents"][0]["reason"]), (200, "needs-login"))
+        self.assertIn("sources", self._direct("/health?view=full")[1]["agents"][0])
+        self.assertEqual(self._direct("/health?view=everything")[0], 400)
+        self.assertEqual(self._direct("/health?view=full", headers={"Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self._direct("/health", token="secret")[0], 401)
+        self.assertEqual(self._direct("/health", headers={"Authorization": "Bearer secret"}, token="secret")[0], 200)
 
     def test_route_delegates_to_the_snapshot_with_its_query(self):
         with mock.patch.object(self.api.health_snapshot, "snapshot", return_value={"overall": "x"}) as snap:
