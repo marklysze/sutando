@@ -8327,6 +8327,29 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
     return out
 
 
+def check_pool_suspended() -> dict:
+    """A pool suspension never expires; only resuming the pool lifts it. One still present
+    while a core runs means the host never resumed it, and no worker is being healed."""
+    name = "pool-suspended"
+    path = WORKSPACE_DIR / "state" / "pool-suspended"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    except OSError as e:
+        return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        rec = None
+    what = (f"{rec.get('reason')} since {rec.get('at')}" if isinstance(rec, dict) else text[:80])
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
+    return {"name": name, "status": "warn",
+            "detail": f"pool suspended ({what}) while a core is running, so no worker is being "
+                      "healed; repair: resume the worker pool"}
+
+
 def check_pool_advertisement() -> dict:
     """The picker follows the roster only through the advertisement the bridge
     sends; a roster version that file does not carry is a pin nobody was told."""
@@ -13371,6 +13394,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_pool_advertisement())
+    checks.append(check_pool_suspended())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
