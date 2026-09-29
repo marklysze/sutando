@@ -46,7 +46,7 @@ def obs(session_alive, paused=False):
 
 
 def tick_result(decisions=None):
-    return {"decisions": decisions or {}, "observations": {}, "wedged": []}
+    return {"decisions": decisions or {}, "observations": {}, "wedged": [], "auth_expired": []}
 
 
 class Base(unittest.TestCase):
