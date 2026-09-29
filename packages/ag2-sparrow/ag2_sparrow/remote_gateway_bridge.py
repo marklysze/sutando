@@ -313,6 +313,7 @@ from .dedup_recovery import plan_dedup_recovery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import _host_label as _stable_host_label
 
 TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
@@ -2654,8 +2655,9 @@ def _build_agent_profile(workers: "dict") -> "dict":
     AVAILABLE: the broker REPLACES the profile document, so this function must
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
+    # The host's stable label: gethostname() drifts with the network (a DHCP lease renames it).
     try:
-        host_id = socket.gethostname().split(".")[0]
+        host_id = _stable_host_label()
     except OSError:
         host_id = "unknown-host"
     return {"display": {"name": name},
