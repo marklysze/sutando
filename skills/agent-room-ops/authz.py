@@ -1,4 +1,4 @@
-# DEPRECATED: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
 # Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """Client-side handling for an authorization-decision envelope on room-op responses.
 
