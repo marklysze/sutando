@@ -96,7 +96,7 @@
    ],
    "status": "active",
    "canonical_for": "verbatim parking for relocated CLAUDE.md detail: marker-migration history, vault python bootstrap, liveness payload schema",
-   "last_verified": "2026-08-17"
+   "last_verified": "2026-09-29"
   },
   "docs/codex-core.md": {
    "title": "Codex CLI as the Sutando core",
@@ -463,7 +463,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-09-04"
+   "last_verified": "2026-09-29"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
