@@ -52,7 +52,7 @@ class Probe(unittest.TestCase):
         self.marker.write_text(json.dumps({"reason": "app-quit", "at": 5, "stopped": []}))
         c = self.check(True)
         self.assertEqual(c["status"], "warn")
-        self.assertIn("pool_remedy.py --resume", c["detail"])
+        self.assertIn("repair: resume the worker pool", c["detail"])
 
     def test_a_hand_written_marker_is_quoted(self):
         self.marker.write_text("app-quit 7\n")

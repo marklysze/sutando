@@ -8328,8 +8328,8 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
 
 
 def check_pool_suspended() -> dict:
-    """A pool suspension is lifted by the owning host's next start; one still present
-    while a core runs means that start never lifted it, and no worker is being healed."""
+    """A pool suspension never expires; only resuming the pool lifts it. One still present
+    while a core runs means the host never resumed it, and no worker is being healed."""
     name = "pool-suspended"
     path = WORKSPACE_DIR / "state" / "pool-suspended"
     try:
@@ -8347,7 +8347,7 @@ def check_pool_suspended() -> dict:
         return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
     return {"name": name, "status": "warn",
             "detail": f"pool suspended ({what}) while a core is running, so no worker is being "
-                      "healed; repair: skills/worker-pool/scripts/pool_remedy.py --resume"}
+                      "healed; repair: resume the worker pool"}
 
 
 def check_pool_advertisement() -> dict:
