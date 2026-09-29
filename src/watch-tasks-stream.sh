@@ -16,6 +16,12 @@
 # The agent reads the named files via the Read tool when notifications
 # arrive — no need to inline file contents in stdout (Monitor's 200ms
 # batching window would group multi-line content awkwardly).
+#
+# SUTANDO_WATCHER_TRANSITION_HOOK=<executable>: run synchronously at each
+# ownership transition of a handled task, as `<hook> <transition> <task file>`
+# with transition in before-claim | after-handler | after-done. A dependency
+# seam for observation and for tests that must interrupt a real transition;
+# its exit status is ignored and its stderr dropped.
 
 # fd 9 is a stable dup of the real stdout, taken before anything can rebind fd 1.
 # A shutdown emit invoked one $( ) deep writes to the capture pipe, not to stdout.
@@ -23,26 +29,15 @@ exec 9>&1
 
 set -u
 
-# Defined above the runner because the runner is where a worker can put its name
-# down BEFORE the handler publishes the result that record attributes.
+# The handler records ownership before publishing; this wrapper passes its
+# resolved interpreter to the shared stage writer.
 record_worker_done() {
-  local task_id="${1%.txt}" stage="$2" ws="$3"
-  # Only a pool recipient has a claim to record, and the core cannot locate the
-  # writer: its spawner injects one, so unset means "not a worker", not an error.
-  [ -n "${SUTANDO_INSTANCE_ID:-}" ] || return 0
-  [ -n "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
-  # `-f` not `-x`: we hand it to the interpreter below, so the execute bit is
-  # the wrong property to require of a script the pool may ship non-executable.
-  [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT}" ] || return 1
-  # The RESOLVED interpreter, never the shebang: a worker's PATH python3 may be
-  # the macOS CLT stub, which is why the launcher forwards one at all.
-  [ -n "${SUTANDO_PY_BIN:-}" ] || return 1
-  "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" \
-    --workspace "$ws" --recipient "$SUTANDO_INSTANCE_ID" \
-    mark-done --task-id "$task_id" --stage "$stage" >/dev/null || return 1
+  write_worker_stage "$1" "$2" "$3" "${SUTANDO_PY_BIN:-}"
 }
 
 __SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=delivery/worker-stage.sh
+source "$__SCRIPT_DIR/delivery/worker-stage.sh"
 # shellcheck source=watcher_sentinel.sh
 source "$__SCRIPT_DIR/watcher_sentinel.sh"
 # shellcheck source=task-emit.sh
@@ -419,14 +414,37 @@ retry_held_tasks_if_due() {
 }
 [ -n "$HANDLER_CONFIG_PATH" ] && reload_current_handler
 
+# A pid alone can be recycled between a watcher's death and the next sweep;
+# the start time beside it, read in one fixed locale, tells them apart.
+proc_start() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//;s/ *$//'
+}
+
+# A zombie answers kill -0 but will never act; ps reports it as Z.
+proc_is_zombie() {
+  case "$(LC_ALL=C ps -o stat= -p "$1" 2>/dev/null | sed 's/^ *//')" in Z*) return 0 ;; esac
+  return 1
+}
+
 claim_is_live() {
-  local claim="$1" owner_pid
+  local claim="$1" owner_pid owner_start live_start
   [ -f "$claim" ] || return 1
   owner_pid="$(sed -n '1p' "$claim" 2>/dev/null)"
   case "$owner_pid" in
     ""|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$owner_pid" 2>/dev/null
+  kill -0 "$owner_pid" 2>/dev/null || return 1
+  proc_is_zombie "$owner_pid" && return 1
+  owner_start="$(sed -n '5p' "$claim" 2>/dev/null)"
+  [ -n "$owner_start" ] || return 0
+  live_start="$(proc_start "$owner_pid")"
+  if [ -z "$live_start" ]; then
+    # Unknown is not dead: keep the claim (a strand is recoverable, a concurrent
+    # handler is not) and say so; every later dispatch re-asks (reconcile_dead_claims).
+    echo "watch-tasks-stream: cannot read the start time of pid $owner_pid holding $(basename "$claim"); keeping the claim until ps answers" >&2
+    return 0
+  fi
+  [ "$owner_start" = "$live_start" ]
 }
 
 remove_claim() {
@@ -449,7 +467,14 @@ acquire_task_claim() {
   local filename="$1" task_path="$2" disposition="${3:-fallback}" claim temporary attempts=0
   claim="$CLAIMS_DIR/$filename"
   temporary="$CLAIMS_DIR/.claim-$WATCHER_ID-$filename"
-  printf '%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" > "$temporary"
+  local own_start
+  own_start="$(proc_start "$$")"
+  if [ -z "$own_start" ]; then
+    # A claim without its owner's start time would read as pid-only forever.
+    echo "watch-tasks-stream: cannot read my own start time (ps); not claiming $filename this pass" >&2
+    return 2
+  fi
+  printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$WATCHER_ID" "$task_path" "$disposition" "$own_start" > "$temporary"
   while [ "$attempts" -lt 3 ]; do
     # A hard link publishes the fully written claim atomically and fails if
     # another watcher already owns the destination; it never clobbers.
@@ -549,17 +574,60 @@ publish_terminal_failure() {
 #
 # Idempotent, so a handler declared later still works with no restart; only
 # the claim bookkeeping remains -- handler runs are synchronous, no queue.
+# Overlapping watchers preserve a live owner's claim. A dead owner's record is
+# quarantined before any dispatch: a stale claim makes both notifiers drop the task.
+# `hold`: a task freed mid-lifetime joins the held list (retried by the existing
+# held-retry path, once), never a dispatch from inside a dispatch.
+reconcile_dead_claims() {
+  local claim task_path fn
+  [ -d "$CLAIMS_DIR" ] || return 0
+  # Retiring is a handler's business: the freed task is replayed through a handler,
+  # and a watcher without one can only announce it, which a handler claim forbids.
+  if [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+    return 0
+  fi
+  shopt -s nullglob
+  for claim in "$CLAIMS_DIR"/task-*.txt; do
+    claim_is_live "$claim" && continue
+    task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
+    retire_stale_claim "$claim" || continue
+    [ "${1:-}" = "hold" ] || continue
+    fn="$(basename "$task_path")"
+    [ -f "$TASKS_DIR/$fn" ] || continue
+    hold_task "$fn" now
+  done
+  shopt -u nullglob
+}
+
+# A task decided later: held names are replayed by redispatch_held_tasks once the
+# deadline passes ("now" makes the next event the deadline).
+hold_task() {
+  local fn="$1"
+  printf '%s' "$HELD_NAMES" | grep -qxF -- "$fn" && return 0
+  if [ "${2:-}" = "now" ]; then
+    HELD_RETRY_AT=0
+  elif [ -z "$HELD_NAMES" ]; then
+    HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
+  fi
+  HELD_NAMES="$HELD_NAMES$fn
+"
+}
+
 prepare_handler_state() {
   [ -z "$HANDLER_STATE_READY" ] || return 0
   mkdir -p "$CLAIMS_DIR" "$FALLBACKS_DIR"
-  shopt -s nullglob
-  for claim in "$CLAIMS_DIR"/task-*.txt; do
-    # Overlapping watchers preserve a live owner's claim. A dead owner's
-    # record is atomically quarantined before the new sweep retries it.
-    claim_is_live "$claim" || retire_stale_claim "$claim" || true
-  done
-  shopt -u nullglob
+  reconcile_dead_claims
   HANDLER_STATE_READY=1
+}
+
+# Dependency seam at each ownership transition (see the header): the hook runs
+# synchronously with the transition's name, so a kill can land inside it.
+transition() {
+  [ -n "${SUTANDO_WATCHER_TRANSITION_HOOK:-}" ] || return 0
+  # Backgrounded and waited on, so a signal interrupts the wait (bash defers
+  # traps until a foreground child exits); cleanup's kill 0 ends the hook.
+  "$SUTANDO_WATCHER_TRANSITION_HOOK" "$1" "$2" 2>/dev/null &
+  wait "$!" 2>/dev/null || true
 }
 
 if [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ]; then
@@ -607,9 +675,14 @@ run_handler_now() {
   filename="$(basename "$task_path")"
   announce="$(task_announce "$task_path")"
   prepare_handler_state
-  if ! acquire_task_claim "$filename" "$task_path" "$disposition"; then
-    return 0
-  fi
+  transition before-claim "$filename"
+  acquire_task_claim "$filename" "$task_path" "$disposition"
+  case $? in
+    0) ;;
+    # Not ours now: another watcher's live claim, or our own identity unreadable.
+    # Either may clear with nobody to tell us, so the timer re-asks.
+    *) hold_task "$filename"; return 0 ;;
+  esac
   record_admission
   activity_transition RUNNING "$task_path"
   timed_out=0
@@ -653,8 +726,10 @@ run_handler_now() {
       timed_out=1
       rm -f "$timeout_flag"
     fi
+    transition after-handler "$filename"
     if [ "$handler_rc" -eq 0 ]; then
       record_worker_done "$filename" done "$WORKSPACE_DIR" || handler_rc=1
+      transition after-done "$filename"
     fi
   fi
 
@@ -810,15 +885,21 @@ dispatch_task() {
   [ -z "$HELD_NAMES" ] || HELD_NAMES="$(printf '%s' "$HELD_NAMES" | grep -vxF -- "$filename")
 "
   read_handler_config_now
+  reconcile_dead_claims hold
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ "$HANDLER_STATE" = "broken" ]; then
-    [ -n "$HELD_NAMES" ] || HELD_RETRY_AT=$(( $(date +%s) + HELD_RETRY_INTERVAL ))
-    HELD_NAMES="$HELD_NAMES$filename
-"
+    hold_task "$filename"
     echo "watch-tasks-stream: holding $filename: the task-event-handler config exists but cannot be read" >&2
     return 0
   fi
   DECISION_IDENTITY="$identity"
   if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -z "$CURRENT_HANDLER" ] || [ ! -x "$CURRENT_HANDLER" ]; then
+    # A handler claim means a handler's outcome is unknown; with no handler here
+    # to replay it, the task is held (not announced) until one returns.
+    if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -e "$CLAIMS_DIR/$filename" ]; then
+      hold_task "$filename"
+      echo "watch-tasks-stream: holding $filename: a handler's claim stands and no handler is available here" >&2
+      return 0
+    fi
     emit_dispatch_task_file "$announce" && record_admission
     return
   fi
@@ -912,36 +993,18 @@ _tmux_wake() {
 #   either way so nothing downstream needs to observe them again.
 #
 # SIGTERM interrupts `wait` immediately, so run_handler_now() never resumes
-# to settle its own claim -- this settles directly from CLAIMS_DIR instead.
+# to settle its own claim. Nothing is decided here either: the handler may
+# already have delivered, its delivery is idempotent, and the next watcher
+# retires this dead pid's claim and re-sweeps tasks/ (prepare_handler_state).
 settle_own_claims_on_shutdown() {
-  local claim filename task_path announce claim_settled verdict
+  local claim filename task_path
   [ -n "${CLAIMS_DIR:-}" ] && [ -d "$CLAIMS_DIR" ] || return
   shopt -s nullglob
   for claim in "$CLAIMS_DIR"/task-*.txt; do
     filename="$(basename "$claim")"
     [ "$(sed -n '2p' "$claim" 2>/dev/null)" = "$WATCHER_ID" ] || continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
-    [ -n "$task_path" ] || continue
-    announce="$(task_announce "$task_path")"
-    claim_settled=1
-    claim_disposition "$filename"
-    verdict=$?
-    case $verdict in
-      0)
-        echo "watch-tasks-stream: required Team handler interrupted for $filename; publishing safe terminal failure" >&2
-        publish_terminal_failure "$filename" "was interrupted" "$task_path" || claim_settled=0
-        ;;
-      1)
-        printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
-        echo "watch-tasks-stream: optional task handler interrupted for $filename; falling back to live core (possible at-least-once retry)" >&2
-        record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
-        emit_task_file "$announce"
-        ;;
-      *)
-        echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
-        ;;
-    esac
-    [ "$claim_settled" -eq 1 ] && { release_task_claim "$filename" || true; }
+    echo "watch-tasks-stream: task handler in flight for $filename at shutdown; leaving ${task_path:-$filename} to the next watcher's sweep" >&2
   done
   shopt -u nullglob
 }
@@ -988,6 +1051,7 @@ trap 'cleanup; exit 0' HUP INT TERM
 # fallback receipt is emitted.
 startup_sweep() {
   local fn
+  reconcile_dead_claims
   while IFS= read -r fn; do
     dispatch_task "$TASKS_DIR/$fn"
   done < <(priority_sorted_tasks)
@@ -1144,7 +1208,30 @@ if [ "$WATCHER_ROLE" = "session" ]; then
 fi
 # EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
 # readiness replay above, since a second open of the FIFO would race it for bytes.
-while IFS= read -r path <&3; do
-  handle_event "$path"
+# While anything is held the read is timed, so a quiet inbox still reaches the
+# held retry: read returns >128 on the timeout and 1 on EOF, never the same.
+held_read_timeout() {
+  local left
+  [ -n "$HELD_NAMES" ] || { echo 0; return; }
+  left=$(( HELD_RETRY_AT - $(date +%s) ))
+  [ "$left" -gt 0 ] && echo "$left" || echo 1
+}
+while :; do
+  # A due deadline is served BEFORE the read, so `-t` is never 0 and the held
+  # set and deadline are current when the timeout is computed.
   retry_held_tasks_if_due
+  path=""
+  t="$(held_read_timeout)"
+  if [ "$t" -gt 0 ]; then
+    IFS= read -r -t "$t" path <&3; rc=$?
+  else
+    IFS= read -r path <&3; rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    handle_event "$path"
+  elif [ "$rc" -gt 128 ]; then
+    :   # the timeout: nothing arrived; the loop head serves the deadline
+  else
+    break   # EOF: fswatch is gone, held or not
+  fi
 done

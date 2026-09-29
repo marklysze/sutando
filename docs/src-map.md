@@ -93,6 +93,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`git_binary.py`** — Resolve a git executable that will actually run.
 - **`github-webhook.py`** — GitHub webhook bridge — receives GitHub events and writes task files.
 - **`health-check.py`** — Sutando health check — verifies all components are running correctly.
+- **`health_snapshot.py`** — Health snapshot — one read-only answer per agent (core and workers) from existing state files.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
@@ -117,6 +118,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`migrate.sh`** — Sutando Migration Script — bundle current machine state for transfer to new Mac
 - **`migration_safety_helpers.sh`** — shellcheck shell=bash PR #1440 — auto-migration safety helpers (Mini review).
 - **`morning-briefing.py`** — Morning briefing for Sutando.
+- **`native-pim-consent.ts`** — Native PIM consent — the voice-process client of skills/macos-tools/scripts/native_pim_consent.py.
 - **`notify.sh`** — Sutando: notify the user across available channels
 - **`obsidian-mirror.py`** — Obsidian sync — one-shot sweep of agent state into the Sutando vault.
 - **`optional_script.py`** — Dependency-light runner for optional script-backed capabilities.
@@ -221,6 +223,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`url-scheme.ts`** — Scheme normalization for URLs handed to Chrome via AppleScript.
 - **`util_paths.py`** — Resolve personal-asset paths with private-dir-first lookup.
 - **`util_paths.ts`** — TypeScript twin of src/util_paths.py — personal-asset path resolution.
+- **`vault-secret.ts`** — Read a secret the owner stored with `vault set KEY …` from the Keychain item that src/vault_intercept.py writes (`security add-generic-password -a sutando -s KEY`).
 - **`vault_intercept.py`** — Bridge-level vault secret interception.
 - **`vault_set_grammar.py`** — Pure, dependency-free `vault set KEY VALUE` grammar — regex + redact-only.
 - **`verify-gemini-31.sh`** — Sutando Gemini 3.1 rollout verification
@@ -308,10 +311,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`nudge_gate.py`** — Whether a supervisor with no session-role watcher should nudge, alert, or arm.
 - **`pane_gate.py`** — Pane idle-gate and line delivery for a core CLI pane — the consumer-side policy every external task-notifier shares.
 - **`readiness.py`** — Readiness of a `results/<task-id>.txt` file, for every delivery consumer.
 - **`router.py`** — Result Router — fallback & audit policy (Result Router v1, slice S4).
 - **`task_dispatch.py`** — Consumer-side dispatch policy shared by every external task-notifier.
+- **`worker-stage.sh`** — One pool delivery stage writer for the Claude watcher and Codex notifier.
 
 ## `src/hitl/`
 

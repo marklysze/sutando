@@ -26,6 +26,11 @@ if [ -f "$REPO/.env" ]; then
     _self_dev_was_set=1
     _self_dev_ambient="$SUTANDO_SELF_DEVELOPMENT_ENABLED"
   fi
+  _codex_reset_was_set=0
+  if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+    _codex_reset_was_set=1
+    _codex_reset_ambient="$SUTANDO_CODEX_AUTO_RESET_ENABLED"
+  fi
   set -a
   # shellcheck disable=SC1091
   source "$REPO/.env"
@@ -33,7 +38,11 @@ if [ -f "$REPO/.env" ]; then
   if [ "$_self_dev_was_set" = 1 ]; then
     export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
   fi
+  if [ "$_codex_reset_was_set" = 1 ]; then
+    export SUTANDO_CODEX_AUTO_RESET_ENABLED="$_codex_reset_ambient"
+  fi
   unset _self_dev_was_set _self_dev_ambient
+  unset _codex_reset_was_set _codex_reset_ambient
 fi
 
 # `--runtime <name>` names the runtime for THIS launch (leading arg only). A

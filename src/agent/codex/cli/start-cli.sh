@@ -14,10 +14,10 @@ cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
 
-# This runtime has no worker mode: everything below is the canonical core's
-# ceremony, so an instance launch is refused before the first step of it.
+# This entry point only launches the canonical core. A Codex pool worker uses
+# the pool's runtime launcher instead.
 if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-  echo "start-cli: SUTANDO_INSTANCE_ID is set, but Codex workers are unsupported — only the claude runtime launches a pool worker." >&2
+  echo "start-cli: SUTANDO_INSTANCE_ID is set; launch Codex workers through the pool launcher." >&2
   exit 2
 fi
 
@@ -166,6 +166,9 @@ CORE_ENV_ARGS=(-e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex)
 # the self-development policy explicitly into the persistent core session.
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   CORE_ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
+fi
+if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
+  CORE_ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
 fi
 
 CODEX_ARGS=(
@@ -339,6 +342,22 @@ ensure_codex_scheduler() {
   fi
 }
 
+ensure_codex_auto_reset_timer() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local ws timer py
+  timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
+  [ -f "$timer" ] || return 0
+  py="$(heartbeat_python)"
+  if [ -z "$py" ]; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer: no runnable Python" >&2
+    return 0
+  fi
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+    echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
+  fi
+}
+
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
 # every launcher invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
@@ -346,9 +365,10 @@ ensure_codex_scheduler() {
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
+resolve_heartbeat_python
 ensure_durable_schedules
 ensure_codex_scheduler
-resolve_heartbeat_python
+ensure_codex_auto_reset_timer
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
