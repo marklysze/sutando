@@ -552,9 +552,12 @@ pool_remedy.py --workspace WS --repo REPO --resume             # lifts it, then 
 - While `state/pool-suspended` exists, a sweep observes only: no restart, re-arm, card or
   supervisor start, and the death ladder does not advance. The marker is re-read before every
   action, so a suspension that lands mid-sweep stops the rest of it.
-- `--resume` restarts every non-paused worker whose session is gone, outside the ladder (a
-  deliberate stop is not a failure), and clears their ladder evidence. Without a marker it is
-  just a sweep.
+- `--suspend` records which workers the stop takes down: every supervised, non-paused worker not
+  already in a death episode (read from the ladder's own state, so no probe delays a quit).
+  While suspended, escalations are still reported, never acted on.
+- `--resume` restarts only those workers, outside the ladder (a deliberate stop is not a
+  failure), and clears their ladder evidence. A worker already dead or escalated before the stop
+  keeps its ladder. Without a marker it is just a sweep.
 - The marker never expires; only `--resume` lifts it. It is separate from the owner's
   per-worker `paused` marker, which the host must not use.
 

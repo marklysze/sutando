@@ -53,33 +53,60 @@ def suspended_path(workspace) -> Path:
     return Path(workspace) / SUSPENDED_REL
 
 
+def _marker(workspace) -> dict | None:
+    """The suspension record {reason, at, stopped}, or None when not suspended."""
+    try:
+        text = suspended_path(workspace).read_text().strip()
+    except OSError:
+        return None
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        rec = None
+    if not isinstance(rec, dict):
+        # A marker that isn't the record still suspends; it just names no workers.
+        return {"reason": text or SUSPENDED, "at": None, "stopped": []}
+    return rec
+
+
 def suspension(workspace) -> str | None:
     """The recorded reason the pool is suspended, or None. Never expires: only a
     deliberate app quit writes it, and the app's next start lifts it."""
-    try:
-        return suspended_path(workspace).read_text().strip() or SUSPENDED
-    except OSError:
+    rec = _marker(workspace)
+    if rec is None:
         return None
+    return f"{rec.get('reason') or SUSPENDED} {rec.get('at') or ''}".strip()
 
 
 def suspend(workspace, reason: str, now: float | None = None) -> str:
+    """Suspend, recording which workers the stop takes down: every supervised worker not
+    already in a death episode. Read from the ladder's own file, so no probe delays a quit."""
+    state = sup.load_state(workspace)
+    in_episode = {w for w, e in state.workers.items() if e.consecutive or e.escalated}
+    stopped = sorted(w for w in sup.supervised_workers(workspace)
+                     if w not in in_episode and not sup.is_paused(workspace, w))
     path = suspended_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
-    tmp.write_text(f"{reason} {int(now if now is not None else time.time())}\n")
+    tmp.write_text(json.dumps({"reason": reason, "at": int(now if now is not None else time.time()),
+                               "stopped": stopped}) + "\n")
     os.replace(tmp, path)
-    return path.read_text().strip()
+    return suspension(workspace)
 
 
 def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
-    """Lift a suspension and bring back, now, every worker it left dead: a deliberate
-    quit is not a failure, so those workers skip the death ladder and start it afresh."""
+    """Lift a suspension and bring back, now, the workers the stop took down: a deliberate
+    quit is not a failure, so they skip the death ladder. A worker already dead or escalated
+    before the stop is left to its own ladder."""
+    rec = _marker(workspace)
     was = suspension(workspace)
     suspended_path(workspace).unlink(missing_ok=True)
     restarted = {}
-    if was:
+    if rec is not None:
+        stopped = set(rec.get("stopped") or [])
         obs = sup.observe(workspace, time.time(), runner=runner or subprocess.run)
-        dead = [w for w, o in obs.items() if o.session_alive is False and not o.paused]
+        dead = [w for w, o in obs.items()
+                if w in stopped and o.session_alive is False and not o.paused]
         restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
         state = sup.load_state(workspace)
         sup.save_state(workspace, replace(state, workers={
@@ -338,7 +365,9 @@ def main(argv=None) -> int:
         print(f"refused: {e}", file=sys.stderr)
         return 2
     idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
-    acted = ({**idle, "dry_run": True} if a.dry_run else {**idle, "suspended": held} if held
+    escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
+    acted = ({**idle, "dry_run": True} if a.dry_run
+             else {**idle, "escalations": escalations, "suspended": held} if held
              else apply(a.workspace, a.repo, tick["decisions"]))
     if resumed is not None:
         acted["resume"] = resumed

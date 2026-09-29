@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The pool can be suspended by the app that owns it, and resumed on its next start.
 
-`pool_remedy --suspend <reason>` writes `state/pool-suspended`; while it exists a sweep
-observes only (no recover, rearm, card or supervisor start, and the ladder does not
-advance), and `apply()` re-reads it before every action so a quit that lands mid-sweep
-wins. `--resume` lifts it, recovers every non-paused worker the quit left dead outside the
-death ladder, clears their evidence, and then sweeps. Without a marker, --resume is a sweep.
+`pool_remedy --suspend <reason>` writes `state/pool-suspended`, recording which workers the
+stop takes down (those not already in a death episode); while it exists a sweep observes
+only (no recover, rearm, card or supervisor start, the ladder does not advance, escalations
+are still reported), and `apply()` re-reads it before every action so a quit that lands
+mid-sweep wins. `--resume` lifts it and recovers, outside the death ladder, only the workers
+the stop took down; a worker already dead or escalated keeps its ladder. Without a marker,
+--resume is a sweep.
 
 Run: python3 tests/skills/worker-pool/pool-suspend-resume.test.py
 """
@@ -35,7 +37,7 @@ def _load(name):
 
 rem = _load("pool_remedy")
 ps = rem.ps
-DEAD, ALIVE, PAUSED = "a" * 32, "b" * 32, "c" * 32
+DEAD, ALIVE, PAUSED, ESCALATED = "a" * 32, "b" * 32, "c" * 32, "e" * 32
 
 
 def obs(session_alive, paused=False):
@@ -53,6 +55,10 @@ class Base(unittest.TestCase):
         self.ws = Path(self.td.name) / "ws"
         (self.ws / "state").mkdir(parents=True)
 
+    def roster(self, *ids):
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"workers": {w: {"runtime": "claude", "state": "live"} for w in ids}}))
+
     def tearDown(self):
         self.td.cleanup()
 
@@ -64,11 +70,23 @@ class Base(unittest.TestCase):
 
 
 class Marker(Base):
-    def test_suspend_records_reason_and_time_and_suspension_reads_it(self):
+    def test_suspend_records_reason_time_and_the_workers_the_stop_takes_down(self):
         self.assertIsNone(rem.suspension(self.ws))
+        self.roster(DEAD, ALIVE, ESCALATED)
+        rem.sup.save_state(self.ws, ps.SupervisionState(last_sample_at=1.0, workers={
+            ESCALATED: ps.WorkerEvidence(consecutive=9, escalated=True)}))
         self.assertEqual(rem.suspend(self.ws, "app-quit", now=1790630000), "app-quit 1790630000")
-        self.assertEqual((self.ws / "state" / "pool-suspended").read_text(), "app-quit 1790630000\n")
+        rec = json.loads((self.ws / "state" / "pool-suspended").read_text())
+        self.assertEqual(rec, {"reason": "app-quit", "at": 1790630000, "stopped": sorted([DEAD, ALIVE])})
         self.assertEqual(rem.suspension(self.ws), "app-quit 1790630000")
+
+    def test_a_marker_that_is_not_a_record_still_suspends_and_names_no_workers(self):
+        (self.ws / "state" / "pool-suspended").write_text("app-quit 5\n")
+        self.assertEqual(rem.suspension(self.ws), "app-quit 5")
+        with mock.patch.object(rem.sup, "observe", return_value={DEAD: obs(False)}), \
+                mock.patch.object(rem, "recover") as rec:
+            self.assertEqual(rem.resume(self.ws, REPO)["restarted"], {})
+        rec.assert_not_called()
 
     def test_the_cli_suspends_and_exits_zero(self):
         rc, out = self.run_main("--suspend", "app-quit")
@@ -117,6 +135,14 @@ class Suspended(Base):
         self.assertEqual(out["suspended"], "app-quit 1")
         self.assertEqual(out["decisions"], {DEAD: ps.RECOVER})
 
+    def test_a_suspended_sweep_still_reports_escalations(self):
+        rem.suspend(self.ws, "app-quit", now=1)
+        with mock.patch.object(rem.sup, "tick", return_value=tick_result({ESCALATED: ps.ESCALATE})), \
+                mock.patch.object(rem, "apply") as apply:
+            rc, out = self.run_main("--sweep")
+        apply.assert_not_called()
+        self.assertEqual(out["escalations"], [ESCALATED])
+
 
 class Resume(Base):
     def test_resume_without_a_marker_is_just_a_sweep(self):
@@ -124,26 +150,27 @@ class Resume(Base):
             self.assertEqual(rem.resume(self.ws, REPO), {"was_suspended": None, "restarted": {}})
         observe.assert_not_called(), rec.assert_not_called()
 
-    def test_resume_restarts_only_the_non_paused_dead_and_clears_their_ladder(self):
+    def test_resume_restarts_only_what_the_stop_took_down_and_keeps_an_escalation(self):
+        self.roster(DEAD, ALIVE, PAUSED, ESCALATED)
+        (self.ws / "state" / "workers" / PAUSED).mkdir(parents=True)
+        (self.ws / "state" / "workers" / PAUSED / "paused").write_text("")
+        escalated = ps.WorkerEvidence(consecutive=9, escalated=True, recover_issued_at=5.0)
+        rem.sup.save_state(self.ws, ps.SupervisionState(last_sample_at=1.0, workers={ESCALATED: escalated}))
         rem.suspend(self.ws, "app-quit")
-        state = ps.SupervisionState(last_sample_at=1.0, workers={
-            DEAD: ps.WorkerEvidence(consecutive=9, escalated=True, recover_issued_at=5.0),
-            ALIVE: ps.WorkerEvidence(consecutive=1)})
-        saved = []
         with mock.patch.object(rem.sup, "observe", return_value={
-                    DEAD: obs(False), ALIVE: obs(True), PAUSED: obs(False, paused=True)}), \
+                    DEAD: obs(False), ALIVE: obs(True), PAUSED: obs(False, paused=True),
+                    ESCALATED: obs(False)}), \
                 mock.patch.object(rem, "recover", side_effect=lambda ws, repo, w, **kw: {
-                    "worker_id": w, "outcome": rem.RECOVERED}) as rec, \
-                mock.patch.object(rem.sup, "load_state", return_value=state), \
-                mock.patch.object(rem.sup, "save_state", side_effect=lambda ws, s: saved.append(s)):
+                    "worker_id": w, "outcome": rem.RECOVERED}) as rec:
             out = rem.resume(self.ws, REPO)
         self.assertIsNone(rem.suspension(self.ws))
         self.assertEqual([c.args[2] for c in rec.call_args_list], [DEAD])
         self.assertEqual(out["was_suspended"].split()[0], "app-quit")
         self.assertEqual(list(out["restarted"]), [DEAD])
-        self.assertEqual(set(saved[0].workers), {ALIVE})
+        self.assertEqual(rem.sup.load_state(self.ws).workers[ESCALATED], escalated)
 
     def test_the_cli_resumes_then_sweeps_and_a_failed_restart_exits_nonzero(self):
+        self.roster(DEAD)
         rem.suspend(self.ws, "app-quit")
         with mock.patch.object(rem.sup, "observe", return_value={DEAD: obs(False)}), \
                 mock.patch.object(rem, "recover", return_value={"worker_id": DEAD, "outcome": rem.FAILED}), \
