@@ -80,6 +80,20 @@ class Marker(Base):
         self.assertEqual(rec, {"reason": "app-quit", "at": 1790630000, "stopped": sorted([DEAD, ALIVE])})
         self.assertEqual(rem.suspension(self.ws), "app-quit 1790630000")
 
+    def test_an_unreadable_pool_still_suspends_and_names_no_workers(self):
+        with mock.patch.object(rem.sup, "load_state", side_effect=ValueError("corrupt ladder")):
+            self.assertTrue(rem.suspend(self.ws, "app-quit", now=3).startswith("app-quit"))
+        rec = json.loads((self.ws / "state" / "pool-suspended").read_text())
+        self.assertEqual(rec["stopped"], [])
+
+    def test_a_bad_worker_id_on_resume_exits_2_not_a_traceback(self):
+        rem.suspend(self.ws, "app-quit", now=3)
+        with mock.patch.object(rem, "resume", side_effect=rem.wi.IdentityError("bad id")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            rc = rem.main(["--workspace", str(self.ws), "--repo", str(REPO), "--resume"])
+        self.assertEqual(rc, 2)
+        self.assertIn("refused", err.getvalue())
+
     def test_a_marker_that_is_not_a_record_still_suspends_and_names_no_workers(self):
         (self.ws / "state" / "pool-suspended").write_text("app-quit 5\n")
         self.assertEqual(rem.suspension(self.ws), "app-quit 5")

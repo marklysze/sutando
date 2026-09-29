@@ -70,8 +70,8 @@ def _marker(workspace) -> dict | None:
 
 
 def suspension(workspace) -> str | None:
-    """The recorded reason the pool is suspended, or None. Never expires: only a
-    deliberate app quit writes it, and the app's next start lifts it."""
+    """The recorded reason the pool is suspended, or None. Never expires: only
+    --resume lifts it."""
     rec = _marker(workspace)
     if rec is None:
         return None
@@ -81,10 +81,13 @@ def suspension(workspace) -> str | None:
 def suspend(workspace, reason: str, now: float | None = None) -> str:
     """Suspend, recording which workers the stop takes down: every supervised worker not
     already in a death episode. Read from the ladder's own file, so no probe delays a quit."""
-    state = sup.load_state(workspace)
-    in_episode = {w for w, e in state.workers.items() if e.consecutive or e.escalated}
-    stopped = sorted(w for w in sup.supervised_workers(workspace)
-                     if w not in in_episode and not sup.is_paused(workspace, w))
+    try:
+        state = sup.load_state(workspace)
+        in_episode = {w for w, e in state.workers.items() if e.consecutive or e.escalated}
+        stopped = sorted(w for w in sup.supervised_workers(workspace)
+                         if w not in in_episode and not sup.is_paused(workspace, w))
+    except Exception:  # noqa: BLE001 — an unreadable pool must never leave the stop unsuspended
+        stopped = []
     path = suspended_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
@@ -355,9 +358,9 @@ def main(argv=None) -> int:
     if a.suspend:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
-    resumed = resume(a.workspace, a.repo) if a.resume else None
-    held = suspension(a.workspace)
     try:
+        resumed = resume(a.workspace, a.repo) if a.resume else None
+        held = suspension(a.workspace)
         tick = sup.tick(a.workspace, time.time(),
                         worker_ids=[a.recipient] if a.recipient else None,
                         persist=not a.dry_run and not held)
