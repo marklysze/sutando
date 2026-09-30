@@ -270,7 +270,13 @@ class Workers(Base):
         self.ws.supervisor("crashed", session=f"sutando-worker-{WID}",
                            name=f"core-supervisor.sutando-worker-{WID}.json", age=3)
         w = self.snap(agent="workers")["agents"][0]
-        self.assertEqual((w["alive"], w["condition"], w["reason"]), (True, "abnormal", "crashed"))
+        self.assertEqual((w["alive"], w["condition"], w["reason"]), (False, "abnormal", "crashed"))
+
+    def test_a_core_the_supervisor_saw_crash_is_not_alive_while_its_beat_is_fresh(self):
+        self.ws.touch(f"state/cores/{HOST}.alive", age=5)
+        self.ws.supervisor("crashed")
+        c = self.core()
+        self.assertEqual((c["alive"], c["condition"], c["reason"]), (False, "abnormal", "crashed"))
 
     def test_alive_follows_the_beat_before_any_screen_verdict_exists(self):
         self.ws.worker()
