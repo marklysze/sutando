@@ -550,9 +550,13 @@ def test_an_unchanged_pool_is_resent_on_the_cadence_so_a_restarted_broker_heals(
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], calls
         calls.clear()
-        clock[0] += 60
+        clock[0] += m.WORKERS_REFRESH_S - 1
         m._push_pool_advertisement_now()
         assert calls == [], "within the cadence and unchanged: nothing resent"
+        clock[0] += 1
+        m._push_pool_advertisement_now()
+        assert [c[0] for c in calls] == ["POST"], "the workers report refreshes for the broker's staleness window"
+        calls.clear()
         clock[0] += m._REPUSH_EVERY_S
         m._push_pool_advertisement_now()
         assert [c[0] for c in calls] == ["POST", "PUT"], "past the cadence: both halves resent unchanged"

@@ -2444,6 +2444,10 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
+# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+WORKERS_REFRESH_S = 20.0
+_workers_pushed_at: "float | None" = None
 _advertisement_unavailable_logged = False
 
 # 404/405/501 are the broker saying "this endpoint does not exist here"; every
@@ -2662,7 +2666,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
     leaves the broker holding the last snapshot we sent; an unsupported
     endpoint backs the push off an hour and any other HTTP status 5m;
     nothing here may ever break the task loop."""
-    global _workers_pushed_identity, _workers_push_retry_at
+    global _workers_pushed_identity, _workers_push_retry_at, _workers_pushed_at
     if not _publication_permitted():
         return False
     now = time.time()
@@ -2676,7 +2680,8 @@ def _maybe_push_workers_snapshot(record) -> bool:
     if body is not base:
         # Health changes between advertisements, so it joins the change signal.
         identity += ":" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
-    if identity == _workers_pushed_identity:
+    fresh = _workers_pushed_at is not None and _now() - _workers_pushed_at < WORKERS_REFRESH_S
+    if identity == _workers_pushed_identity and fresh:
         return False
     try:
         _req("POST", "/v1/workers", body, timeout=15)
@@ -2688,6 +2693,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
         _log(f"workers-snapshot push failed, retrying in 5m: {e}")
         return False
     _workers_pushed_identity = identity
+    _workers_pushed_at = _now()
     _log("workers-snapshot pushed")
     return True
 

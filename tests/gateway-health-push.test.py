@@ -55,6 +55,7 @@ class Base(unittest.TestCase):
         for name, value in (("_STATE", self.ws / "state"), ("_heartbeat_disabled", False),
                             ("_last_heartbeat_at", 0.0), ("_last_core_health", None),
                             ("_workers_pushed_identity", ""), ("_workers_push_retry_at", 0.0),
+                            ("_workers_pushed_at", None),
                             ("_health_cache", {"at": None, "value": None, "error": None})):
             p = mock.patch.object(rgb, name, value)
             p.start()
