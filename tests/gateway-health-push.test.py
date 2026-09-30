@@ -111,6 +111,14 @@ class Rows(unittest.TestCase):
         self.assertEqual(body["suspended"], {"reason": "app-quit", "at": 7})
         self.assertNotIn("health", REPORT["workers"][0])
 
+    def test_a_suspension_leaves_as_a_slug_and_a_numeric_time_only(self):
+        self.assertIsNone(rgb._suspended_row(None))
+        free_text = {"reason": "App Quit at /Users/mark (host)" + "x" * 60, "at": "yesterday"}
+        row = rgb._suspended_row(free_text)
+        self.assertRegex(row["reason"], r"^[a-z0-9-]{1,40}$")
+        self.assertIsNone(row["at"])
+        self.assertEqual(rgb._suspended_row({"reason": "!!!", "at": 5}), {"reason": "suspended", "at": 5})
+
     def test_the_legacy_body_and_a_missing_snapshot_pass_through(self):
         self.assertIs(rgb._with_health(LEGACY, snap()), LEGACY)
         self.assertIs(rgb._with_health(REPORT, None), REPORT)

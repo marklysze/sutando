@@ -185,9 +185,9 @@ received.
 
 ### `PUT /v1/agents/<mxid>/profile` *(optional)*
 
-The instance's identity card, pushed on the same change signal and cadence as
-the workers snapshot, from the same single read, so the two can never describe
-different revisions. `<mxid>` is percent-encoded as one path segment.
+The instance's identity card, pushed on the same change signal as the workers
+snapshot and from the same single read, so the two can never describe different
+revisions. Unchanged, it is re-sent every 600 s, not at the workers' 20 s refresh. `<mxid>` is percent-encoded as one path segment.
 
 ```
 body: {

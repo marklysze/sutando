@@ -2657,7 +2657,16 @@ def _with_health(body: dict, snap: "dict | None") -> dict:
     health = {a.get("id"): _health_row(a) for a in snap.get("agents") or [] if a.get("role") == "worker"}
     rows = [{**r, "health": health[r["id"]]} if isinstance(r, dict) and r.get("id") in health else r
             for r in body["workers"]]
-    return {**body, "workers": rows, "suspended": snap.get("suspended")}
+    return {**body, "workers": rows, "suspended": _suspended_row(snap.get("suspended"))}
+
+
+def _suspended_row(value) -> "dict | None":
+    """The pool suspension as summary fields: its reason a slug like any health reason."""
+    if not isinstance(value, dict):
+        return None
+    reason = _health_row({"reason": value.get("reason")})["reason"]
+    at = value.get("at")
+    return {"reason": reason or "suspended", "at": at if isinstance(at, (int, float)) else None}
 
 
 def _maybe_push_workers_snapshot(record) -> bool:
@@ -2719,12 +2728,8 @@ def _build_agent_profile(workers: "dict") -> "dict":
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
     # The host's stable label: gethostname() drifts with the network (a DHCP lease renames it).
-    try:
-        host_id = _stable_host_label()
-    except OSError:
-        host_id = "unknown-host"
     return {"display": {"name": name},
-            "host": {"host_id": host_id, "kind": "local"},
+            "host": {"host_id": _stable_host_label(), "kind": "local"},
             "workers": workers}
 
 
