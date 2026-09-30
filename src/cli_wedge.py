@@ -94,7 +94,9 @@ RETRY_PATTERNS: tuple[tuple[str, re.Pattern], ...] = tuple(
 _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?"), "<ts>"),
     (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AaPp][Mm])?\b"), "<clock>"),
-    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?)\b"), "<dur>"),
+    # A compound duration ("3m 12s") is one field, so 12s and 3m 12s compare equal.
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?)(?:\s+\d+(?:\.\d+)?\s*(?:ms|s|secs?|m|mins?|h|hrs?))*\b"),
+     "<dur>"),
     (re.compile(r"\b\d+(?:\.\d+)?[kKmM]?\s*tokens?\b"), "<tokens>"),
     (re.compile(r"\b\d+\s*/\s*\d+\b"), "<count>"),
     (re.compile(r"\b\d+(?:\.\d+)?%"), "<pct>"),
