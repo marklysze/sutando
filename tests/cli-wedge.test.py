@@ -46,6 +46,10 @@ class Normalization(unittest.TestCase):
         # No blanket digit stripping (owner review): a bare number is content until a trace says otherwise.
         self.assertIn("run 42", n)
 
+    def test_a_compound_duration_is_one_field(self):
+        self.assertEqual(w.normalize("(12s · esc to interrupt)"), w.normalize("(1h 3m 12s · esc to interrupt)"))
+        self.assertEqual(w.normalize("took 3.5s"), "took <dur>")
+
     def test_semantic_digits_are_progress_not_noise(self):
         self.assertNotEqual(w.state_id("editing migration_41.sql\n"), w.state_id("editing migration_42.sql\n"))
         self.assertNotEqual(w.state_id("processing shard 17\n"), w.state_id("processing shard 18\n"))

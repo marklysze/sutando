@@ -335,6 +335,78 @@ class TestComposeState(unittest.TestCase):
         self.assertEqual(st2, "hung")
 
 
+# A turn in flight, as Claude Code renders it: output above, the spinner line below.
+_TURN_A = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "✻ Perambulating… (12s · ↓ 1.2k tokens · esc to interrupt)")
+_TURN_B = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+           "⏺ Read(src/health_snapshot.py)\n  ⎿  Read 400 lines\n"
+           "✻ Perambulating… (15s · ↓ 1.9k tokens · esc to interrupt)")
+# The same frame three minutes later: only the clock and the token count moved.
+_TURN_A_TICKED = ("⏺ Bash(gh pr list --state open)\n  ⎿  #4944 feat(health): …\n"
+                  "✻ Perambulating… (3m 12s · ↓ 4.8k tokens · esc to interrupt)")
+
+
+class TestMovingTurnIsNotHung(unittest.TestCase):
+    """A stale self-report is not a wedge when the pane shows a turn in flight AND it
+    changed since the last poll; a frozen turn still reads hung."""
+
+    def test_a_moving_working_pane_reads_running(self):
+        st, detail, prompt, _k = compose_state(_TURN_B, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual((st, detail, prompt), ("running", "actively processing", None))
+
+    def test_a_frozen_working_pane_stays_hung(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_the_first_poll_has_no_motion_to_see(self):
+        st, *_ = compose_state(_TURN_A, "unknown", True)
+        self.assertEqual(st, "hung")
+
+    def test_only_the_spinner_clock_moving_is_still_hung(self):
+        st, *_ = compose_state(_TURN_A_TICKED, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "hung")
+
+    def test_a_changing_pane_without_a_turn_in_flight_stays_hung(self):
+        st, *_ = compose_state("Running step 4...", "unknown", True, prev_pane="Running step 3...")
+        self.assertEqual(st, "hung")
+
+    def test_the_idle_footer_override_is_unchanged(self):
+        idle = "prior output\n\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        st, *_ = compose_state(idle, "unknown", True, prev_pane=_TURN_A)
+        self.assertEqual(st, "idle-ready")
+
+    def test_the_watcher_carries_the_previous_capture_between_polls(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+        panes, states = iter([_TURN_A, _TURN_B]), []
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "unknown", "signals": {"process": True}}
+
+        class _Stop(Exception):
+            pass
+
+        def _sleep(_s):
+            with open(out) as f:
+                states.append(json.load(f)["state"])
+            if len(states) == 2:
+                raise _Stop
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--no-chat-escalation"]
+        with patch.object(_mod, "capture", lambda s, sess: next(panes)), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod.time, "sleep", _sleep), \
+                patch.object(sys, "argv", argv), self.assertRaises(_Stop):
+            main()
+        self.assertEqual(states, ["hung", "running"])
+
+
 class TestRefusedTurn(unittest.TestCase):
     """#4015: a turn the CLI refuses is a FINISHED turn at the idle footer — no gate, no
     affordance — so classify() cannot see it and every base health reads idle-ready.

@@ -154,7 +154,7 @@ state as the reason. `retired` workers are left out of the response.
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
 | `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |
-| `hung` | supervisor | the session is there but the self-report stopped advancing |
+| `hung` | supervisor | the session is there but the self-report stopped advancing, and the pane shows neither the idle footer nor a turn in flight that changed since the last poll |
 | `crashed` | supervisor | the supervisor found no session |
 | `gateway-down` | supervisor | the core is up but its gateway bridge is not |
 | `retry-loop` | cli_wedge | the pane keeps moving while the CLI retries |
