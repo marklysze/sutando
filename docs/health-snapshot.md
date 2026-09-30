@@ -48,7 +48,7 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 | `overall` | `attention` if any agent is abnormal; `ok` if every agent is healthy; otherwise `unknown` |
 | `id`, `role` | `core`, or a worker id with role `worker` |
 | `label` | the worker's roster label; `null` when it is only the id |
-| `alive` | `true` beat fresh, `false` beat stale, `null` no beat file (see [Liveness](#liveness)) |
+| `alive` | `true` beat fresh, `false` beat stale or the supervisor saw the session crash, `null` no beat file |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
 | `reason` | why it is abnormal (see [Reasons](#reasons)); `null` otherwise |
@@ -146,7 +146,9 @@ state as the reason. `retired` workers are left out of the response.
    supervisor's `needs-login` outranks a `cli_wedge` `retry-loop`.
 4. **Moving beats idle.** Motion is `moving` if any source says so, else `idle` if any says so,
    else `unknown`.
-5. `alive` comes from the beat alone and is reported beside the verdict, not folded into it.
+5. `alive` comes from the beat and is reported beside the verdict, not folded into it. The
+   one exception is a current `crashed` verdict, which makes it `false`: a worker's inbox
+   watcher, and the core's heartbeat writer, run apart from the session and outlive it.
 
 ## Reasons
 

@@ -225,8 +225,11 @@ def _pool_source(entry, sampled_at, now: float) -> dict:
     return {**src, "opinion": None}
 
 
-def _alive(beat: dict):
-    """True / False from a beat source, None when there is no beat to judge."""
+def _alive(beat: dict, supervisor: dict | None = None):
+    """True / False from a beat source, None when there is no beat to judge. A current
+    `crashed` verdict is False: the beat's writer can outlive the session it vouches for."""
+    if ((supervisor or {}).get("opinion") or {}).get("reason") == "crashed":
+        return False
     return {"fresh": True, "stale": False}.get(beat.get("value"))
 
 
@@ -312,7 +315,7 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             "self_report": _status_source(ws, now),
         }
         agents.append((_verdict({"id": "core", "role": "core", "label": None,
-                                 "alive": _alive(sources["heartbeat"])}, sources), sources))
+                                 "alive": _alive(sources["heartbeat"], sources["supervisor"])}, sources), sources))
 
     if agent != "core":
         pool, pool_mtime = _read_json(ws / "state" / "pool-supervision.json")
@@ -341,7 +344,7 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
                 "activity": _activity_source(wid, activity, now),
             }
             agents.append((_verdict({"id": wid, "role": "worker", "label": label,
-                                     "alive": _alive(sources["watcher_beat"])}, sources), sources))
+                                     "alive": _alive(sources["watcher_beat"], sources["supervisor"])}, sources), sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else
