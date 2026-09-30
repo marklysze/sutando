@@ -912,7 +912,7 @@ class TestSendKeys(unittest.TestCase):
             self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "sutando-core:0", "Enter"])
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:0", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
@@ -982,6 +982,50 @@ class TestMainOnce(unittest.TestCase):
                 sig = json.load(f)
         self.assertEqual(sig["state"], "crashed")
         self.assertEqual(sig["session"], "sutando-core")
+
+    def test_a_dead_seat_whose_input_session_lives_on_is_crashed(self):
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            sock = os.path.join(td, "sock")
+            seat = "sutando-worker-" + "a" * 32
+            subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", seat + "-input", "sleep 60"],
+                           check=True)
+            out = os.path.join(td, "state", f"core-supervisor.{seat}.json")
+            old, old_sock = sys.argv, os.environ.get("SUTANDO_TMUX_SOCKET")
+            sys.argv = ["core-input-watch.py", f"--socket={sock}", f"--session={seat}",
+                        f"--out={out}", "--no-chat-escalation", "--once"]
+            try:
+                main()
+            finally:
+                sys.argv = old
+                if old_sock is None:
+                    os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                else:
+                    os.environ["SUTANDO_TMUX_SOCKET"] = old_sock
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+            with open(out) as f:
+                self.assertEqual(json.load(f)["state"], "crashed")
+
+    def test_capture_and_keys_target_the_session_exactly(self):
+        import subprocess
+        seen = []
+
+        class R:
+            returncode, stdout = 0, ""
+        orig = subprocess.run
+        subprocess.run = lambda argv, **k: seen.append(argv) or R()
+        try:
+            _mod.capture("s.sock", "seat")
+            _mod.send_keys("s.sock", "seat", "Enter")
+        finally:
+            subprocess.run = orig
+        self.assertEqual([a[a.index("-t") + 1] for a in seen], ["=seat:0", "=seat:0"])
 
     def test_once_blocked_prompt_debounces_on_first_tick(self):
         """A fresh gate with --stable 2 must NOT escalate on the first tick — the
