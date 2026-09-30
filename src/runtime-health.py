@@ -267,7 +267,7 @@ def _gateway_running():
     if rc == 0:
         return True
     # Fallback: a window named "gateway" in the core session.
-    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", SESSION, "-F", "#{window_name}"])
+    rc2, out = _run(["tmux", "-S", _tmux_socket(), "list-windows", "-t", f"={SESSION}", "-F", "#{window_name}"])
     if rc2 == 0 and any(w.strip() == "gateway" for w in out.splitlines()):
         return True
     # Neither probe confirmed the gateway. Only report "down" if at least one
@@ -505,7 +505,7 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
 
 
 def _pane_text():
-    rc, out = _run(["tmux", "-S", _tmux_socket(), "capture-pane", "-p", "-t", SESSION])
+    rc, out = _run(["tmux", "-S", _tmux_socket(), "capture-pane", "-p", "-t", f"={SESSION}"])
     return out if rc == 0 else ""
 
 

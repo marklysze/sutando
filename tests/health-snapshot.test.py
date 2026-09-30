@@ -264,6 +264,14 @@ class Workers(Base):
         self.assertEqual((w["motion"], w["condition"], w["reason"]), ("unknown", "abnormal", "offline"))
         self.assertEqual(w["since"], NOW - hs.HEARTBEAT_STALE_S - 30)
 
+    def test_a_seat_the_watcher_saw_end_is_crashed_while_the_inbox_beat_is_fresh(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("crashed", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=3)
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["condition"], w["reason"]), (True, "abnormal", "crashed"))
+
     def test_alive_follows_the_beat_before_any_screen_verdict_exists(self):
         self.ws.worker()
         self.assertIsNone(self.snap(agent="workers")["agents"][0]["alive"])
