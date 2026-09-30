@@ -2,7 +2,7 @@
 
 One read-only answer to "how is each agent doing?" for the core and every worker. Code:
 `src/health_snapshot.py`; served by agent-api (`src/agent-api.py`, port 7843); tests:
-`tests/health-snapshot.test.py`.
+`tests/health-snapshot.test.py`, `tests/gateway-health-push.test.py`.
 
 It reads files the existing watchers already write. It probes no process or pane and writes
 nothing, so calling it often is safe and it answers even when the core is down.
@@ -33,11 +33,14 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 ```json
 {
   "checked_at": 1790566151.7,
+  "instance": "@mark-desktop.agent:ag2.space",
   "overall": "ok",
+  "suspended": null,
   "agents": [
-    {"id": "core", "role": "core", "label": null, "alive": true,
+    {"id": "core", "role": "core", "label": null, "session": "sutando-core", "alive": true,
      "motion": "idle", "condition": "healthy", "reason": null, "since": null},
-    {"id": "40659240fd884f63bcd19fa684b451f1", "role": "worker", "label": null, "alive": true,
+    {"id": "40659240fd884f63bcd19fa684b451f1", "role": "worker", "label": null,
+     "session": "sutando-worker-40659240fd884f63bcd19fa684b451f1", "alive": true,
      "motion": "idle", "condition": "healthy", "reason": null, "since": null}
   ]
 }
@@ -45,9 +48,12 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 
 | Field | Meaning |
 |---|---|
+| `instance` | the agent id the serving gateway lane signed in as (the `agent_id` it writes to `state/gateway-status[.<lane>].json` while connected). `null` when no lane is serving within 180 s, or two serving lanes name different ids: a wrong id would show this Mac twice |
 | `overall` | `attention` if any agent is abnormal; `ok` if every agent is healthy; otherwise `unknown` |
+| `suspended` | `{"reason", "at"}` while `state/pool-suspended` exists (the app quit and paused the pool); `null` otherwise |
 | `id`, `role` | `core`, or a worker id with role `worker` |
 | `label` | the worker's roster label; `null` when it is only the id |
+| `session` | the tmux session to open for this agent, as its beat file (core) or supervisor file names it; `null` when no file names one. Never guessed |
 | `alive` | `true` beat fresh, `false` beat stale, `null` no beat file (see [Liveness](#liveness)) |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
@@ -193,6 +199,14 @@ and the self-report is idle. Result: `alive: true` (fresh heartbeat), `idle · h
   so a dead core monitor's last state stands until the heartbeat goes stale.
 - **Moving can lag** by up to 120 s for a task that never writes a result, and by up to 90 s from
   a stale `running` self-report.
+
+## Reaching AG2 Space
+
+The gateway bridge computes this snapshot in-process, so a Mac or cloud Sutando without agent-api
+still reports. It sends the core's `alive`/`motion`/`condition`/`reason`/`since` on the heartbeat
+and each worker's on the workers report, plus `suspended` (see
+[`remote-gateway-protocol.md`](remote-gateway-protocol.md)). `instance`, `session`, `label` and the
+`full` view stay on the Mac.
 
 ## Privacy
 

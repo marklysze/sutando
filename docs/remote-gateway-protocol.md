@@ -140,6 +140,20 @@ body: {
 understands the per-agent Collaborator control layered over Team. Gateways
 without it safely keep Team on their prior restricted path.
 
+When the gateway runs inside a Sutando checkout it adds the core's health row
+from [`GET /health`](health-snapshot.md) and the `worker_health.v1` capability:
+
+```
+"health": {"alive": true|false|null, "motion": "idle|moving|unknown",
+           "condition": "healthy|abnormal|unknown", "reason": "<slug>"|null,
+           "since": <unix seconds>|null}
+```
+
+`reason` is a slug of `[a-z0-9-]{1,40}`, not a closed set. `since` is for display;
+the broker times freshness by when it received the heartbeat. A change in the row
+sends the heartbeat at once, without waiting for the interval. A gateway with no
+Sutando checkout around it sends neither field.
+
 ### `POST /v1/workers` *(optional)*
 
 The worker pool this gateway fronts, pushed when the local advertisement's
@@ -157,6 +171,12 @@ body: {
 }
 success: 2xx, body ignored
 ```
+
+When the advertisement carries the per-worker report (`workers: [{id, state, …}]`),
+a gateway that sends `worker_health.v1` adds each non-retired worker's `health`
+row (the heartbeat's shape) and a top-level `suspended: {"reason", "at"} | null`,
+set while the owner has quit the app and the pool is paused. A health change
+pushes the report again even when the advertisement has not changed.
 
 ### `PUT /v1/agents/<mxid>/profile` *(optional)*
 

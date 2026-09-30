@@ -38,6 +38,8 @@ def _load(base):
     m = importlib.reload(mod)
     # hermetic: the channel .env fallback must not leak this host's identity
     m._config_from_channel_env = lambda *a, **k: ""
+    # health rides on the same POST; tests/gateway-health-push.test.py pins it
+    m._health_snapshot = lambda: None
     return m
 
 

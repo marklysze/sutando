@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
+import gateway_serving
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
 
@@ -41,6 +42,8 @@ WEDGE_MOTION_FRESH_S = 30.0
 POOL_STALE_S = 900.0
 ACTIVITY_LIVE_S = 120.0
 ACTIVITY_TAIL_BYTES = 256 * 1024
+# health-check's window for a gateway-status sidecar; the bridge rewrites it on every poll.
+GATEWAY_STALE_S = 180.0
 
 # core-input-watch states → (motion, condition, reason). A blocked-human reason is refined from `kind`.
 SUPERVISOR = {
@@ -291,6 +294,42 @@ def _worker_supervisor_paths(ws: Path) -> dict:
     return out
 
 
+def _instance(ws: Path, now: float):
+    """The identity a serving gateway lane signed in as; None when no lane is serving or serving
+    lanes disagree, since a wrong identity would show this Mac twice."""
+    ids = set()
+    for path in (ws / "state").glob("gateway-status*.json"):
+        value, _ = _read_json(path)
+        verdict = gateway_serving.verdict_from_record(value, now=now, max_age=GATEWAY_STALE_S)
+        agent_id = value.get("agent_id") if isinstance(value, dict) else None
+        if verdict and verdict.serving and isinstance(agent_id, str) and agent_id:
+            ids.add(agent_id)
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _suspended(ws: Path):
+    """{reason, at} while the worker pool is suspended, else None. A marker that is not a
+    record still suspends, as the pool reads it."""
+    try:
+        text = (ws / "state" / "pool-suspended").read_text().strip()
+    except OSError:
+        return None
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        rec = None
+    if not isinstance(rec, dict):
+        return {"reason": text or "suspended", "at": None}
+    return {"reason": rec.get("reason"), "at": rec.get("at")}
+
+
+def _session(path):
+    """The tmux session a beat or supervisor file names, or None."""
+    value, _ = _read_json(path) if path else (None, None)
+    session = value.get("session") if isinstance(value, dict) else None
+    return session if isinstance(session, str) and session else None
+
+
 def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=None) -> dict:
     """The health snapshot. `agent`: all | core | workers | <worker id>. `view`: summary | full."""
     if view not in VIEWS:
@@ -309,7 +348,9 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
             "activity": _activity_source("core", activity, now),
             "self_report": _status_source(ws, now),
         }
-        agents.append((_verdict({"id": "core", "role": "core", "label": None,
+        session = (_session(ws / "state" / "cores" / f"{_host_label()}.alive")
+                   or _session(Path(status_read_path("core-supervisor.json", ws))))
+        agents.append((_verdict({"id": "core", "role": "core", "label": None, "session": session,
                                  "alive": _alive(sources["heartbeat"])}, sources), sources))
 
     if agent != "core":
@@ -338,13 +379,14 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
             }
-            agents.append((_verdict({"id": wid, "role": "worker", "label": label,
+            agents.append((_verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),
                                      "alive": _alive(sources["watcher_beat"])}, sources), sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else
                "ok" if agents and conditions == {HEALTHY} else "unknown")
-    out = {"checked_at": round(now, 1), "overall": overall,
+    out = {"checked_at": round(now, 1), "instance": _instance(ws, now), "overall": overall,
+           "suspended": _suspended(ws),
            "agents": [a if view == "summary" else {**a, "sources": s} for a, s in agents]}
     return out
 

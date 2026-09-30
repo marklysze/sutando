@@ -1723,6 +1723,7 @@ def _auth_probe() -> bool:
         return False
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
+_last_core_health: "dict | None" = None
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
@@ -2604,6 +2605,57 @@ def _workers_body(ad: dict) -> dict:
     return ad["workers"]
 
 
+HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
+HEALTH_TTL_S = 15.0
+_health_cache: dict = {"at": None, "value": None, "error": None}
+
+
+def _health_snapshot() -> "dict | None":
+    """The workspace health summary, reused for HEALTH_TTL_S; None where the monorepo
+    src/ is absent or the snapshot fails, so a standalone sparrow reports no health."""
+    at = _health_cache["at"]
+    if at is not None and time.monotonic() - at < HEALTH_TTL_S:
+        return _health_cache["value"]
+    value, error = None, None
+    try:
+        src = _monorepo_src("health_snapshot.py")
+        if src:
+            if src not in sys.path:
+                sys.path.insert(0, src)
+            import health_snapshot
+            value = health_snapshot.snapshot(_STATE.parent)
+    except Exception as e:  # noqa: BLE001 — health is optional; it never breaks a push
+        error = f"{type(e).__name__}: {e}"
+    if error and error != _health_cache["error"]:
+        _log(f"health snapshot unavailable: {error}")
+    _health_cache.update(at=time.monotonic(), value=value, error=error)
+    return value
+
+
+def _health_row(agent: dict) -> dict:
+    """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
+    row = {k: agent.get(k) for k in HEALTH_FIELDS}
+    if row["reason"] is not None:
+        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40] or None
+    return row
+
+
+def _core_health(snap: "dict | None") -> "dict | None":
+    core = next((a for a in (snap or {}).get("agents") or [] if a.get("role") == "core"), None)
+    return _health_row(core) if core else None
+
+
+def _with_health(body: dict, snap: "dict | None") -> dict:
+    """The report plus each worker's health and the pool suspension. The legacy body has
+    no worker rows, so it and a missing snapshot pass through unchanged."""
+    if snap is None or not isinstance(body.get("workers"), list):
+        return body
+    health = {a.get("id"): _health_row(a) for a in snap.get("agents") or [] if a.get("role") == "worker"}
+    rows = [{**r, "health": health[r["id"]]} if isinstance(r, dict) and r.get("id") in health else r
+            for r in body["workers"]]
+    return {**body, "workers": rows, "suspended": snap.get("suspended")}
+
+
 def _maybe_push_workers_snapshot(record) -> bool:
     """Push-on-change relay of the pool's workers snapshot (the worker
     picker's read path). An unavailable advertisement pushes NOTHING and
@@ -2619,10 +2671,15 @@ def _maybe_push_workers_snapshot(record) -> bool:
     identity, ad = record  # one read per beat, shared with the other publication
     if ad is None:
         return False
+    base = _workers_body(ad)
+    body = _with_health(base, _health_snapshot())
+    if body is not base:
+        # Health changes between advertisements, so it joins the change signal.
+        identity += ":" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
     if identity == _workers_pushed_identity:
         return False
     try:
-        _req("POST", "/v1/workers", _workers_body(ad), timeout=15)
+        _req("POST", "/v1/workers", body, timeout=15)
     except urllib.error.HTTPError as e:
         _workers_push_retry_at = _defer_push("workers-snapshot push", e, now)
         return False
@@ -2792,13 +2849,16 @@ def _reported_core_status() -> tuple[str | None, str | None]:
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at
+    global _heartbeat_disabled, _last_heartbeat_at, _last_core_health
     if _heartbeat_disabled:
         return False
     now = time.time()
-    if not force and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
+    health = _core_health(_health_snapshot())
+    changed = health is not None and health != _last_core_health
+    if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
+    _last_core_health = health
     _status, _step = _reported_core_status()
     try:
         payload = {
@@ -2816,6 +2876,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["status"] = _status
         if _step is not None:
             payload["step"] = _step
+        if health is not None:
+            payload["health"] = health
+            payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
         return True
     except urllib.error.HTTPError as e:
@@ -2859,6 +2922,8 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            # Re-read on every write, so a lane switch or re-login shows at the next poll.
+            "agent_id": (_reenroll_identity() or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
