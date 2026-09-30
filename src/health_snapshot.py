@@ -237,7 +237,9 @@ def _verdict(agent: dict, sources: dict) -> dict:
     # A dead agent's last words (e.g. a supervisor file left at idle-ready) say nothing now.
     offline = next((o for o in ops if o["reason"] == "offline"), None)
     if offline:
-        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": "offline", "since": offline["since"]}
+        # The pool giving up is fresher news about the same death, and it needs a person.
+        dead = next((o for o in ops if o["reason"] == "not-answering"), offline)
+        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": dead["reason"], "since": dead["since"]}
     motions = {o["motion"] for o in ops if o["motion"]}
     bad = [o for o in ops if o["condition"] == ABNORMAL]
     good = [o for o in ops if o["condition"] == HEALTHY]

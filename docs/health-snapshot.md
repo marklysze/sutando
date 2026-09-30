@@ -137,7 +137,9 @@ state as the reason. `retired` workers are left out of the response.
 
 1. **Offline wins outright.** If any source says `offline`, the agent is `unknown · abnormal ·
    offline`, whatever else it says. A dead agent's files keep their last words (a supervisor
-   file left at `idle-ready`), and those say nothing about now.
+   file left at `idle-ready`), and those say nothing about now. The one exception: when a fresh
+   pool sample says it gave up on the worker, the reason is `not-answering`, since that needs a
+   person and a plain `offline` does not.
 2. **Abnormal beats healthy.** Condition is `abnormal` if any source says so, else `healthy` if
    any says so, else `unknown`.
 3. **The first abnormal source names the reason**, in the source order above. So the

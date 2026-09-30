@@ -317,6 +317,15 @@ class Workers(Base):
         w = self.snap(agent="workers")["agents"][0]
         self.assertEqual((w["condition"], w["reason"], w["since"]), ("abnormal", "wedged", NOW - 400))
 
+    def test_a_dead_worker_the_pool_gave_up_on_reads_not_answering_not_offline(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=hs.HEARTBEAT_STALE_S + 30)
+        self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {
+            WID: {"consecutive": 351, "escalated": True, "first_detected_at": NOW - 600}}})
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["motion"], w["condition"], w["reason"], w["since"]),
+                         (False, "unknown", "abnormal", "not-answering", NOW - 600))
+
     def test_a_fresh_pool_sample_without_escalation_gives_no_opinion(self):
         self.ws.worker()
         self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {
