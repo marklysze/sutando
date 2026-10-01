@@ -372,6 +372,20 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 st, *_ = compose_state(_TURN_A.replace("✻ ", glyph + " "), "unknown", True, prev_pane=_TURN_A)
                 self.assertEqual(st, "hung")
 
+    def test_a_real_captured_turn_reads_as_in_flight_and_its_glyph_cycle_is_not_motion(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
+                            "pane-claude-turn-in-flight.txt")
+        with open(path, encoding="utf-8") as f:
+            real = f.read()
+        self.assertTrue(_mod.cli_wedge.frame_working(real))
+        cycled = real.replace("✢ Transmogrifying…", "✻ Transmogrifying…")
+        self.assertNotEqual(cycled, real)
+        st, *_ = compose_state(cycled, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "hung")
+        grown = real.replace("⏺\n", "⏺ Rain on the roof,\n")
+        st, *_ = compose_state(grown, "unknown", True, prev_pane=real)
+        self.assertEqual(st, "running")
+
     def test_a_changing_pane_without_a_turn_in_flight_stays_hung(self):
         st, *_ = compose_state("Running step 4...", "unknown", True, prev_pane="Running step 3...")
         self.assertEqual(st, "hung")
