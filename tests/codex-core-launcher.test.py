@@ -220,8 +220,13 @@ exit 0
         except OSError:
             shutil.rmtree(self.tmp.name, ignore_errors=True)
 
+    # Every fake tmux answers the notifier's window lookup: the core has one window, index 0.
+    _CORE_WINDOW = 'for _a in "$@"; do [ "$_a" = list-windows ] && { echo 0; exit 0; }; done\n'
+
     def _write_exe(self, name, body):
         path = self.bin / name
+        if name == "tmux" and body.startswith("#!/bin/bash\n"):
+            body = body.replace("#!/bin/bash\n", "#!/bin/bash\n" + self._CORE_WINDOW, 1)
         path.write_text(body)
         path.chmod(0o755)
 
@@ -857,10 +862,10 @@ exit 0
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self._tmux_calls()
-        self.assertIn("send-keys -t sutando-core:0 -l -- Sutando task ready: task-123.txt", calls)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
         self.assertIn("/tasks/task-123.txt", calls)
-        self.assertIn("send-keys -t sutando-core:0 C-m", calls)
+        self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
 
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"
@@ -1715,7 +1720,7 @@ exit 0
             "\\033[1m›\\033[0m \\033[2mAsk Codex to do anything\\033[0m\\n"
             "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\\n")
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertIn("send-keys -t sutando-core:0 -l -- Sutando task ready: task-owner.txt", calls)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-owner.txt", calls)
         self.assertTrue(done.exists())
 
     def test_managed_notifier_holds_while_a_real_picker_is_open(self):

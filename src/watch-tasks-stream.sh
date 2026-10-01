@@ -976,7 +976,11 @@ TMUX_SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 _tmux_wake() {
   # Poke the idle CLI session so it processes the new task without waiting
   # for the next 5-min proactive-loop cron tick (sutando-skills#27 / #1289).
-  tmux -S "$TMUX_SOCK" send-keys -t "$TMUX_SESSION" '[watcher-ping]' Enter 2>/dev/null || true
+  # The core's lowest window, exactly: a bare name prefix-matches `<session>-watcher`.
+  local idx
+  idx="$(tmux -S "$TMUX_SOCK" list-windows -t "=$TMUX_SESSION" -F '#{window_index}' 2>/dev/null | sort -n | head -1)"
+  [ -n "$idx" ] || return 0
+  tmux -S "$TMUX_SOCK" send-keys -t "=$TMUX_SESSION:$idx" '[watcher-ping]' Enter 2>/dev/null || true
 }
 
 # Clean up on exit:

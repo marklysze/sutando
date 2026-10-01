@@ -484,18 +484,17 @@ def gateway_alive(app_data, state_dir=None):
 
 
 def capture(socket, session):
-    try:
-        out = subprocess.run(["tmux", "-S", socket, "capture-pane", "-p", "-t", f"={session}:0"],
-                             capture_output=True, text=True, timeout=8)
-        return out.stdout if out.returncode == 0 else None
-    except Exception:
-        return None
+    target = cli_wedge.core_target(socket, session)
+    return cli_wedge.capture_pane(socket, target) if target else None
 
 
 def send_keys(socket, session, key):
     """Type one key into the core pane. True only when tmux accepted it."""
+    target = cli_wedge.core_target(socket, session)
+    if not target:
+        return False
     try:
-        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", f"={session}:0", key],
+        r = subprocess.run(["tmux", "-S", socket, "send-keys", "-t", target, key],
                            capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:

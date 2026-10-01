@@ -372,6 +372,13 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
                 st, *_ = compose_state(_TURN_A.replace("✻ ", glyph + " "), "unknown", True, prev_pane=_TURN_A)
                 self.assertEqual(st, "hung")
 
+    def test_a_hyphenated_spinner_verb_cycling_its_glyph_is_still_hung(self):
+        prev = _TURN_A.replace("Perambulating", "Dilly-dallying")
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(prev.replace("✻ ", glyph + " "), "unknown", True, prev_pane=prev)
+                self.assertEqual(st, "hung")
+
     def test_a_real_captured_turn_reads_as_in_flight_and_its_glyph_cycle_is_not_motion(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures",
                             "pane-claude-turn-in-flight.txt")
@@ -921,7 +928,8 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n" + script + "\n")
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+                    + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
 
@@ -932,7 +940,7 @@ class TestSendKeys(unittest.TestCase):
             self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:0", "Enter"])
+                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
@@ -942,7 +950,8 @@ class TestSendKeys(unittest.TestCase):
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
-        with patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=sutando-core:0"), \
+                patch.object(_mod.subprocess, "run", side_effect=OSError("no tmux")):
             self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
 
 
@@ -1032,20 +1041,53 @@ class TestMainOnce(unittest.TestCase):
             with open(out) as f:
                 self.assertEqual(json.load(f)["state"], "crashed")
 
-    def test_capture_and_keys_target_the_session_exactly(self):
+    def test_capture_reads_the_core_on_a_base_index_1_host(self):
+        import shutil
         import subprocess
+        import tempfile
+        import time
+        tmux = shutil.which("tmux")
+        if tmux is None:
+            self.skipTest("tmux not installed")
+        with tempfile.TemporaryDirectory() as td:
+            conf, sock = os.path.join(td, "base1.conf"), os.path.join(td, "sock")
+            with open(conf, "w") as f:
+                f.write("set -g base-index 1\n")
+            subprocess.run([tmux, "-f", conf, "-S", sock, "new-session", "-d", "-s", "sutando-core",
+                            "printf 'core pane here\\n'; sleep 60"], check=True)
+            try:
+                frame = ""
+                for _ in range(20):
+                    frame = _mod.capture(sock, "sutando-core") or ""
+                    if "core pane here" in frame:
+                        break
+                    time.sleep(0.1)
+                self.assertIn("core pane here", frame)
+            finally:
+                subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
+
+    def test_capture_and_keys_target_the_lowest_window_exactly(self):
+        from unittest.mock import patch
         seen = []
 
         class R:
             returncode, stdout = 0, ""
-        orig = subprocess.run
-        subprocess.run = lambda argv, **k: seen.append(argv) or R()
-        try:
-            _mod.capture("s.sock", "seat")
-            _mod.send_keys("s.sock", "seat", "Enter")
-        finally:
-            subprocess.run = orig
-        self.assertEqual([a[a.index("-t") + 1] for a in seen], ["=seat:0", "=seat:0"])
+        with patch.object(_mod.cli_wedge, "core_target", return_value="=seat:1") as target, \
+                patch.object(_mod.cli_wedge, "capture_pane", return_value="frame") as cap, \
+                patch.object(_mod.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or R()):
+            self.assertEqual(_mod.capture("s.sock", "seat"), "frame")
+            self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
+        self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
+        cap.assert_called_once_with("s.sock", "=seat:1")
+        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+
+    def test_no_core_window_means_no_capture_and_no_keys(self):
+        from unittest.mock import patch
+        with patch.object(_mod.cli_wedge, "core_target", return_value=None), \
+                patch.object(_mod.subprocess, "run") as run:
+            self.assertIsNone(_mod.capture("s.sock", "seat"))
+            self.assertFalse(_mod.send_keys("s.sock", "seat", "Enter"))
+        run.assert_not_called()
 
     def test_once_blocked_prompt_debounces_on_first_tick(self):
         """A fresh gate with --stable 2 must NOT escalate on the first tick — the
