@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
 import gateway_serving
+import pool_suspension
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
 
@@ -324,19 +325,12 @@ def _instance(ws: Path, now: float):
 
 
 def _suspended(ws: Path):
-    """{reason, at} while the worker pool is suspended, else None. A marker that is not a
-    record still suspends, as the pool reads it."""
+    """{reason, at} while the worker pool is suspended, else None."""
     try:
-        text = (ws / "state" / "pool-suspended").read_text().strip()
+        rec = pool_suspension.read(ws)
     except OSError:
         return None
-    try:
-        rec = json.loads(text)
-    except ValueError:
-        rec = None
-    if not isinstance(rec, dict):
-        return {"reason": text or "suspended", "at": None}
-    return {"reason": rec.get("reason"), "at": rec.get("at")}
+    return {"reason": rec["reason"], "at": rec["at"]} if rec else None
 
 
 def _session(path):

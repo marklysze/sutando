@@ -2640,7 +2640,7 @@ def _health_row(agent: dict) -> dict:
     """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
     row = {k: agent.get(k) for k in HEALTH_FIELDS}
     if row["reason"] is not None:
-        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40] or None
+        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40].strip("-") or None
     return row
 
 
@@ -2666,7 +2666,20 @@ def _suspended_row(value) -> "dict | None":
         return None
     reason = _health_row({"reason": value.get("reason")})["reason"]
     at = value.get("at")
-    return {"reason": reason or "suspended", "at": at if isinstance(at, (int, float)) else None}
+    numeric = isinstance(at, (int, float)) and not isinstance(at, bool)
+    return {"reason": reason or "suspended", "at": at if numeric else None}
+
+
+def _profile_host_id() -> str:
+    """The host's stable label: gethostname() drifts with the network (a DHCP lease renames
+    it). The monorepo src/ is put on the path first, so the label never depends on call order."""
+    src = _monorepo_src("util_paths.py")
+    if src and src not in sys.path:
+        sys.path.insert(0, src)
+    try:
+        return _stable_host_label()
+    except OSError:
+        return "unknown-host"
 
 
 def _maybe_push_workers_snapshot(record) -> bool:
@@ -2689,7 +2702,8 @@ def _maybe_push_workers_snapshot(record) -> bool:
     if body is not base:
         # Health changes between advertisements, so it joins the change signal.
         identity += ":" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
-    fresh = _workers_pushed_at is not None and _now() - _workers_pushed_at < WORKERS_REFRESH_S
+    # Only a body carrying health has the broker's 120 s staleness; others keep the 600 s re-push.
+    fresh = body is base or (_workers_pushed_at is not None and _now() - _workers_pushed_at < WORKERS_REFRESH_S)
     if identity == _workers_pushed_identity and fresh:
         return False
     try:
@@ -2727,9 +2741,8 @@ def _build_agent_profile(workers: "dict") -> "dict":
     AVAILABLE: the broker REPLACES the profile document, so this function must
     never be reached with a map it could not read."""
     name = (os.environ.get("SUTANDO_DISPLAY_NAME") or "Sutando").strip()
-    # The host's stable label: gethostname() drifts with the network (a DHCP lease renames it).
     return {"display": {"name": name},
-            "host": {"host_id": _stable_host_label(), "kind": "local"},
+            "host": {"host_id": _profile_host_id(), "kind": "local"},
             "workers": workers}
 
 

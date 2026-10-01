@@ -157,8 +157,8 @@ Sutando checkout around it sends neither field.
 ### `POST /v1/workers` *(optional)*
 
 The worker pool this gateway fronts, pushed when the local advertisement's
-content changes and re-sent at least every 60 s (see below), so a relay that
-restarted with an empty copy heals without an operator. Sent only when the gateway finds a readable
+content changes and re-sent unchanged every 600 s (every 20 s when it carries
+health, see below), so a relay that restarted with an empty copy heals without an operator. Sent only when the gateway finds a readable
 advertisement; a gateway with no pool never calls it.
 
 ```
@@ -178,10 +178,11 @@ row (the heartbeat's shape) and a top-level `suspended: {"reason", "at"} | null`
 set while the owner has quit the app and the pool is paused. A health change
 pushes the report again even when the advertisement has not changed.
 
-The report is also re-sent, changed or not, whenever the last one is 20 s old,
-checked between polls. That keeps gaps under 60 s: the broker requires a report
-at least every 60 s and marks worker rows stale 120 s after the last report it
-received.
+A report carrying health is also re-sent, changed or not, whenever the last one
+is 20 s old, checked between polls. That keeps gaps under 60 s: the broker requires
+a health report at least every 60 s and marks worker rows stale 120 s after the
+last one it received. A body without health (the legacy snapshot, or a standalone
+sparrow with no health snapshot) keeps the 600 s re-send.
 
 ### `PUT /v1/agents/<mxid>/profile` *(optional)*
 
