@@ -95,6 +95,8 @@ class Rows(unittest.TestCase):
         self.assertEqual(rgb._health_row(agent("core", "core", reason="x" * 60))["reason"], "x" * 40)
         self.assertIsNone(rgb._health_row(agent("core", "core", reason="!!!"))["reason"])
         self.assertIsNone(rgb._health_row(agent("core", "core"))["reason"])
+        cut = rgb._health_row(agent("core", "core", reason="a" * 39 + " b"))["reason"]
+        self.assertEqual(cut, "a" * 39)
 
     def test_core_health_is_the_core_row_or_none(self):
         self.assertIsNone(rgb._core_health(None))
@@ -118,6 +120,7 @@ class Rows(unittest.TestCase):
         self.assertRegex(row["reason"], r"^[a-z0-9-]{1,40}$")
         self.assertIsNone(row["at"])
         self.assertEqual(rgb._suspended_row({"reason": "!!!", "at": 5}), {"reason": "suspended", "at": 5})
+        self.assertEqual(rgb._suspended_row({"reason": True, "at": True}), {"reason": "true", "at": None})
 
     def test_the_legacy_body_and_a_missing_snapshot_pass_through(self):
         self.assertIs(rgb._with_health(LEGACY, snap()), LEGACY)
