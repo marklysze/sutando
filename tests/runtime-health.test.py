@@ -335,7 +335,7 @@ try:
         check("_gateway_running: unconfigured host -> None", rh._gateway_running() is None)
     finally:
         rh._gateway_configured = _ogc
-    check("real _pane_text returns a str", isinstance(rh._pane_text(), str))
+    check("real _pane_text: no session on the socket -> empty", rh._pane_text() == "")
     check("real _resolve_workspace returns a path", rh._resolve_workspace(REPO).startswith("/"))
     d = rh.derive()
     check("real derive: offline on bogus socket", d["health"] == "offline")
@@ -345,6 +345,32 @@ try:
 finally:
     rh.TMUX_SOCKET = _orig_socket
     rh._tmux_socket = _orig_tmux_socket
+
+# 6b) The real pane read against a real core session: capture-pane needs a pane target, and a
+#     bare `=session` is refused by tmux, which would silently read every pane as "".
+_tmux = shutil.which("tmux")
+if _tmux is None:
+    print("  skip  real _pane_text against a scratch session (tmux not installed)")
+else:
+    _td = tempfile.mkdtemp()
+    _sock = os.path.join(_td, "sock")
+    subprocess.run([_tmux, "-S", _sock, "new-session", "-d", "-s", rh.SESSION,
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    subprocess.run([_tmux, "-S", _sock, "new-session", "-d", "-s", rh.SESSION + "-watcher",
+                    "printf 'watcher pane\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock
+    try:
+        for _ in range(20):
+            _pane = rh._pane_text()
+            if "Please run /login" in _pane:
+                break
+            time.sleep(0.1)
+        check("real _pane_text returns the core pane's own text", "Please run /login" in _pane
+              and "watcher pane" not in _pane)
+        check("real _pane_text feeds needs_login", rh.needs_login(_pane))
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock, "kill-server"], check=False)
 
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a

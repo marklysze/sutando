@@ -54,7 +54,7 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 | `id`, `role` | `core`, or a worker id with role `worker` |
 | `label` | the worker's roster label; `null` when it is only the id |
 | `session` | the tmux session to open for this agent, as its beat file (core) or supervisor file names it; `null` when no file names one. Never guessed |
-| `alive` | `true` beat fresh, `false` beat stale, `null` no beat file (see [Liveness](#liveness)) |
+| `alive` | `true` beat fresh, `false` beat stale or the supervisor saw the session crash, `null` no beat file |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
 | `reason` | why it is abnormal (see [Reasons](#reasons)); `null` otherwise |
@@ -71,7 +71,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 
 | Source | File | Freshness |
 |---|---|---|
-| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness |
+| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness. A `crashed` verdict is ignored when a fresh beat written after it recorded a live core pane (its `pid` is the core's, not the beat writer's `heartbeat_pid`) |
 | `cli_wedge` | `state/cli-wedge/window.jsonl`, classified with `cli_wedge.classify_window` | 180 s for health, 30 s for motion |
 | `heartbeat` | `state/cores/<host>.alive` mtime | 90 s |
 | `activity` | tail (256 KB) of `state/agent-activity.jsonl`, plus result files | 120 s since the task's last row |
@@ -143,14 +143,19 @@ state as the reason. `retired` workers are left out of the response.
 
 1. **Offline wins outright.** If any source says `offline`, the agent is `unknown · abnormal ·
    offline`, whatever else it says. A dead agent's files keep their last words (a supervisor
-   file left at `idle-ready`), and those say nothing about now.
+   file left at `idle-ready`), and those say nothing about now. The one exception: when a fresh
+   pool sample says it gave up on the worker, the reason is `not-answering`, since that needs a
+   person and a plain `offline` does not.
 2. **Abnormal beats healthy.** Condition is `abnormal` if any source says so, else `healthy` if
    any says so, else `unknown`.
 3. **The first abnormal source names the reason**, in the source order above. So the
    supervisor's `needs-login` outranks a `cli_wedge` `retry-loop`.
 4. **Moving beats idle.** Motion is `moving` if any source says so, else `idle` if any says so,
    else `unknown`.
-5. `alive` comes from the beat alone and is reported beside the verdict, not folded into it.
+5. `alive` comes from the beat and is reported beside the verdict, not folded into it. The
+   one exception is a `crashed` verdict that survives the freshness rules above, which makes
+   it `false`: a worker's inbox watcher, and the core's heartbeat writer, run apart from the
+   session and outlive it.
 
 ## Reasons
 
@@ -160,7 +165,7 @@ state as the reason. `retired` workers are left out of the response.
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
 | `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |
-| `hung` | supervisor | the session is there but the self-report stopped advancing |
+| `hung` | supervisor | the session is there but the self-report stopped advancing, and the pane shows neither the idle footer nor a turn in flight that changed since the last poll |
 | `crashed` | supervisor | the supervisor found no session |
 | `gateway-down` | supervisor | the core is up but its gateway bridge is not |
 | `retry-loop` | cli_wedge | the pane keeps moving while the CLI retries |
