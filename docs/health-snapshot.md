@@ -57,7 +57,7 @@ A `200` answer carries no CORS headers, so a web page on another origin cannot r
 | `alive` | `true` beat fresh, `false` beat stale, `null` no beat file (see [Liveness](#liveness)) |
 | `motion` | `idle`, `moving` or `unknown` |
 | `condition` | `healthy`, `abnormal` or `unknown` |
-| `reason` | why it is abnormal (see [Reasons](#reasons)); `null` otherwise |
+| `reason` | why it is abnormal (see [Reasons](#reasons)), or `suspended` for a worker the pool's suspension took down; `null` otherwise |
 | `since` | epoch seconds the abnormal state was first seen, when the source knows it |
 
 `view=full` adds `sources` to each agent: every input with its workspace-relative `path`,
@@ -151,12 +151,17 @@ state as the reason. `retired` workers are left out of the response.
 4. **Moving beats idle.** Motion is `moving` if any source says so, else `idle` if any says so,
    else `unknown`.
 5. `alive` comes from the beat alone and is reported beside the verdict, not folded into it.
+6. **A worker the suspension took down** (listed in `state/pool-suspended`'s `stopped`) reads
+   `alive: false · unknown · unknown`, reason `suspended`, since the suspension's `at`, whatever
+   its files say. A quit kills the tmux server outright, so no seat records its own end and its
+   beat stays fresh for up to 90 s. The pool's resume lifts this.
 
 ## Reasons
 
 | Reason | Source | Meaning |
 |---|---|---|
 | `offline` | beat | no beat for 90 s: the session is gone or its beat writer stopped |
+| `suspended` | `state/pool-suspended` | the app quit took this worker down; condition stays `unknown` and it never alerts |
 | `needs-login` | supervisor, cli_wedge | the CLI is at a sign-in prompt or refused a turn for lack of a login |
 | `login`, `permission`, `selection`, `turn-rejected`, `session-limit`, … | supervisor | a prompt that needs a person (the gate kind) |
 | `awaiting-input` | supervisor, cli_wedge | waiting for a person, kind unrecognised |

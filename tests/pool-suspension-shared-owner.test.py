@@ -82,10 +82,10 @@ class Delegation(Base):
     def test_health_snapshot_renders_the_readers_record(self):
         hs = _load("hs_susp", REPO / "src" / "health_snapshot.py")
         with mock.patch.object(hs.pool_suspension, "read", return_value=self.RECORD) as read:
-            self.assertEqual(hs._suspended(self.ws), {"reason": "from-the-reader", "at": 9})
+            self.assertEqual(hs.snapshot(self.ws, agent="core")["suspended"], {"reason": "from-the-reader", "at": 9})
         read.assert_called_once_with(self.ws)
         susp.path(self.ws).mkdir()
-        self.assertIsNone(hs._suspended(self.ws))
+        self.assertIsNone(hs._suspension(self.ws))
 
     def test_health_check_renders_the_readers_record(self):
         hc = _load("hc_susp", REPO / "src" / "health-check.py")
