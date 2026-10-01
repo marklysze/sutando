@@ -117,6 +117,31 @@ def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
     return {"was_suspended": was, "restarted": restarted}
 
 
+RESTART_RESULTS = {RECOVERED: "restarted", ALREADY_RUNNING: "already-running", PAUSED: "paused",
+                   SUSPENDED: "suspended"}
+
+
+def restart(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
+    """The owner's restart of one worker, outside the death ladder: an escalated worker comes
+    back now, and its ladder starts clean. Idempotent: a running worker is left alone."""
+    wi.worker_dir(workspace, worker_id)  # raises IdentityError for a malformed id
+    if suspension(workspace):
+        out = {"worker_id": worker_id, "outcome": SUSPENDED}
+    else:
+        out = recover(workspace, repo, worker_id, runner=runner, spawn=spawn)
+    result = RESTART_RESULTS.get(out["outcome"], "failed")
+    detail = {k: v for k, v in out.items() if k not in ("worker_id", "outcome")}
+    if result in ("restarted", "already-running"):
+        state = sup.load_state(workspace)
+        sup.save_state(workspace, replace(state, workers={
+            w: e for w, e in state.workers.items() if w != worker_id}))
+        detail["supervisor"] = ensure_supervisor(workspace, repo, worker_id, runner=runner)["outcome"]
+        detail["input_watch"] = ensure_input_watch(workspace, repo, worker_id, runner=runner)["outcome"]
+    elif result == "failed":
+        detail["outcome"] = out["outcome"]
+    return {"worker_id": worker_id, "result": result, "detail": detail}
+
+
 def _last_run(workspace, worker_id) -> dict:
     runs = wi.incarnations(workspace, worker_id)
     return runs[-1] if runs else {}
@@ -350,11 +375,21 @@ def main(argv=None) -> int:
                    help="stop remedying until --resume (the app writes this on a real quit)")
     p.add_argument("--resume", action="store_true",
                    help="lift a suspension, restart the workers it left dead, then sweep")
+    p.add_argument("--restart", metavar="WORKER_ID",
+                   help="the owner's restart of one worker, outside the death ladder")
     p.add_argument("--dry-run", action="store_true",
                    help="decide and report, but neither remedy nor advance the ladder")
     a = p.parse_args(argv)
-    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume))) != 1:
-        p.error("pass exactly one of --recipient, --sweep, --suspend or --resume")
+    if sum(map(bool, (a.recipient, a.sweep, a.suspend, a.resume, a.restart))) != 1:
+        p.error("pass exactly one of --recipient, --sweep, --suspend, --resume or --restart")
+    if a.restart:
+        try:
+            out = restart(a.workspace, a.repo, a.restart)
+        except (wi.IdentityError, ValueError) as e:
+            print(json.dumps({"worker_id": a.restart, "result": "failed", "detail": {"why": str(e)}}))
+            return 2
+        print(json.dumps(out, sort_keys=True))
+        return 1 if out["result"] == "failed" else 0
     if a.suspend:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0

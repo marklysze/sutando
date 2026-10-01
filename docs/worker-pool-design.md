@@ -563,6 +563,22 @@ pool_remedy.py --workspace WS --repo REPO --resume             # lifts it, then 
 - The marker never expires; only `--resume` lifts it. health-check warns (`pool-suspended`) when it is still present while a core is running. It is separate from the owner's
   per-worker `paused` marker, which the host must not use.
 
+**Owner restart.** Once the ladder escalates, sweeps only report that worker. The owner brings
+it back with one command, which an app may put behind a button (the click is the authorisation):
+
+```
+pool_remedy.py --workspace WS --repo REPO --restart <worker-id>
+```
+
+- It prints one JSON line, `{"worker_id", "result", "detail"}`. `result` is `restarted`,
+  `already-running`, `paused`, `suspended` or `failed`. It exits 0 except for `failed` (1),
+  and an invalid id (2).
+- It is idempotent. A running worker is left alone, a paused worker and a suspended pool are
+  not restarted, and a failure names why in `detail`.
+- `restarted` and `already-running` clear that worker's ladder evidence, so it starts clean,
+  and ensure its inbox supervisor and input watcher at once rather than on the next sweep.
+  Any other result leaves the ladder as it was.
+
 ### Stage 1 — single-core delivery, no routing
 
 **No luggage.** New code on `main`, written to this document, against what `main`
