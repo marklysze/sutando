@@ -505,7 +505,7 @@ def _refresh_station(workspace, *, now=None, ttl=_STATION_TTL,
 
 
 def _pane_text():
-    rc, out = _run(["tmux", "-S", _tmux_socket(), "capture-pane", "-p", "-t", f"={SESSION}"])
+    rc, out = _run(["tmux", "-S", _tmux_socket(), "capture-pane", "-p", "-t", f"={SESSION}:0"])
     return out if rc == 0 else ""
 
 
