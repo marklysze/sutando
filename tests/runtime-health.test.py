@@ -372,6 +372,38 @@ else:
         rh._tmux_socket = _orig_tmux_socket
         subprocess.run([_tmux, "-S", _sock, "kill-server"], check=False)
 
+    # 6c) A host whose ~/.tmux.conf sets base-index 1: the core window is :1, not :0.
+    _conf = os.path.join(_td, "base1.conf")
+    with open(_conf, "w") as _fh:
+        _fh.write("set -g base-index 1\n")
+    _sock1 = os.path.join(_td, "sock1")
+    subprocess.run([_tmux, "-f", _conf, "-S", _sock1, "new-session", "-d", "-s", rh.SESSION,
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock1
+    try:
+        for _ in range(20):
+            _pane = rh._pane_text()
+            if "Please run /login" in _pane:
+                break
+            time.sleep(0.1)
+        check("real _pane_text reads the core on a base-index-1 host", "Please run /login" in _pane)
+        check("real _pane_text feeds needs_login on a base-index-1 host", rh.needs_login(_pane))
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock1, "kill-server"], check=False)
+
+    # 6d) Only the watcher lives: the core is gone, and its pane must not be read as the core's.
+    _sock2 = os.path.join(_td, "sock2")
+    subprocess.run([_tmux, "-S", _sock2, "new-session", "-d", "-s", rh.SESSION + "-watcher",
+                    "printf 'Please run /login\\n'; sleep 60"], check=True)
+    rh._tmux_socket = lambda: _sock2
+    try:
+        time.sleep(0.3)
+        check("real _pane_text never reads the watcher when the core is gone", rh._pane_text() == "")
+    finally:
+        rh._tmux_socket = _orig_tmux_socket
+        subprocess.run([_tmux, "-S", _sock2, "kill-server"], check=False)
+
 # 7) Defensive branches (the degrade-not-crash paths).
 # A command that cannot execute returns rc None (UNKNOWN — distinct from a
 # command that ran and returned non-zero) so a probe outage is never counted as
