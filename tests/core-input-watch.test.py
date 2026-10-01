@@ -366,6 +366,12 @@ class TestMovingTurnIsNotHung(unittest.TestCase):
         st, *_ = compose_state(_TURN_A_TICKED, "unknown", True, prev_pane=_TURN_A)
         self.assertEqual(st, "hung")
 
+    def test_only_the_spinner_glyph_cycling_is_still_hung(self):
+        for glyph in "✶✳✢·✽*":
+            with self.subTest(glyph=glyph):
+                st, *_ = compose_state(_TURN_A.replace("✻ ", glyph + " "), "unknown", True, prev_pane=_TURN_A)
+                self.assertEqual(st, "hung")
+
     def test_a_changing_pane_without_a_turn_in_flight_stays_hung(self):
         st, *_ = compose_state("Running step 4...", "unknown", True, prev_pane="Running step 3...")
         self.assertEqual(st, "hung")
