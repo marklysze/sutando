@@ -102,7 +102,7 @@ _VOLATILE: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b\d+(?:\.\d+)?%"), "<pct>"),
     (re.compile(r"\b(attempt|retry|retries|try|line|col|iteration|round|turn)\s+#?\d+\b", re.IGNORECASE), r"\1 #"),
     # The CLI cycles its spinner line's leading glyph within one turn ("✢ Hatching…" → "✻ Hatching…").
-    (re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗·*]\s+(?=[A-Z][A-Za-z]+(?:…|\.\.\.))"), r"\1<spin> "),
+    (re.compile(r"^(\s*)[✻✶✳✢✽✺✹✷✸✦✧∗·*]\s+(?=[A-Z][A-Za-z-]+(?:…|\.\.\.))"), r"\1<spin> "),
     (re.compile(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷◐◓◑◒◴◷◶◵]"), "<spin>"),
     (re.compile(r"(?:\.\s?){2,}|…+"), "<dots>"),
     (re.compile(r"[─━═]{2,}"), "<rule>"),

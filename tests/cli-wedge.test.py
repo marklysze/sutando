@@ -59,6 +59,12 @@ class Normalization(unittest.TestCase):
         self.assertEqual(len({w.state_id(f) for f in frames}), 1)
         self.assertNotEqual(w.state_id("✻ Hatching… (9s)"), w.state_id("✻ Cooking… (9s)"))
 
+    def test_a_hyphenated_spinner_verb_cycles_its_glyph_without_a_new_state(self):
+        for verb in ("Dilly-dallying", "Re-ticulating", "Topsy-turvying"):
+            with self.subTest(verb=verb):
+                frames = [f"{g} {verb}… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+                self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+
     def test_a_markdown_bullet_is_content_not_a_spinner(self):
         self.assertNotEqual(w.state_id("* Fix the parser\n"), w.state_id("· Fix the parser\n"))
         self.assertIn("* Fix the parser", w.normalize("* Fix the parser"))
