@@ -324,13 +324,23 @@ def _instance(ws: Path, now: float):
     return ids.pop() if len(ids) == 1 else None
 
 
-def _suspended(ws: Path):
-    """{reason, at} while the worker pool is suspended, else None."""
+def _suspension(ws: Path):
     try:
-        rec = pool_suspension.read(ws)
+        return pool_suspension.read(ws)
     except OSError:
         return None
+
+
+def _suspended(rec):
+    """{reason, at} while the worker pool is suspended, else None."""
     return {"reason": rec["reason"], "at": rec["at"]} if rec else None
+
+
+def _stopped_by_suspension(row: dict, rec) -> dict:
+    """A worker the suspension took down is not alive, whatever its files last said:
+    a quit kills the tmux server before any seat can record its own end."""
+    return {**row, "alive": False, "motion": UNKNOWN, "condition": UNKNOWN,
+            "reason": "suspended", "since": rec["at"]}
 
 
 def _session(path):
@@ -347,6 +357,8 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
     ws = Path(workspace) if workspace is not None else Path(resolve_workspace())
     now = time.time() if now is None else now
     workers = _workers(ws)
+    suspension = _suspension(ws)
+    stopped = set(suspension["stopped"]) if suspension else set()
     activity = _activity_by_agent(ws, now, [w[0] for w in workers])
     agents = []
 
@@ -394,14 +406,15 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
             }
-            agents.append((_verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),
-                                     "alive": _alive(sources["watcher_beat"], sources["supervisor"])}, sources), sources))
+            row = _verdict({"id": wid, "role": "worker", "label": label, "session": _session(seat),
+                            "alive": _alive(sources["watcher_beat"], sources["supervisor"])}, sources)
+            agents.append((_stopped_by_suspension(row, suspension) if wid in stopped else row, sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else
                "ok" if agents and conditions == {HEALTHY} else "unknown")
     out = {"checked_at": round(now, 1), "instance": _instance(ws, now), "overall": overall,
-           "suspended": _suspended(ws),
+           "suspended": _suspended(suspension),
            "agents": [a if view == "summary" else {**a, "sources": s} for a, s in agents]}
     return out
 

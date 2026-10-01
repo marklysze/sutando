@@ -460,6 +460,19 @@ class InstanceSessionSuspended(Base):
                            name=f"core-supervisor.sutando-worker-{WID}.json")
         self.assertEqual(worker()["session"], f"sutando-worker-{WID}")
 
+    def test_a_worker_the_suspension_took_down_is_not_alive_whatever_its_files_say(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("idle-ready", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=10)
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": [WID]})
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["motion"], w["condition"], w["reason"], w["since"]),
+                         (False, "unknown", "unknown", "suspended", NOW - 3))
+        self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": NOW - 3, "stopped": []})
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "healthy")
+
     def test_suspended_reads_the_pool_marker(self):
         self.assertIsNone(self.snap()["suspended"])
         self.ws.json("state/pool-suspended", {"reason": "app-quit", "at": 5, "stopped": [WID]})
