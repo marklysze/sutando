@@ -113,6 +113,17 @@ def _heartbeat_source(ws: Path, now: float, path: Path | None = None) -> dict:
     return {**src, "value": "fresh", "opinion": None}
 
 
+def _core_seen_since(ws: Path, supervisor: dict, heartbeat: dict) -> bool:
+    """True when a fresh beat written after a `crashed` verdict saw a live core pane: the
+    beat records the core's pid only when tmux shows one, else its own pid."""
+    if ((supervisor.get("opinion") or {}).get("reason") != "crashed" or heartbeat.get("value") != "fresh"
+            or supervisor["age_s"] is None or supervisor["age_s"] <= heartbeat["age_s"]):
+        return False
+    beat, _ = _read_json(ws / heartbeat["path"])
+    return (isinstance(beat, dict) and isinstance(beat.get("pid"), int)
+            and beat.get("pid") != beat.get("heartbeat_pid"))
+
+
 def _status_source(ws: Path, now: float) -> dict:
     path = Path(status_read_path("core-status.json", ws))
     value, mtime = _read_json(path)
@@ -307,10 +318,15 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
     agents = []
 
     if agent in ("all", "core"):
+        supervisor = _supervisor_source(Path(status_read_path("core-supervisor.json", ws)), ws, now)
+        heartbeat = _heartbeat_source(ws, now)
+        if _core_seen_since(ws, supervisor, heartbeat):
+            supervisor = {**supervisor, "value": {**(supervisor["value"] or {}), "superseded": True},
+                          "opinion": None}
         sources = {
-            "supervisor": _supervisor_source(Path(status_read_path("core-supervisor.json", ws)), ws, now),
+            "supervisor": supervisor,
             "cli_wedge": _wedge_source(ws, now),
-            "heartbeat": _heartbeat_source(ws, now),
+            "heartbeat": heartbeat,
             "activity": _activity_source("core", activity, now),
             "self_report": _status_source(ws, now),
         }

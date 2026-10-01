@@ -65,7 +65,7 @@ Listed in the order they are consulted; the order matters when two sources disag
 
 | Source | File | Freshness |
 |---|---|---|
-| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness |
+| `supervisor` | `state/core-supervisor.json` (written by `core-input-watch.py` on each state change) | none: written on change only, so its age is not staleness. A `crashed` verdict is ignored when a fresh beat written after it recorded a live core pane (its `pid` is the core's, not the beat writer's `heartbeat_pid`) |
 | `cli_wedge` | `state/cli-wedge/window.jsonl`, classified with `cli_wedge.classify_window` | 180 s for health, 30 s for motion |
 | `heartbeat` | `state/cores/<host>.alive` mtime | 90 s |
 | `activity` | tail (256 KB) of `state/agent-activity.jsonl`, plus result files | 120 s since the task's last row |
@@ -147,8 +147,9 @@ state as the reason. `retired` workers are left out of the response.
 4. **Moving beats idle.** Motion is `moving` if any source says so, else `idle` if any says so,
    else `unknown`.
 5. `alive` comes from the beat and is reported beside the verdict, not folded into it. The
-   one exception is a current `crashed` verdict, which makes it `false`: a worker's inbox
-   watcher, and the core's heartbeat writer, run apart from the session and outlive it.
+   one exception is a `crashed` verdict that survives the freshness rules above, which makes
+   it `false`: a worker's inbox watcher, and the core's heartbeat writer, run apart from the
+   session and outlive it.
 
 ## Reasons
 

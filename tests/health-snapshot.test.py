@@ -278,6 +278,24 @@ class Workers(Base):
         c = self.core()
         self.assertEqual((c["alive"], c["condition"], c["reason"]), (False, "abnormal", "crashed"))
 
+    def test_a_crashed_core_verdict_a_later_beat_contradicts_is_dropped(self):
+        self.ws.supervisor("crashed", age=600)
+        self.ws.json(f"state/cores/{HOST}.alive", {"pid": 4242, "heartbeat_pid": 99}, age=5)
+        c = self.core(view="full")
+        self.assertEqual((c["alive"], c["reason"]), (True, None))
+        self.assertTrue(c["sources"]["supervisor"]["value"]["superseded"])
+
+    def test_a_crashed_core_verdict_stands_when_the_beat_saw_no_core_pane(self):
+        self.ws.supervisor("crashed", age=600)
+        self.ws.json(f"state/cores/{HOST}.alive", {"pid": 99, "heartbeat_pid": 99}, age=5)
+        c = self.core()
+        self.assertEqual((c["alive"], c["reason"]), (False, "crashed"))
+
+    def test_a_crashed_core_verdict_newer_than_the_beat_stands(self):
+        self.ws.json(f"state/cores/{HOST}.alive", {"pid": 4242, "heartbeat_pid": 99}, age=20)
+        self.ws.supervisor("crashed", age=3)
+        self.assertEqual(self.core()["reason"], "crashed")
+
     def test_alive_follows_the_beat_before_any_screen_verdict_exists(self):
         self.ws.worker()
         self.assertIsNone(self.snap(agent="workers")["agents"][0]["alive"])
