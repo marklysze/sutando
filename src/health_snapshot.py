@@ -253,7 +253,8 @@ def _verdict(agent: dict, sources: dict) -> dict:
     if offline:
         # The pool giving up is fresher news about the same death, and it needs a person.
         dead = next((o for o in ops if o["reason"] == "not-answering"), offline)
-        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": dead["reason"], "since": dead["since"]}
+        return {**agent, "motion": UNKNOWN, "condition": ABNORMAL, "reason": dead["reason"],
+                "since": dead["since"] if dead["since"] is not None else offline["since"]}
     motions = {o["motion"] for o in ops if o["motion"]}
     bad = [o for o in ops if o["condition"] == ABNORMAL]
     good = [o for o in ops if o["condition"] == HEALTHY]
@@ -359,8 +360,10 @@ def snapshot(workspace=None, *, agent: str = "all", view: str = "summary", now=N
                                        _opinion(None, ABNORMAL, str(state)))},
                 "activity": _activity_source(wid, activity, now),
             }
+            # Only a verdict known to be this incarnation's may override the beat's alive.
+            current = sources["supervisor"] if started is not None else None
             agents.append((_verdict({"id": wid, "role": "worker", "label": label,
-                                     "alive": _alive(sources["watcher_beat"], sources["supervisor"])}, sources), sources))
+                                     "alive": _alive(sources["watcher_beat"], current)}, sources), sources))
 
     conditions = {a["condition"] for a, _ in agents}
     overall = ("attention" if ABNORMAL in conditions else

@@ -139,7 +139,8 @@ state as the reason. `retired` workers are left out of the response.
    offline`, whatever else it says. A dead agent's files keep their last words (a supervisor
    file left at `idle-ready`), and those say nothing about now. The one exception: when a fresh
    pool sample says it gave up on the worker, the reason is `not-answering`, since that needs a
-   person and a plain `offline` does not.
+   person and a plain `offline` does not. Its `since` is the pool's first detection, or the
+   beat's when the pool did not record one.
 2. **Abnormal beats healthy.** Condition is `abnormal` if any source says so, else `healthy` if
    any says so, else `unknown`.
 3. **The first abnormal source names the reason**, in the source order above. So the
@@ -149,7 +150,9 @@ state as the reason. `retired` workers are left out of the response.
 5. `alive` comes from the beat and is reported beside the verdict, not folded into it. The
    one exception is a `crashed` verdict that survives the freshness rules above, which makes
    it `false`: a worker's inbox watcher, and the core's heartbeat writer, run apart from the
-   session and outlive it.
+   session and outlive it. For a worker this needs its current incarnation to be readable:
+   without it the verdict cannot be shown to be this run's, so `alive` stays the beat's while
+   the condition still reads `crashed`.
 
 ## Reasons
 

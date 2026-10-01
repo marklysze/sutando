@@ -264,13 +264,28 @@ class Workers(Base):
         self.assertEqual((w["motion"], w["condition"], w["reason"]), ("unknown", "abnormal", "offline"))
         self.assertEqual(w["since"], NOW - hs.HEARTBEAT_STALE_S - 30)
 
+    def _incarnation(self, started_ago):
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - started_ago))
+        self.ws.json(f"state/workers/{WID}/current.json", {"incarnation_id": "b"})
+        self.ws.json(f"state/workers/{WID}/incarnations.json",
+                     {"incarnations": [{"incarnation_id": "b", "started_at": started}]})
+
     def test_a_seat_the_watcher_saw_end_is_crashed_while_the_inbox_beat_is_fresh(self):
         self.ws.worker()
+        self._incarnation(60)
         self.ws.touch(f"state/watchers/{WID}.alive", age=5)
         self.ws.supervisor("crashed", session=f"sutando-worker-{WID}",
                            name=f"core-supervisor.sutando-worker-{WID}.json", age=3)
         w = self.snap(agent="workers")["agents"][0]
         self.assertEqual((w["alive"], w["condition"], w["reason"]), (False, "abnormal", "crashed"))
+
+    def test_a_crashed_verdict_of_unknown_incarnation_cannot_override_a_fresh_beat(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=5)
+        self.ws.supervisor("crashed", session=f"sutando-worker-{WID}",
+                           name=f"core-supervisor.sutando-worker-{WID}.json", age=3)
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["alive"], w["condition"], w["reason"]), (True, "abnormal", "crashed"))
 
     def test_a_core_the_supervisor_saw_crash_is_not_alive_while_its_beat_is_fresh(self):
         self.ws.touch(f"state/cores/{HOST}.alive", age=5)
@@ -357,6 +372,14 @@ class Workers(Base):
         w = self.snap(agent="workers")["agents"][0]
         self.assertEqual((w["alive"], w["motion"], w["condition"], w["reason"], w["since"]),
                          (False, "unknown", "abnormal", "not-answering", NOW - 600))
+
+    def test_a_given_up_worker_without_a_first_detection_takes_the_beats_since(self):
+        self.ws.worker()
+        self.ws.touch(f"state/watchers/{WID}.alive", age=hs.HEARTBEAT_STALE_S + 30)
+        self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {
+            WID: {"consecutive": 9, "escalated": True}}})
+        w = self.snap(agent="workers")["agents"][0]
+        self.assertEqual((w["reason"], w["since"]), ("not-answering", NOW - hs.HEARTBEAT_STALE_S - 30))
 
     def test_a_fresh_pool_sample_without_escalation_gives_no_opinion(self):
         self.ws.worker()
