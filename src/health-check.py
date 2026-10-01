@@ -14665,13 +14665,14 @@ def _default_cron_nudge(
     env = _resolve_launch_env()
     try:
         has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", f"={session}"],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
+            # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
+            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
             env=env, capture_output=True, timeout=15,
         )
         return send.returncode == 0
