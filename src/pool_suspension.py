@@ -10,14 +10,19 @@ A marker that is not the JSON record still suspends; it just names no workers.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
 
 REL = Path("state") / "pool-suspended"
 DEFAULT_REASON = "suspended"
 
 
-def path(workspace) -> Path:
-    return Path(workspace) / REL
+def path(workspace=None) -> Path:
+    """The marker's path; `workspace=None` resolves through the one sanctioned helper."""
+    return Path(workspace if workspace is not None else resolve_workspace()) / REL
 
 
 def normalise(text: str) -> dict:
@@ -36,7 +41,7 @@ def normalise(text: str) -> dict:
     }
 
 
-def read(workspace) -> dict | None:
+def read(workspace=None) -> dict | None:
     """The normalised record, or None when the pool is not suspended. A marker that
     exists but cannot be read raises OSError: each reader decides what that means."""
     try:

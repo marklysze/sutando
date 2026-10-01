@@ -65,6 +65,11 @@ class Contract(Base):
         self.mark("")
         self.assertEqual(susp.read(self.ws), {"reason": "suspended", "at": None, "stopped": []})
 
+    def test_no_workspace_resolves_the_sanctioned_one(self):
+        with mock.patch.object(susp, "resolve_workspace", return_value=self.ws):
+            self.assertEqual(susp.path(), self.ws / "state" / "pool-suspended")
+            self.assertIsNone(susp.read())
+
     def test_an_unreadable_marker_raises_for_the_caller_to_judge(self):
         susp.path(self.ws).mkdir()
         with self.assertRaises(OSError):
