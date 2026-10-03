@@ -74,7 +74,7 @@ function harness(env, root = '/e/skills/claude-observer/plugin') {
     process: { run: async (argv, init) => { runs.push({ argv, init }); if (release === 'hold') await new Promise((r) => { release = r; }); return { exitCode: 0 }; } },
   };
   return { $, handlers, timers, runs, tick: (ms) => { nowMs += ms; }, hold: () => { release = 'hold'; }, free: () => release && release !== 'hold' && release(),
-    fire: async (name, e = {}) => { let out; await handlers[name]($, e, async (x) => x); return out; },
+    fire: async (name, e = {}) => handlers[name]($, e, async (x) => x),
     flushTimers: async () => { const due = timers.splice(0); for (const t of due) await t.fn(); await new Promise((r) => setTimeout(r, 5)); } };
 }
 
@@ -116,7 +116,7 @@ test('a completed step records last_success_at and clears the condition', async 
   await h.fire('turn.start', { turnId: 't1' });
   await h.fire('classic.StopFailure', { error: 'rate_limit' });
   h.tick(1000);
-  await h.handlers['turn.step']({ ...h.$ }, { turnId: 't1' }, async function* () { return 1; }).next();
+  await h.handlers['turn.step']({ ...h.$ }, { turnId: 't1' }, async function* () { yield* []; return 1; }).next();
   await h.flushTimers();
   const rec = JSON.parse(h.runs.at(-1).init.stdin);
   assert.equal(rec.seat, WID);

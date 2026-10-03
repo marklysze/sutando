@@ -105,8 +105,6 @@ def _superseded(old, new) -> bool:
 def write(record, ws=None) -> bool:
     """Store a record; False when it is older than the same observer's stored one."""
     rec = validate(record)
-    if len(json.dumps(rec)) > MAX_BYTES:
-        raise ValueError("record too large")
     ws = Path(ws) if ws is not None else Path(resolve_workspace(migrate=False))
     path = record_path(ws, rec["seat"])
     with locked_file(path.with_name(f".{rec['seat']}.lock")):

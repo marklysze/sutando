@@ -270,10 +270,6 @@ def _observation(ws: Path, now: float, seat: str, session, started=None):
     return {**src, "value": value, "opinion": op}, rec
 
 
-def _observation_source(ws: Path, now: float, seat: str, session, started=None) -> dict:
-    return _observation(ws, now, seat, session, started)[0]
-
-
 def _supersede(sources: dict, rec, now: float) -> dict:
     """A completed model request after a pane-derived claim disproves the claim."""
     if rec is None or rec["last_success_at"] is None:

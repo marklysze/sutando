@@ -2,6 +2,7 @@
 """runtime_observation: schema validation, ordering, lease, atomic publication and the write CLI."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -9,7 +10,9 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -151,6 +154,24 @@ class CliTests(Base):
             res = self.run_cli(bad)
             self.assertEqual(res.returncode, 2, bad[:20])
             self.assertIn("rejected", res.stderr)
+
+
+class CliInProcessTests(Base):
+    def main(self, stdin):
+        err = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), redirect_stderr(err):
+            code = ro.main(["write", "--workspace", str(self.ws)])
+        return code, err.getvalue()
+
+    def test_accept_stale_and_reject(self):
+        self.assertEqual(self.main(json.dumps(rec(seq=3))), (0, ""))
+        code, err = self.main(json.dumps(rec(seq=2)))
+        self.assertEqual(code, 0)
+        self.assertIn("stale", err)
+        for bad in ("not json", json.dumps(rec(reason="boom")), "x" * (ro.MAX_BYTES + 10)):
+            code, err = self.main(bad)
+            self.assertEqual(code, 2, bad[:20])
+            self.assertIn("rejected", err)
 
 
 if __name__ == "__main__":
