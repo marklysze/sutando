@@ -125,6 +125,24 @@ test('a completed step records last_success_at and clears the condition', async 
   assert(rec.last_success_at > 0);
 });
 
+test('subagent turns neither change the record nor leak into the main loop', async () => {
+  const h = await boot({ SUTANDO_CORE_SESSION: '1', SUTANDO_TMUX_SESSION: 'sutando-core' });
+  await h.fire('turn.start', { turnId: 'main' });
+  await h.fire('classic.StopFailure', { error: 'authentication_failed' });
+  await h.flushTimers();
+  const before = JSON.parse(h.runs.at(-1).init.stdin);
+  h.tick(1000);
+  await h.fire('turn.start', { turnId: 'sub', agentId: 'agent-1' });
+  await h.handlers['turn.step']({ ...h.$ }, { turnId: 'sub', agentId: 'agent-1' }, async function* () { yield* []; return 1; }).next();
+  await h.fire('turn.complete', { turnId: 'sub', agentId: 'agent-1', reason: 'answer' });
+  await h.flushTimers();
+  const after = JSON.parse(h.runs.at(-1).init.stdin);
+  for (const k of ['seq', 'phase', 'condition', 'reason', 'condition_since', 'last_success_at']) assert.deepEqual(after[k], before[k], k);
+  await h.handlers['turn.step']({ ...h.$ }, { turnId: 'sub' }, async function* () { yield* []; return 1; }).next();
+  await h.flushTimers();
+  assert.equal(JSON.parse(h.runs.at(-1).init.stdin).last_success_at, null, 'the subagent turn id was never registered as main');
+});
+
 test('a change during a flush schedules another, never two at once', async () => {
   const h = await boot({ SUTANDO_CORE_SESSION: '1' });
   h.hold();

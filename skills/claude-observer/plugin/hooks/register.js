@@ -193,6 +193,8 @@ export function register(on) {
     return next(e);
   });
   on('turn.start', async ($, e, next) => {
+    // Subagent runs raise no turn.start today; refuse one anyway so it can never pass as the main loop.
+    if (e.agentId) return next(e);
     mainTurns.add(e.turnId);
     await observe($, {phase: 'req', motion: 'mov'});
     return next(e);
