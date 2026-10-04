@@ -79,6 +79,8 @@ def validate(record) -> dict:
         if record.get(key) not in allowed:
             raise ValueError(f"bad {key}")
         out[key] = record[key]
+    if (out["condition"] == "abnormal") != (out["reason"] is not None):
+        raise ValueError("reason is required exactly when abnormal")
     return out
 
 

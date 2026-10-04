@@ -60,6 +60,13 @@ class ValidateTests(Base):
                               condition="abnormal", reason="needs-login"))
         self.assertEqual((out["seat"], out["reason"]), (WID, "needs-login"))
 
+    def test_reason_is_present_exactly_when_abnormal(self):
+        for bad in (rec(condition="abnormal", reason=None), rec(condition="healthy", reason="api-error"),
+                    rec(condition="unknown", reason="needs-login")):
+            with self.assertRaises(ValueError):
+                ro.validate(bad)
+        self.assertEqual(ro.validate(rec(condition="abnormal", reason="api-error"))["reason"], "api-error")
+
     def test_non_object_rejected(self):
         for bad in (None, [], "x", 3):
             with self.assertRaises(ValueError):

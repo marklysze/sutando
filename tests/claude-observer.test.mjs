@@ -143,6 +143,38 @@ test('subagent turns neither change the record nor leak into the main loop', asy
   assert.equal(JSON.parse(h.runs.at(-1).init.stdin).last_success_at, null, 'the subagent turn id was never registered as main');
 });
 
+test('an unclassified failure is api-error, never abnormal without a reason', async () => {
+  const h = await boot({ SUTANDO_CORE_SESSION: '1' });
+  await h.fire('turn.start', { turnId: 't1' });
+  await h.handlers['turn.step']({ ...h.$ }, { turnId: 't1' }, async function* () { yield* []; return 1; }).next();
+  await h.fire('turn.complete', { turnId: 't1', reason: 'error' });
+  await h.flushTimers();
+  const rec = JSON.parse(h.runs.at(-1).init.stdin);
+  assert.deepEqual([rec.condition, rec.reason, rec.phase], ['abnormal', 'api-error', 'failed']);
+  await h.fire('classic.StopFailure', { error: 'model_not_found' });
+  await h.flushTimers();
+  assert.equal(JSON.parse(h.runs.at(-1).init.stdin).reason, 'api-error');
+});
+
+test('a tool running answers a permission wait; subagent compaction is ignored', async () => {
+  const h = await boot({ SUTANDO_CORE_SESSION: '1' });
+  await h.fire('turn.start', { turnId: 't1' });
+  await h.fire('classic.PermissionRequest', {});
+  await h.flushTimers();
+  assert.equal(JSON.parse(h.runs.at(-1).init.stdin).reason, 'permission');
+  await h.handlers['tool.call']({ ...h.$ }, { tool: 'Bash' }, async () => {
+    await h.flushTimers();
+    const during = JSON.parse(h.runs.at(-1).init.stdin);
+    assert.deepEqual([during.phase, during.condition, during.reason], ['tool', 'healthy', null]);
+    return {};
+  });
+  const n = h.runs.length;
+  await h.fire('classic.PreCompact', { agent_id: 'sub' });
+  await h.flushTimers();
+  assert.notEqual(JSON.parse(h.runs.at(-1).init.stdin).phase, 'compacting');
+  assert(h.runs.length >= n);
+});
+
 test('a change during a flush schedules another, never two at once', async () => {
   const h = await boot({ SUTANDO_CORE_SESSION: '1' });
   h.hold();

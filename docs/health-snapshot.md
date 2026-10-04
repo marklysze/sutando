@@ -197,8 +197,12 @@ dropped (its value gains `"superseded_by": "observation"`) if it is abnormal, it
 `retry-loop`, the pool and roster states, and `suspended` stand regardless, and `alive` is
 untouched.
 
-Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record,
-so the source is empty and the verdict is exactly what the other sources say.
+A record is abnormal exactly when it carries a reason; the writer rejects anything else. The core
+has no incarnation record, so for it only the session match and the lease apply.
+
+Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record:
+their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains
+an empty `observation` source.
 
 ## Reasons
 

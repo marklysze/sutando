@@ -15,7 +15,7 @@ const WRITE_TIMEOUT_MS = 5000;
 const PHASE_NAME = {req: 'requesting', tool: 'tool', idle: 'idle', fail: 'failed', wait: 'waiting', cmp: 'compacting', unk: 'unknown'};
 const MOTION_NAME = {mov: 'moving', idle: 'idle', unk: 'unknown'};
 const CONDITION_NAME = {ok: 'healthy', bad: 'abnormal', unk: 'unknown'};
-const REASON_NAME = {auth: 'needs-login', quota: 'quota-limit', funds: 'out-of-credits', retry: 'api-error', perm: 'permission', input: 'awaiting-input', '-': null};
+const REASON_NAME = {auth: 'needs-login', quota: 'quota-limit', funds: 'out-of-credits', retry: 'api-error', perm: 'permission', input: 'awaiting-input'};
 
 // Record-side state; the band's own `seq` and `stamp` are separate and unchanged.
 let recSeq = 0;
@@ -102,7 +102,7 @@ export function buildRecord(s) {
     phase: PHASE_NAME[s.phase] ?? 'unknown',
     motion: MOTION_NAME[s.motion] ?? 'unknown',
     condition: CONDITION_NAME[s.condition] ?? 'unknown',
-    reason: REASON_NAME[s.reason] ?? null,
+    reason: s.condition === 'bad' ? (REASON_NAME[s.reason] ?? 'api-error') : null,
   };
 }
 
@@ -210,7 +210,8 @@ export function register(on) {
   });
   on('tool.call', async ($, e, next) => {
     if (e.agentId) return next(e);
-    await observe($, {phase: 'tool', motion: 'mov'});
+    const answered = condition === 'bad' && (reason === 'perm' || reason === 'input');
+    await observe($, answered ? {phase: 'tool', motion: 'mov', condition: 'ok', reason: '-'} : {phase: 'tool', motion: 'mov'});
     try {
       return await next(e);
     } finally {
@@ -238,11 +239,11 @@ export function register(on) {
     return next(e);
   });
   on('classic.PreCompact', async ($, e, next) => {
-    await observe($, {phase: 'cmp', motion: 'mov'});
+    if (!e.agent_id) await observe($, {phase: 'cmp', motion: 'mov'});
     return next(e);
   });
   on('classic.PostCompact', async ($, e, next) => {
-    await observe($, {phase: 'idle', motion: 'idle'});
+    if (!e.agent_id) await observe($, {phase: 'idle', motion: 'idle'});
     return next(e);
   });
   on('ui.render', {component: 'AbovePrompt'}, async ($, e, next) => {
