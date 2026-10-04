@@ -671,6 +671,12 @@ class Observation(Base):
         self.obs(last_success_at=NOW - 1)
         self.assertEqual(self.core()["reason"], "retry-loop")
 
+    def test_a_claim_with_no_time_is_never_superseded(self):
+        claim = {"path": "x", "age_s": None, "value": {"kind": "provider-limit"},
+                 "opinion": hs._opinion("idle", hs.ABNORMAL, "quota-limit", None)}
+        out = hs._supersede({"cli_wedge": claim}, {"last_success_at": NOW - 1}, NOW)
+        self.assertEqual(out["cli_wedge"], claim)
+
     def test_worker_pool_and_roster_states_are_not_superseded(self):
         self.worker_seat()
         self.ws.json("state/pool-supervision.json", {"last_sample_at": NOW - 60, "workers": {

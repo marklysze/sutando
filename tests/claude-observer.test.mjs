@@ -59,10 +59,11 @@ test('buildRecord maps band vocabulary to schema 1', async () => {
   }
 });
 
-function harness(env, root = '/e/skills/claude-observer/plugin') {
+function harness(env, root = '/e/skills/claude-observer/plugin', python = '/py/bin/python3\n') {
   const handlers = {};
   const timers = [];
   const runs = [];
+  const resolves = [];
   let nowMs = 1_790_000_000_000;
   let release = null;
   const $ = {
@@ -71,16 +72,18 @@ function harness(env, root = '/e/skills/claude-observer/plugin') {
     plugin: { root },
     session: { id: async () => 'claude-session-1' },
     ui: { invalidate() {} },
-    process: { run: async (argv, init) => { runs.push({ argv, init }); if (release === 'hold') await new Promise((r) => { release = r; }); return { exitCode: 0 }; } },
+    process: { run: async (argv, init) => {
+      if (argv[0] === 'bash') { resolves.push(argv); return { exitCode: python === null ? 1 : 0, stdout: python || '', stderr: '' }; }
+      runs.push({ argv, init }); if (release === 'hold') await new Promise((r) => { release = r; }); return { exitCode: 0 }; } },
   };
-  return { $, handlers, timers, runs, tick: (ms) => { nowMs += ms; }, hold: () => { release = 'hold'; }, free: () => release && release !== 'hold' && release(),
+  return { $, handlers, timers, runs, resolves, tick: (ms) => { nowMs += ms; }, hold: () => { release = 'hold'; }, free: () => release && release !== 'hold' && release(),
     fire: async (name, e = {}) => handlers[name]($, e, async (x) => x),
     flushTimers: async () => { const due = timers.splice(0); for (const t of due) await t.fn(); await new Promise((r) => setTimeout(r, 5)); } };
 }
 
-async function boot(env, root) {
+async function boot(env, root, python) {
   const { register } = await load();
-  const h = harness(env, root);
+  const h = harness(env, root, python);
   register((name, a, b) => { h.handlers[name + (typeof a === 'object' ? ':' + a.component : '')] = b || a; });
   await h.fire('session.start');
   return h;
@@ -96,7 +99,8 @@ test('a core seat writes debounced records through the engine CLI and heartbeats
   await h.flushTimers();
   assert.equal(h.runs.length, 1);
   const { argv, init } = h.runs[0];
-  assert.deepEqual(argv, ['python3', '/e/src/runtime_observation.py', 'write', '--workspace', '/ws']);
+  assert.deepEqual(argv, ['/py/bin/python3', '/e/src/runtime_observation.py', 'write', '--workspace', '/ws']);
+  assert.deepEqual(h.resolves, [['bash', '-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', '/e']]);
   assert.equal(init.timeoutMs, 5000);
   const rec = JSON.parse(init.stdin);
   assert.deepEqual([rec.seat, rec.session, rec.phase, rec.condition, rec.reason, rec.claude_session_id],
@@ -139,8 +143,9 @@ test('subagent turns neither change the record nor leak into the main loop', asy
   const after = JSON.parse(h.runs.at(-1).init.stdin);
   for (const k of ['seq', 'phase', 'condition', 'reason', 'condition_since', 'last_success_at']) assert.deepEqual(after[k], before[k], k);
   await h.handlers['turn.step']({ ...h.$ }, { turnId: 'sub' }, async function* () { yield* []; return 1; }).next();
+  await h.handlers['turn.step']({ ...h.$ }, { turnId: 'main', agentId: 'agent-1' }, async function* () { yield* []; return 1; }).next();
   await h.flushTimers();
-  assert.equal(JSON.parse(h.runs.at(-1).init.stdin).last_success_at, null, 'the subagent turn id was never registered as main');
+  assert.equal(JSON.parse(h.runs.at(-1).init.stdin).last_success_at, null, 'no subagent step counts as a main-loop success');
 });
 
 test('an unclassified failure is api-error, never abnormal without a reason', async () => {
@@ -202,4 +207,26 @@ test('guest sessions and failing writes never write or break events', async () =
   h.$.process.run = async () => { throw new Error('no python'); };
   await h.fire('turn.start', { turnId: 't1' });
   await h.flushTimers();
+});
+
+test('no resolvable python means no write, and the session carries on', async () => {
+  const h = await boot({ SUTANDO_CORE_SESSION: '1' }, undefined, null);
+  await h.fire('turn.start', { turnId: 't1' });
+  await h.flushTimers();
+  assert.equal(h.runs.length, 0);
+  assert(h.resolves.length >= 1);
+});
+
+test('the band is one label line and yields to an occupied slot', async () => {
+  const h = await boot({ SUTANDO_CORE_SESSION: '1' });
+  const render = h.handlers['ui.render:AbovePrompt'];
+  const props = { bodyColumns: 80, maxRows: 4, hasSurvey: false };
+  await h.fire('turn.start', { turnId: 't1' });
+  assert.deepEqual(await render(h.$, { props }, async () => null), { type: 'Text', children: ['Sutando: thinking'] });
+  await h.fire('classic.StopFailure', { error: 'authentication_failed' });
+  assert.deepEqual(await render(h.$, { props: { ...props, bodyColumns: 12 } }, async () => null), { type: 'Text', children: ['Sutando: nee'] });
+  const taken = { type: 'Text', children: ['engine'] };
+  assert.equal(await render(h.$, { props }, async () => taken), taken);
+  assert.equal(await render(h.$, { props: { ...props, hasSurvey: true } }, async () => null), null);
+  assert.equal(await render(h.$, { props: { ...props, maxRows: 0 } }, async () => null), null);
 });

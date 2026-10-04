@@ -198,7 +198,9 @@ dropped (its value gains `"superseded_by": "observation"`) if it is abnormal, it
 untouched.
 
 A record is abnormal exactly when it carries a reason; the writer rejects anything else. The core
-has no incarnation record, so for it only the session match and the lease apply.
+has no incarnation record, so for it only the session match and the lease apply. An observed
+failure does not age: a seat whose last request failed stays abnormal, its lease renewed, until a
+request completes or the observer stops.
 
 Seats with no observer (the Codex runtime, an older engine, the observer disabled) have no record:
 their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains

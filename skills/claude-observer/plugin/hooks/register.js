@@ -1,6 +1,4 @@
-// Main-loop observations drawn as the S2 band and, for core and pool seats, published as a runtime observation record.
-let seq = 1;
-let stamp = 0;
+// Main-loop observations drawn as a one-line band and, for core and pool seats, published as a runtime observation record.
 let phase = 'unk';
 let motion = 'unk';
 let condition = 'unk';
@@ -17,7 +15,6 @@ const MOTION_NAME = {mov: 'moving', idle: 'idle', unk: 'unknown'};
 const CONDITION_NAME = {ok: 'healthy', bad: 'abnormal', unk: 'unknown'};
 const REASON_NAME = {auth: 'needs-login', quota: 'quota-limit', funds: 'out-of-credits', retry: 'api-error', perm: 'permission', input: 'awaiting-input'};
 
-// Record-side state; the band's own `seq` and `stamp` are separate and unchanged.
 let recSeq = 0;
 let changedAt = 0;
 let conditionSince = null;
@@ -27,6 +24,7 @@ let observerId = '';
 let startedAt = 0;
 let claudeSessionId = null;
 let engineDir = '';
+let python = '';
 let workspaceDir = '';
 let initPromise = null;
 let dirty = false;
@@ -37,28 +35,6 @@ const AUTH_ERRORS = new Set(['authentication_failed', 'oauth_org_not_allowed', '
 const ERROR_REASON = {billing_error: 'funds', rate_limit: 'quota', overloaded: 'retry', server_error: 'retry'};
 const REASON_LABEL = {auth: 'needs login', quota: 'usage limit reached', funds: 'billing problem', retry: 'API unavailable', perm: 'waiting for permission', input: 'waiting for input'};
 const PHASE_LABEL = {req: 'thinking', tool: 'using a tool', idle: 'idle', cmp: 'compacting', unk: 'starting'};
-
-export function checksum(text) {
-  let hash = 2166136261;
-  for (const char of text) { hash ^= char.charCodeAt(0); hash = Math.imul(hash, 16777619); }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
-export function formatFrame(payload, token, revision, columns, maxRows) {
-  const data = payload + ';h=' + checksum(payload);
-  const q = revision.toString(36);
-  let count = 1;
-  let chunks = [];
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const capacity = columns - 1 - `S2:${token}:${q}:${count}/${count} `.length;
-    if (capacity < 1) return [];
-    chunks = data.match(new RegExp('.{1,' + capacity + '}', 'g'));
-    if (chunks.length === count) break;
-    count = chunks.length;
-  }
-  if (chunks.length !== count || count + 1 > Math.min(8, maxRows)) return [];
-  return chunks.map((chunk, index) => `S2:${token}:${q}:${index + 1}/${count} ${chunk}`);
-}
 
 export function errorReason(error) {
   return AUTH_ERRORS.has(error) ? 'auth' : (ERROR_REASON[error] || '-');
@@ -118,9 +94,11 @@ async function flush($) {
   inFlight = true;
   dirty = false;
   try {
+    python ||= await resolvePython($);
+    if (!python) return;
     const record = buildRecord({observerId, startedAt, seat: seat.seat, session: seat.session, claudeSessionId, seq: recSeq,
       changedAt, conditionSince, lastSuccessAt, heartbeatAt: (await $.clock.now()) / 1000, phase, motion, condition, reason});
-    const argv = ['python3', engineDir + '/src/runtime_observation.py', 'write'];
+    const argv = [python, engineDir + '/src/runtime_observation.py', 'write'];
     if (workspaceDir) argv.push('--workspace', workspaceDir);
     await $.process.run(argv, {stdin: JSON.stringify(record), timeoutMs: WRITE_TIMEOUT_MS});
   } catch {
@@ -129,6 +107,13 @@ async function flush($) {
     inFlight = false;
     if (dirty) schedule($);
   }
+}
+
+// The engine's own interpreter policy: a bare python3 can land on the macOS developer-tools stub.
+async function resolvePython($) {
+  const out = await $.process.run(['bash', '-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', engineDir],
+    {timeoutMs: WRITE_TIMEOUT_MS});
+  return out.exitCode === 0 ? out.stdout.trim() : '';
 }
 
 function schedule($) {
@@ -161,7 +146,7 @@ function ensureInit($) {
   return initPromise;
 }
 
-// Only a change stamps evidence time and bumps the revision; redraws never do.
+// Only a change stamps evidence time; redraws never do.
 async function observe($, change) {
   await ensureInit($);
   const [p, m, c, r] = [change.phase ?? phase, change.motion ?? motion, change.condition ?? condition, change.reason ?? reason];
@@ -169,8 +154,6 @@ async function observe($, change) {
   const nowMs = await $.clock.now();
   conditionSince = nextConditionSince({condition, reason}, {condition: c, reason: r}, conditionSince, nowMs / 1000);
   [phase, motion, condition, reason] = [p, m, c, r];
-  stamp = Math.floor(nowMs / 1000);
-  seq += 1;
   recSeq += 1;
   changedAt = nowMs / 1000;
   dirty = true;
@@ -188,7 +171,6 @@ async function markSuccess($) {
 
 export function register(on) {
   on('session.start', async ($, e, next) => {
-    stamp = Math.floor(await $.clock.now() / 1000);
     await ensureInit($);
     return next(e);
   });
@@ -200,7 +182,7 @@ export function register(on) {
     return next(e);
   });
   on('turn.step', async function* ($, e, next) {
-    if (!mainTurns.has(e.turnId)) return yield* next(e);
+    if (e.agentId || !mainTurns.has(e.turnId)) return yield* next(e);
     await observe($, {phase: 'req', motion: 'mov'});
     const result = yield* next(e);
     // A completed request is positive recovery from any earlier failure.
@@ -249,13 +231,8 @@ export function register(on) {
   on('ui.render', {component: 'AbovePrompt'}, async ($, e, next) => {
     const original = await next(e);
     if (e.props.hasSurvey) return original;
-    const width = Math.floor(e.props.bodyColumns);
-    const budget = Math.floor(e.props.maxRows);
-    const payload = `t=${stamp};l=30;p=${phase};m=${motion};c=${condition};r=${reason}`;
     if (original?.children?.length || original?.type === 'Text') return original;
-    const rows = formatFrame(payload, 'test', seq, width, budget);
-    if (!rows.length) return original;
-    const header = label(phase, condition, reason).slice(0, width);
-    return {type: 'Box', props: {flexDirection: 'column'}, children: [{type: 'Text', children: [header]}, ...rows.map(row => ({type: 'Text', children: [row]}))]};
+    if (Math.floor(e.props.maxRows) < 1) return original;
+    return {type: 'Text', children: [label(phase, condition, reason).slice(0, Math.floor(e.props.bodyColumns))]};
   });
 }
