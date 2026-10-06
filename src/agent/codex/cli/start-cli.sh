@@ -24,6 +24,7 @@ fi
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 WATCHER_SESSION="${SESSION}-watcher"
+OBSERVER_SESSION="${SESSION}-observer"
 
 EXTERNAL_HELPERS=""
 RECONCILE_SCHEDULES=1
@@ -290,6 +291,28 @@ ensure_task_notifier() {
     "${NOTIFIER_ENV_ARGS[@]}" bash "$NOTIFIER_SUPERVISOR"
 }
 
+# HealthStatus evidence for the core, read from the rollout file Codex holds open. The observer
+# exits once the core session is gone; a changed script restarts it like the notifier.
+ensure_codex_observer() {
+  local node_bin expected_version active_version
+  node_bin="$(command -v node 2>/dev/null)" || return 0
+  expected_version="$(cksum "$REPO/src/agent/codex/cli/codex-observer.mjs" | awk '{print $1 "-" $2}')"
+  if session_exists "$OBSERVER_SESSION"; then
+    active_version="$(
+      tmux -S "$TMUX_SOCKET" show-environment -t "=$OBSERVER_SESSION" \
+        SUTANDO_OBSERVER_VERSION 2>/dev/null \
+        | sed -n 's/^SUTANDO_OBSERVER_VERSION=//p' || true
+    )"
+    [ "$active_version" = "$expected_version" ] && return 0
+    tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
+  fi
+  local args=(--engine "$REPO" --tmux-socket "$TMUX_SOCKET" --session "$SESSION")
+  local ws
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] && args+=(--workspace "$ws")
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$OBSERVER_SESSION" -e "SUTANDO_OBSERVER_VERSION=$expected_version" \
+    "$node_bin" "$REPO/src/agent/codex/cli/codex-observer.mjs" "${args[@]}" 2>/dev/null || true
+}
+
 # Keep the same core-supervisor signal available for both runtimes. The
 # monitor's liveness derivation is tmux/session based; its prompt classifier is
 # best-effort and safely falls back to the generic running/idle/hung states for
@@ -428,6 +451,7 @@ check_external_helpers || exit 1
 
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
   # Hand the heartbeat over as well: ensure_core_heartbeat only starts one when none is running.
   _hb_py="$(heartbeat_python)"
@@ -443,12 +467,14 @@ elif session_exists "$SESSION" && [ "$(session_runtime)" != "codex" ]; then
   # attach a selected Codex launcher to an unknown/foreign canonical session.
   echo "Replacing unmarked or non-Codex $SESSION session."
   tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
+  tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
   tmux -S "$TMUX_SOCKET" kill-session -t "=$SESSION" 2>/dev/null || true
 fi
 
 if session_exists "$SESSION"; then
   apply_tmux_defaults
   ensure_task_notifier
+  ensure_codex_observer
   ensure_core_monitor
   ensure_core_heartbeat
   if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
@@ -558,6 +584,7 @@ if [ -t 1 ] && [ -z "${TMUX:-}" ]; then
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
+  ensure_codex_observer
   ensure_core_monitor
   ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
@@ -575,6 +602,7 @@ else
     echo "  ⚠ $SESSION did not come up within ~5s — sentinel NOT cleared, no core is serving." >&2
   fi
   ensure_task_notifier
+  ensure_codex_observer
   ensure_core_monitor
   ensure_core_heartbeat
   if [ "$VISIBLE" = 1 ]; then

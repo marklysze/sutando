@@ -1,0 +1,289 @@
+#!/usr/bin/env node
+// Read-only observer of the Codex core: follows the rollout file the core's process holds open
+// and publishes the core's runtime observation record.
+//
+//   node codex-observer.mjs --engine <repo> --tmux-socket <path> --session <core tmux session> [--workspace <dir>]
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+
+export const OBSERVER = 'codex-observer';
+export const VERSION = '0.1.0';
+const TICK_MS = 1000;
+const DISCOVER_EVERY = 10;
+const FLUSH_DELAY_MS = 250;
+const HEARTBEAT_MS = 15000;
+const RUN_TIMEOUT_MS = 5000;
+export const TAIL_BYTES = 256 * 1024;
+const TOOL_CALLS = new Set(['function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call', 'mcp_tool_call']);
+const TOOL_OUTPUTS = new Set(['function_call_output', 'custom_tool_call_output', 'local_shell_call_output', 'mcp_tool_call_output']);
+
+export function newState() {
+  return {phase: 'unknown', motion: 'unknown', condition: 'unknown', seq: 0, changedAt: 0, lastSuccessAt: null,
+    turnSucceeded: false};
+}
+
+function epoch(ts, fallback) {
+  const ms = Date.parse(ts);
+  return Number.isFinite(ms) ? ms / 1000 : fallback;
+}
+
+// One rollout line -> change, or null. The rollout records no failures, so this never reports
+// abnormal: a turn that ends without a completed response leaves the condition unknown.
+export function lineChange(state, line) {
+  const p = line?.payload || {};
+  if (line?.type === 'event_msg') {
+    if (p.type === 'task_started') return {phase: 'requesting', motion: 'moving', condition: 'unknown', turnSucceeded: false};
+    if (p.type === 'token_count' && p.info) return {success: true, condition: 'healthy', turnSucceeded: true};
+    if (p.type === 'task_complete') return {phase: 'idle', motion: 'idle', condition: state.turnSucceeded ? 'healthy' : 'unknown'};
+    if (p.type === 'turn_aborted') return {phase: 'idle', motion: 'idle'};
+    return null;
+  }
+  if (line?.type === 'response_item' && state.motion === 'moving') {
+    if (TOOL_CALLS.has(p.type)) return {phase: 'tool'};
+    if (TOOL_OUTPUTS.has(p.type)) return {phase: 'requesting'};
+  }
+  return null;
+}
+
+// Applies a change at `at` (epoch s); true when the record changed.
+export function apply(state, change, at) {
+  if (!change) return false;
+  let changed = false;
+  if (change.success) { state.lastSuccessAt = at; changed = true; }
+  if ('turnSucceeded' in change) state.turnSucceeded = change.turnSucceeded;
+  for (const key of ['phase', 'motion', 'condition']) {
+    if (change[key] !== undefined && change[key] !== state[key]) { state[key] = change[key]; state.changedAt = at; changed = true; }
+  }
+  if (changed) state.seq += 1;
+  return changed;
+}
+
+export function buildRecord(state, ident, now) {
+  return {
+    schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
+    observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
+    seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: null,
+    last_success_at: state.lastSuccessAt, heartbeat_at: now, phase: state.phase, motion: state.motion,
+    condition: state.condition, reason: null,
+  };
+}
+
+// The core's own rollout among those its processes hold open: the one top-level thread.
+// Subagents' rollouts name a parent; more than one top-level file means no opinion.
+export function pickRollout(metas) {
+  const top = metas.filter((m) => m && !m.parent_thread_id && !m.agent_path);
+  return top.length === 1 ? top[0].path : null;
+}
+
+export function descendants(rootPid, psText) {
+  const children = new Map();
+  for (const row of psText.split('\n')) {
+    const [pid, ppid] = row.trim().split(/\s+/).map(Number);
+    if (pid && ppid) children.set(ppid, [...(children.get(ppid) || []), pid]);
+  }
+  const out = [rootPid];
+  for (let i = 0; i < out.length; i++) out.push(...(children.get(out[i]) || []));
+  return out;
+}
+
+export function rolloutPaths(lsofText) {
+  return [...new Set(lsofText.split('\n').filter((l) => l.startsWith('n') && /\/rollout-[^/]*\.jsonl$/.test(l))
+    .map((l) => l.slice(1)))];
+}
+
+export class Observer {
+  constructor(opts, deps) {
+    this.opts = opts;
+    this.deps = deps;
+    this.state = newState();
+    this.target = null;
+    this.offset = 0;
+    this.rest = '';
+    this.ticks = 0;
+    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
+    this.dirty = false;
+    this.timer = null;
+    this.inFlight = false;
+    this.python = '';
+    this.metas = new Map();
+  }
+
+  // false once the core session is gone, so the caller can stop.
+  async discover() {
+    const panePid = await this.deps.panePid();
+    if (!panePid) { this.select(null); return false; }
+    const paths = await this.deps.openRollouts(panePid);
+    for (const p of paths) if (!this.metas.has(p)) this.metas.set(p, {...(await this.deps.readMeta(p)), path: p});
+    const metas = paths.map((p) => this.metas.get(p));
+    this.select(pickRollout(metas));
+    return true;
+  }
+
+  select(file) {
+    if (file === this.target) return;
+    this.target = file;
+    this.state = newState();
+    this.rest = '';
+    if (!file) return;
+    const {text, size} = this.deps.readTail(file, TAIL_BYTES);
+    this.offset = size;
+    // A tail read can start mid-line; that fragment fails to parse and is skipped.
+    this.feed(text);
+    this.markDirty();
+  }
+
+  follow() {
+    if (!this.target) return;
+    const chunk = this.deps.readFrom(this.target, this.offset);
+    if (!chunk) return;
+    this.offset += chunk.bytes;
+    this.feed(chunk.text);
+  }
+
+  feed(text) {
+    const lines = (this.rest + text).split('\n');
+    this.rest = lines.pop();
+    let changed = false;
+    for (const raw of lines) {
+      let line;
+      try { line = JSON.parse(raw); } catch { continue; }
+      changed = apply(this.state, lineChange(this.state, line), epoch(line.timestamp, this.deps.now())) || changed;
+    }
+    if (changed) this.markDirty();
+  }
+
+  async tick() {
+    if (this.ticks++ % DISCOVER_EVERY === 0 && !(await this.discover())) return false;
+    this.follow();
+    return true;
+  }
+
+  markDirty() {
+    this.dirty = true;
+    if (this.timer || !this.target) return;
+    this.timer = this.deps.after(FLUSH_DELAY_MS, () => { this.timer = null; this.flush(); });
+  }
+
+  heartbeat() {
+    if (this.target) this.markDirty();
+  }
+
+  async flush() {
+    if (this.inFlight || !this.target || !this.dirty) return;
+    this.inFlight = true;
+    this.dirty = false;
+    try {
+      this.python ||= await this.deps.resolvePython();
+      if (!this.python) return;
+      await this.deps.write(this.python, buildRecord(this.state, this.ident, this.deps.now()));
+    } catch {
+      // The record is best effort; its lease lapses into "no opinion".
+    } finally {
+      this.inFlight = false;
+      if (this.dirty) this.markDirty();
+    }
+  }
+}
+
+export function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    const key = argv[i]?.replace(/^--/, '');
+    if (!key || argv[i + 1] === undefined) throw new Error(`bad argument ${argv[i]}`);
+    out[key] = argv[i + 1];
+  }
+  for (const key of ['engine', 'tmux-socket', 'session']) if (!out[key]) throw new Error(`missing --${key}`);
+  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || ''};
+}
+
+function run(file, args, input) {
+  return new Promise((resolve) => {
+    const child = execFile(file, args, {timeout: RUN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024},
+      (err, stdout) => resolve(err ? null : stdout));
+    if (input !== undefined) child.stdin.end(input);
+  });
+}
+
+function readRange(file, start) {
+  const size = fs.statSync(file).size;
+  if (size <= start) return {buf: Buffer.alloc(0), size};
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    return {buf, size};
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// session_meta carries the base instructions, so the first line can run to hundreds of KB.
+function firstLine(file, limit = 4 * 1024 * 1024) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const parts = [];
+    const chunk = Buffer.alloc(256 * 1024);
+    for (let pos = 0; pos < limit;) {
+      const n = fs.readSync(fd, chunk, 0, chunk.length, pos);
+      if (!n) break;
+      const nl = chunk.subarray(0, n).indexOf(10);
+      parts.push(Buffer.from(chunk.subarray(0, nl < 0 ? n : nl)));
+      if (nl >= 0) break;
+      pos += n;
+    }
+    return Buffer.concat(parts).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export function fileDeps(opts) {
+  return {
+    now: () => Date.now() / 1000,
+    after: (ms, fn) => setTimeout(fn, ms),
+    panePid: async () => Number(((await run('tmux', ['-S', opts.tmuxSocket, 'list-panes', '-t', `=${opts.session}`,
+      '-F', '#{pane_pid}'])) || '').split('\n')[0]) || 0,
+    openRollouts: async (panePid) => {
+      const pids = descendants(panePid, (await run('ps', ['-A', '-o', 'pid=,ppid='])) || '');
+      return rolloutPaths((await run('lsof', ['-a', '-p', pids.join(','), '-Fn'])) || '');
+    },
+    readMeta: async (file) => {
+      try {
+        const first = JSON.parse(firstLine(file));
+        return first.type === 'session_meta' ? first.payload : null;
+      } catch { return null; }
+    },
+    readTail: (file, bytes) => {
+      const size = fs.statSync(file).size;
+      const {buf} = readRange(file, Math.max(0, size - bytes));
+      return {text: buf.toString('utf8'), size};
+    },
+    readFrom: (file, offset) => {
+      const {buf} = readRange(file, offset);
+      return buf.length ? {text: buf.toString('utf8'), bytes: buf.length} : null;
+    },
+    resolvePython: async () => ((await run('bash', ['-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', opts.engine])) || '').trim(),
+    write: (python, record) => {
+      const args = [path.join(opts.engine, 'src', 'runtime_observation.py'), 'write'];
+      if (opts.workspace) args.push('--workspace', opts.workspace);
+      return run(python, args, JSON.stringify(record));
+    },
+  };
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const observer = new Observer(opts, fileDeps(opts));
+  setInterval(() => observer.heartbeat(), HEARTBEAT_MS);
+  for (;;) {
+    let alive = true;
+    try { alive = await observer.tick(); } catch { /* one bad read is not the end of the core */ }
+    if (!alive) process.exit(0);
+    await new Promise((r) => setTimeout(r, TICK_MS));
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) main();

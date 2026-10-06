@@ -117,6 +117,7 @@ fi
 # non-Codex core, including upgrades from sessions that predate runtime markers.
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-watcher" 2>/dev/null || true
+  tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
 
 exec bash "$launcher" "$@"
