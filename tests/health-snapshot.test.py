@@ -679,19 +679,23 @@ class Observation(Base):
 
     def test_retry_loop_with_a_waiting_or_failed_observation_is_superseded(self):
         self.retry_loop()
-        for seq, phase in enumerate(("waiting", "failed"), 10):
-            self.obs(phase=phase, seq=seq)
-            self.assertEqual(self.core()["condition"], "healthy", phase)
+        for seq, (phase, reason) in enumerate((("waiting", "permission"), ("failed", "api-error")), 10):
+            self.obs(phase=phase, seq=seq, condition="abnormal", reason=reason, condition_since=NOW - 5)
+            c = self.core(view="full")
+            self.assertEqual((c["condition"], c["reason"]), ("abnormal", reason), phase)
+            self.assertEqual(c["sources"]["cli_wedge"]["value"]["superseded_by"], "observation", phase)
 
     def test_retry_loop_with_a_request_in_flight_and_no_newer_success_stands(self):
         self.retry_loop()
         self.obs(phase="requesting", motion="moving", last_success_at=NOW - 3600)
         self.assertEqual(self.core()["reason"], "retry-loop")
 
-    def test_retry_loop_with_a_success_newer_than_the_claim_is_superseded(self):
+    def test_a_newer_success_does_not_drop_a_retry_loop_in_flight(self):
         self.retry_loop()
         self.obs(phase="requesting", motion="moving", last_success_at=NOW - 1)
-        self.assertEqual(self.core()["condition"], "healthy")
+        c = self.core(view="full")
+        self.assertEqual(c["reason"], "retry-loop")
+        self.assertNotIn("superseded_by", c["sources"]["cli_wedge"]["value"])
 
     def test_retry_loop_with_no_observation_stands(self):
         self.retry_loop()
@@ -713,7 +717,7 @@ class Observation(Base):
         self.obs(phase="idle")
         self.assertEqual(self.core()["reason"], "quota-limit")
 
-    def test_a_claim_with_no_time_is_never_superseded(self):
+    def test_a_claim_with_no_time_is_never_superseded_by_a_success(self):
         claim = {"path": "x", "age_s": None, "value": {"kind": "provider-limit"},
                  "opinion": hs._opinion("idle", hs.ABNORMAL, "quota-limit", None)}
         out = hs._supersede({"cli_wedge": claim}, {"last_success_at": NOW - 1}, NOW)

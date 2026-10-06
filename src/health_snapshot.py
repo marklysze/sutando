@@ -287,9 +287,10 @@ def _supersede(sources: dict, rec, now: float) -> dict:
             None if src.get("age_s") is None else now - src["age_s"])
         newer_success = (rec["last_success_at"] is not None and claimed is not None
                          and claimed < rec["last_success_at"])
-        # A CLI retry loop needs a request in flight; an idle seat disproves it.
+        # A retry loop needs a request in flight. Its claim time is the window's run start, not
+        # when retry text appeared, so a newer success proves nothing about it.
         if name == "cli_wedge" and op["reason"] == "retry-loop":
-            drop = newer_success or rec["phase"] in RETRY_DISPROVING_PHASES
+            drop = rec["phase"] in RETRY_DISPROVING_PHASES
         else:
             drop = op["reason"] in PANE_SUPERSEDABLE and newer_success
         if drop:
