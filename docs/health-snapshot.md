@@ -193,9 +193,12 @@ the observation is valid and has `last_success_at`, a `supervisor` or `cli_wedge
 dropped (its value gains `"superseded_by": "observation"`) if it is abnormal, its reason is one of
 `needs-login`, `login`, `quota-limit`, `out-of-credits`, `session-limit`, `api-error`,
 `network-error`, and its claim time (`since`, else the source's mtime) is older than
-`last_success_at`. Nothing else is ever dropped: `crashed`, `hung`, `offline`, `gateway-down`,
-`retry-loop`, the pool and roster states, and `suspended` stand regardless, and `alive` is
-untouched.
+`last_success_at`. A `cli_wedge` `retry-loop` is also dropped when the record's `phase` is `idle`,
+`waiting` or `failed` (no model request in flight), or when `last_success_at` is newer than the
+claim; a loop in a `requesting`, `tool`, `compacting` or `unknown` phase with no newer success
+stands. Nothing else is ever dropped: `crashed`, `hung`, `offline`, `gateway-down`, the
+`supervisor`'s reasons outside that list, the pool and roster states, and `suspended` stand
+regardless, and `alive` is untouched.
 
 A record is abnormal exactly when it carries a reason; the writer rejects anything else. The core
 has no incarnation record, so for it only the session match and the lease apply. An observed
