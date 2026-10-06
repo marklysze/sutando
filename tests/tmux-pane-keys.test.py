@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""src/tmux-pane-keys.sh is the one way keys reach an agent pane: it leaves copy mode before
+typing and bounds each send. Pins that behaviour against a real tmux, the timeout, and that no
+other caller in src/, skills/ or scripts/ runs send-keys itself."""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HELPER = REPO / "src" / "tmux-pane-keys.sh"
+sys.path.insert(0, str(REPO / "src"))
+import tmux_pane_keys  # noqa: E402
+
+
+def run(*args, timeout=30):
+    return subprocess.run(["bash", str(HELPER), *args], capture_output=True, text=True, timeout=timeout)
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class RealTmux(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        self.sock = os.path.join(self.dir, "s")
+        self.view = os.path.join(self.dir, "v")
+        self.tmux("new-session", "-d", "-s", "core", "-x", "120", "-y", "30", "cat")
+        self.tmux("set-option", "-g", "mouse", "on")
+        self.tmux("set-window-option", "-g", "mode-keys", "emacs")
+        # A command-prompt only blocks when a client is attached to answer it.
+        subprocess.run(["tmux", "-S", self.view, "new-session", "-d", "-s", "v", "-x", "120", "-y", "30",
+                        f"env -u TMUX tmux -S {self.sock} attach -t core"], check=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not self.tmux("list-clients").stdout.strip():
+            time.sleep(0.1)
+
+    def tearDown(self):
+        for sock in (self.view, self.sock):
+            subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def tmux(self, *args):
+        return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True, timeout=10)
+
+    def in_mode(self):
+        return self.tmux("display-message", "-p", "-t", "=core:0", "#{pane_in_mode}").stdout.strip()
+
+    def test_a_pane_in_copy_mode_is_released_and_the_text_lands(self):
+        self.tmux("copy-mode", "-t", "=core:0")
+        self.assertEqual(self.in_mode(), "1")
+        start = time.monotonic()
+        r = run("-S", self.sock, "-t", "=core:0", "--", "-l", "--", "Sutando task ready")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - start, 3)
+        self.assertEqual(self.in_mode(), "0")
+        self.assertEqual(run("-S", self.sock, "-t", "=core:0", "--", "C-m").returncode, 0)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and "Sutando task ready" not in self.tmux("capture-pane", "-p", "-t", "=core:0").stdout:
+            time.sleep(0.1)
+        self.assertIn("Sutando task ready", self.tmux("capture-pane", "-p", "-t", "=core:0").stdout)
+
+    def test_without_the_helper_the_same_send_blocks(self):
+        # The control: plain send-keys into copy mode waits on "(jump to forward)".
+        self.tmux("copy-mode", "-t", "=core:0")
+        p = subprocess.Popen(["tmux", "-S", self.sock, "send-keys", "-t", "=core:0", "-l", "--", "Sutando"])
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                p.wait(timeout=2)
+        finally:
+            p.kill()
+            p.wait()
+
+
+class Timeout(unittest.TestCase):
+    def test_a_send_that_never_returns_fails_with_124_inside_the_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 0;; *send-keys*) exec sleep 30;; esac\n')
+            fake.chmod(0o755)
+            start = time.monotonic()
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=core:0", "--timeout", "1", "--", "-l", "--", "hi")
+            self.assertEqual(r.returncode, 124, r.stderr)
+            self.assertIn("timed out after 1s", r.stderr)
+            self.assertLess(time.monotonic() - start, 5)
+
+    def test_send_keys_status_passes_through_and_usage_is_2(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            log = Path(d) / "log"
+            fake.write_text(f'#!/bin/bash\necho "$*" >> {log}\ncase "$*" in *display-message*) echo 1;; *send-keys*) exit 3;; esac\n')
+            fake.chmod(0o755)
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--", "Enter")
+            self.assertEqual(r.returncode, 3)
+            self.assertEqual(log.read_text().splitlines()[1:], ["-S /x copy-mode -q -t =c:0", "-S /x send-keys -t =c:0 Enter"])
+        self.assertEqual(run("-S", "/x", "-t", "=c:0").returncode, 2)
+        self.assertEqual(run("-S", "/x", "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
+
+    def test_python_argv(self):
+        self.assertEqual(tmux_pane_keys.argv("/s", "=c:0", "Escape", tmux="/bin/tmux"),
+                         ["bash", str(HELPER), "--tmux", "/bin/tmux", "-S", "/s", "-t", "=c:0", "--", "Escape"])
+
+
+class OneSender(unittest.TestCase):
+    # A send names its pane with -t (or types with -l / -N); `bind ... send-keys -M` and prose do not.
+    CALL = re.compile(r"""send-keys["',]*\s+["']?-[tlN]\b""")
+
+    def test_no_other_code_runs_send_keys(self):
+        hits = []
+        for root in ("src", "skills", "scripts"):
+            for path in (REPO / root).rglob("*"):
+                if path.suffix not in (".sh", ".py", ".ts", ".mjs", ".js") or path == HELPER or "node_modules" in path.parts:
+                    continue
+                for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+                    code = line.split("#", 1)[0] if path.suffix in (".sh", ".py") else line.split("//", 1)[0]
+                    if self.CALL.search(code):
+                        hits.append(f"{path.relative_to(REPO)}:{n}: {line.strip()}")
+        self.assertEqual(hits, [], "send keys through src/tmux-pane-keys.sh:\n" + "\n".join(hits))
+
+
+if __name__ == "__main__":
+    unittest.main()

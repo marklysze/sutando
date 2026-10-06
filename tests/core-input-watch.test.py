@@ -1079,7 +1079,7 @@ class TestMainOnce(unittest.TestCase):
             self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
         self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
         cap.assert_called_once_with("s.sock", "=seat:1")
-        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+        self.assertEqual(seen, [__import__("tmux_pane_keys").argv("s.sock", "=seat:1", "Enter")])
 
     def test_no_core_window_means_no_capture_and_no_keys(self):
         from unittest.mock import patch

@@ -66,6 +66,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/start-cli.sh",
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
+            "src/tmux-pane-keys.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
             "src/agent/task-event-handler-lookup.sh",
@@ -939,6 +940,49 @@ exit 0
         self.assertNotIn("Related prior workstream context", calls)
         self.assertIn("/tasks/task-123.txt", calls)
         self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
+
+    def test_notifier_leaves_copy_mode_and_logs_before_each_submit(self):
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core")
+        # The core pane reports a mode (an owner scrolled it), as copy mode does.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+case "$*" in *pane_in_mode*) echo 1; exit 0;; esac
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertLess(calls.index("copy-mode -q -t =sutando-core:0"),
+                        calls.index("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt"))
+        self.assertIn("submitting task-123.txt: typing prompt (attempt 1)", result.stderr)
+        self.assertIn("submitting task-123.txt: C-m (attempt 1)", result.stderr)
+
+    def test_notifier_counts_a_hung_send_as_a_failed_attempt(self):
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   HANG_MARK=str(Path(self.tmp.name) / "hung-once"))
+        # The first typed prompt never returns, as send-keys does in copy mode; later ones land.
+        self._write_exe("tmux", '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+case "$*" in *"send-keys"*"-l --"*) [ -e "$HANG_MARK" ] || { touch "$HANG_MARK"; exec sleep 60; };; esac
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+[ "$3" = has-session ] && exit 0
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        start = time.monotonic()
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertIn("typing task-123.txt failed (rc 124); counted as a failed attempt", result.stderr)
+        self.assertIn("submitting task-123.txt: typing prompt (attempt 2)", result.stderr)
+        self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 2)
 
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"

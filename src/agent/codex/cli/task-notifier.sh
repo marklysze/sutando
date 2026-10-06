@@ -258,7 +258,9 @@ deliver_prompt() {
   fi
   while :; do
     target="$(core_target)" || { log_notifier "refusing to type $filename: no core window"; return 1; }
-    tmux -S "$TMUX_SOCKET" send-keys -t "$target" -l -- "$prompt"
+    log_notifier "submitting $filename: typing prompt (attempt $((type_tries + 1)))"
+    bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- -l -- "$prompt" \
+      || log_notifier "typing $filename failed (rc $?); counted as a failed attempt"
     stage_checks=0
     while [ "$stage_checks" -lt 4 ]; do
       sleep "$POLL_INTERVAL"
@@ -273,7 +275,9 @@ deliver_prompt() {
   done
   [ "$staged" = 1 ] && [ "$type_tries" -gt 0 ] \
     && log_notifier "prompt staged for $filename after $((type_tries + 1)) attempts"
-  target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
+  log_notifier "submitting $filename: C-m (attempt 1)"
+  target="$(core_target)" && { bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m \
+    || log_notifier "C-m for $filename failed (rc $?)"; }
   # Nothing observable staged: the submit is sent and unverifiable — never
   # re-press C-m blind into a live session.
   [ "$staged" = 1 ] || return 0
@@ -293,7 +297,8 @@ deliver_prompt() {
       return 0
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    target="$(core_target)" && tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-m
+    target="$(core_target)" && { bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m \
+      || log_notifier "C-m for $filename failed (rc $?)"; }
   done
 }
 

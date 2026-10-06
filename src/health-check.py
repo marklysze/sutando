@@ -76,6 +76,7 @@ import cron_task_id  # noqa: E402
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -14673,7 +14674,7 @@ def _default_cron_nudge(
             return False
         send = subprocess.run(
             # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
-            [tmux_bin, "-S", sock, "send-keys", "-t", f"={session}:", "/schedule-crons", "Enter"],
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
             env=env, capture_output=True, timeout=15,
         )
         return send.returncode == 0
