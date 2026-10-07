@@ -10,35 +10,62 @@ import {
 } from '../src/agent/codex/cli/codex-observer.mjs';
 
 const ev = (type, extra = {}, ts = '2026-10-06T02:57:50.000Z') => ({timestamp: ts, type: 'event_msg', payload: {type, ...extra}});
-const item = (type, ts = '2026-10-06T02:57:51.000Z') => ({timestamp: ts, type: 'response_item', payload: {type}});
+const item = (type, ts = '2026-10-06T02:57:51.000Z', extra = {}) => ({timestamp: ts, type: 'response_item', payload: {type, ...extra}});
+const said = (ts) => item('message', ts, {role: 'assistant'});
+const quota = {message: "You've hit your usage limit.", codex_error_info: 'usage_limit_exceeded'};
+const REPO = new URL('..', import.meta.url).pathname;
+// The repository's interpreter policy, never a bare python3 (the macOS developer-tools stub).
+const PY = execFileSync('bash', ['-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', REPO]).toString().trim();
+const writeRecord = (ws, rec) => execFileSync(PY, [REPO + 'src/runtime_observation.py', 'write', '--workspace', ws], {input: JSON.stringify(rec)});
 const run = (lines, state = newState()) => {
   for (const line of lines) apply(state, lineChange(state, line), Date.parse(line.timestamp) / 1000);
   return state;
 };
 
-test('a turn reads moving, a completed response healthy, its end idle', () => {
-  const s = run([ev('task_started'), item('function_call')]);
-  assert.deepEqual([s.phase, s.motion, s.condition], ['tool', 'moving', 'unknown']);
-  run([item('function_call_output'), ev('token_count', {info: {total_token_usage: {}}}, '2026-10-06T02:57:53.000Z')], s);
-  assert.deepEqual([s.phase, s.condition], ['requesting', 'healthy']);
+test('a turn reads moving, a model output healthy, its end idle', () => {
+  const s = run([ev('task_started')]);
+  assert.deepEqual([s.phase, s.motion, s.condition], ['requesting', 'moving', 'unknown']);
+  run([item('function_call', '2026-10-06T02:57:53.000Z')], s);
+  assert.deepEqual([s.phase, s.condition], ['tool', 'healthy']);
   assert.equal(s.lastSuccessAt, Date.parse('2026-10-06T02:57:53.000Z') / 1000);
-  run([ev('task_complete')], s);
+  run([item('function_call_output'), said(), ev('task_complete')], s);
   assert.deepEqual([s.phase, s.motion, s.condition], ['idle', 'idle', 'healthy']);
 });
 
-test('a turn that ends without a completed response is unknown, never abnormal', () => {
-  const s = run([ev('task_started'), ev('token_count', {info: {}}), ev('task_complete'), ev('task_started'),
-    ev('token_count', {info: null}), ev('task_complete')]);
-  assert.deepEqual([s.phase, s.motion, s.condition], ['idle', 'idle', 'unknown']);
+test('a token_count is not a success: a turn with no model output stays unknown', () => {
+  const s = run([ev('task_started'), ev('token_count', {info: {}}), item('message', undefined, {role: 'user'}), ev('task_complete')]);
+  assert.deepEqual([s.phase, s.motion, s.condition, s.lastSuccessAt], ['idle', 'idle', 'unknown', null]);
   assert.equal(buildRecord(s, {observerId: 'o', startedAt: 1, session: 's'}, 2).reason, null);
 });
 
-test('an aborted turn goes idle; tool items outside a turn and other lines change nothing', () => {
+test('a usage-limit failure after a success is abnormal quota-limit and keeps the earlier success time', () => {
+  const s = run([ev('task_started'), said('2026-10-06T02:57:51.000Z'), ev('task_complete'),
+    ev('task_started', {}, '2026-10-06T03:00:00.000Z'), ev('token_count', {info: {total_token_usage: {}}}, '2026-10-06T03:00:01.000Z'),
+    ev('task_complete', {error: quota}, '2026-10-06T03:00:01.000Z')]);
+  const r = buildRecord(s, {observerId: 'o', startedAt: 1, session: 's'}, 2);
+  assert.deepEqual([r.phase, r.motion, r.condition, r.reason], ['failed', 'idle', 'abnormal', 'quota-limit']);
+  assert.equal(r.last_success_at, Date.parse('2026-10-06T02:57:51.000Z') / 1000);
+  assert.equal(r.condition_since, Date.parse('2026-10-06T03:00:01.000Z') / 1000);
+  run([ev('task_started', {}, '2026-10-06T03:05:00.000Z')], s);
+  assert.equal(s.condition, 'abnormal', 'a new turn alone proves nothing');
+  run([said('2026-10-06T03:05:02.000Z')], s);
+  assert.deepEqual([s.condition, s.reason, s.conditionSince], ['healthy', null, null]);
+});
+
+test('completion errors map to the record reasons', () => {
+  const reasonOf = (info) => buildRecord(run([ev('task_started'), ev('task_complete', {error: {codex_error_info: info}})]),
+    {observerId: 'o', startedAt: 1, session: 's'}, 2).reason;
+  assert.equal(reasonOf('unauthorized'), 'needs-login');
+  assert.equal(reasonOf('session_budget_exceeded'), 'quota-limit');
+  assert.equal(reasonOf('server_overloaded'), 'api-error');
+  assert.equal(reasonOf({http_connection_failed: {http_status_code: 502}}), 'api-error');
+});
+
+test('an aborted turn goes idle; items outside a turn never move the phase', () => {
   const s = run([ev('task_started'), ev('turn_aborted')]);
   assert.deepEqual([s.phase, s.motion], ['idle', 'idle']);
-  const seq = s.seq;
-  run([item('function_call'), ev('agent_message'), {type: 'turn_context'}], s);
-  assert.equal(s.seq, seq);
+  run([item('function_call'), item('function_call_output'), ev('agent_message'), {type: 'turn_context'}], s);
+  assert.deepEqual([s.phase, s.motion], ['idle', 'idle']);
 });
 
 test('the record is schema 1 for the core seat', () => {
@@ -95,7 +122,7 @@ test('the observer follows the core rollout and writes through the resolved pyth
   assert.equal(f.writes.at(-1).py, '/py');
   assert.deepEqual([f.writes.at(-1).rec.phase, f.writes.at(-1).rec.motion], ['requesting', 'moving']);
   const done = JSON.stringify(ev('task_complete'));
-  files['/r/main'].text += jl(ev('token_count', {info: {}})) + done.slice(0, 5);
+  files['/r/main'].text += jl(said()) + done.slice(0, 5);
   await o.tick();
   await f.flush();
   assert.equal(f.writes.at(-1).rec.condition, 'healthy');
@@ -161,13 +188,12 @@ test('one discovery that finds no rollout keeps the target; a second drops it', 
 
 test('reselecting a rollout never lowers seq, so the real writer keeps accepting records', async () => {
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-ws-'));
-  const writer = new URL('../src/runtime_observation.py', import.meta.url).pathname;
   const stored = () => JSON.parse(fs.readFileSync(path.join(ws, 'state/runtime-observations/core.json'), 'utf8'));
   const busy = jl(...Array.from({length: 15}, (_, i) => ev(i % 2 ? 'task_complete' : 'task_started')));
   const files = {'/a': {meta: {}, text: busy}, '/b': {meta: {}, text: jl(ev('task_started'))}};
   const f = fake(files);
   f.deps.now = () => Date.now() / 1000;
-  f.deps.write = async (py, rec) => execFileSync('python3', [writer, 'write', '--workspace', ws], {input: JSON.stringify(rec)});
+  f.deps.write = async (py, rec) => writeRecord(ws, rec);
   f.deps.openRollouts = async () => ['/a'];
   const o = new Observer({session: 'sutando-core'}, f.deps);
   await o.discover();
@@ -222,4 +248,39 @@ test('fileDeps reads a long first line and file ranges', async () => {
   fs.appendFileSync(file, 'abc');
   assert.deepEqual(deps.readFrom(file, size), {text: 'abc', bytes: 3});
   fs.rmSync(dir, {recursive: true});
+});
+
+test('/health reads a usage-limit failure after a success as abnormal quota-limit', () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-health-'));
+  const now = Date.now() / 1000;
+  const at = (dt) => new Date((now + dt) * 1000).toISOString();
+  const s = run([ev('task_started', {}, at(-120)), said(at(-118)), ev('task_complete', {}, at(-117)),
+    ev('task_started', {}, at(-30)), ev('token_count', {info: {}}, at(-29)), ev('task_complete', {error: quota}, at(-29))]);
+  writeRecord(ws, buildRecord(s, {observerId: 'o'.repeat(16), startedAt: now - 300, session: 'sutando-core'}, now - 1));
+  const snap = JSON.parse(execFileSync(PY, [REPO + 'src/health_snapshot.py', '--workspace', ws, '--agent', 'core']).toString());
+  const core = snap.agents[0];
+  assert.deepEqual([core.condition, core.reason], ['abnormal', 'quota-limit']);
+  fs.rmSync(ws, {recursive: true});
+});
+
+test('discovery keeps only open rollouts, only their classification, and retries unreadable metadata', async () => {
+  const big = 'x'.repeat(600_000);
+  const metas = {'/main': {id: 'm', base_instructions: big}, '/sub': null};
+  const f = fake({'/main': {meta: null, text: jl(ev('task_started'))}, '/sub': {meta: null, text: ''}});
+  let reads = 0;
+  f.deps.readMeta = async (p) => { reads += 1; return metas[p]; };
+  f.deps.openRollouts = async () => ['/main', '/sub'];
+  const o = new Observer({session: 's'}, f.deps);
+  await o.discover();
+  assert.equal(o.target, '/main', 'an unreadable sibling is not a second top-level rollout');
+  assert.deepEqual([...o.metas.keys()], ['/main']);
+  assert.deepEqual(o.metas.get('/main'), {parent_thread_id: null, agent_path: null});
+  metas['/sub'] = {id: 's', parent_thread_id: 'm'};
+  await o.discover();
+  assert.deepEqual([...o.metas.keys()], ['/main', '/sub']);
+  assert.equal(o.target, '/main');
+  f.deps.openRollouts = async () => ['/main'];
+  await o.discover();
+  assert.deepEqual([...o.metas.keys()], ['/main'], 'closed rollouts are pruned');
+  assert.equal(reads, 3, 'a cached classification is not re-read; a failed read is');
 });

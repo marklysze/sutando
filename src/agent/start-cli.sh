@@ -113,6 +113,18 @@ if [ -n "$active_runtime" ] && [ "$active_runtime" != "$runtime" ] \
   set -- --restart "$@"
 fi
 
+# A restart the launcher will refuse must refuse here too, before any helper is reaped:
+# otherwise the still-running core keeps its pane but loses task intake and observation.
+. "$REPO/src/agent/restart-guard.sh"
+case "${1:-}" in
+  --restart|--force-restart)
+    if sutando_restart_guard_refuses "${SUTANDO_CORE_SESSION:-}"; then
+      sutando_restart_guard_explain
+      exit 1
+    fi
+    ;;
+esac
+
 # The Codex notifier is runtime-specific. Always reap it before launching a
 # non-Codex core, including upgrades from sessions that predate runtime markers.
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then

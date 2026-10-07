@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-// Read-only observer of the Codex core: follows the rollout file the core's process holds open
-// and publishes the core's runtime observation record.
-//
-//   node codex-observer.mjs --engine <repo> --tmux-socket <path> --session <core tmux session> [--workspace <dir>]
+// Read-only observer of the Codex core: publishes its runtime observation record from the rollout
+// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace].
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -21,8 +19,21 @@ const TOOL_CALLS = new Set(['function_call', 'custom_tool_call', 'local_shell_ca
 const TOOL_OUTPUTS = new Set(['function_call_output', 'custom_tool_call_output', 'local_shell_call_output', 'mcp_tool_call_output']);
 
 export function newState() {
-  return {phase: 'unknown', motion: 'unknown', condition: 'unknown', seq: 0, changedAt: 0, lastSuccessAt: null,
-    turnSucceeded: false};
+  return {phase: 'unknown', motion: 'unknown', condition: 'unknown', reason: null, seq: 0, changedAt: 0,
+    conditionSince: null, lastSuccessAt: null, turnSucceeded: false};
+}
+
+export function errorReason(error) {
+  const info = error?.codex_error_info;
+  if (info === 'unauthorized') return 'needs-login';
+  if (info === 'usage_limit_exceeded' || info === 'session_budget_exceeded') return 'quota-limit';
+  return 'api-error';
+}
+
+// Evidence a model request completed: an item the model produced. token_count is not: Codex
+// writes one from the session's running totals before returning a usage-limit failure.
+function modelOutput(p) {
+  return TOOL_CALLS.has(p.type) || p.type === 'reasoning' || (p.type === 'message' && p.role === 'assistant');
 }
 
 function epoch(ts, fallback) {
@@ -30,21 +41,27 @@ function epoch(ts, fallback) {
   return Number.isFinite(ms) ? ms / 1000 : fallback;
 }
 
-// One rollout line -> change, or null. The rollout records no failures, so this never reports
-// abnormal: a turn that ends without a completed response leaves the condition unknown.
+// One rollout line -> change, or null. A failure is the error on the turn's completion; it
+// stands until a model output proves a later request completed.
 export function lineChange(state, line) {
   const p = line?.payload || {};
   if (line?.type === 'event_msg') {
-    if (p.type === 'task_started') return {phase: 'requesting', motion: 'moving', condition: 'unknown', turnSucceeded: false};
-    if (p.type === 'token_count' && p.info) return {success: true, condition: 'healthy', turnSucceeded: true};
-    if (p.type === 'task_complete') return {phase: 'idle', motion: 'idle', condition: state.turnSucceeded ? 'healthy' : 'unknown'};
+    if (p.type === 'task_started') {
+      return {phase: 'requesting', motion: 'moving', turnSucceeded: false, ...(state.condition === 'abnormal' ? {} : {condition: 'unknown'})};
+    }
+    if (p.type === 'task_complete' && p.error) {
+      return {phase: 'failed', motion: 'idle', condition: 'abnormal', reason: errorReason(p.error)};
+    }
+    if (p.type === 'task_complete') return {phase: 'idle', motion: 'idle'};
     if (p.type === 'turn_aborted') return {phase: 'idle', motion: 'idle'};
     return null;
   }
-  if (line?.type === 'response_item' && state.motion === 'moving') {
-    if (TOOL_CALLS.has(p.type)) return {phase: 'tool'};
-    if (TOOL_OUTPUTS.has(p.type)) return {phase: 'requesting'};
+  if (line?.type !== 'response_item') return null;
+  if (modelOutput(p)) {
+    const phase = state.motion === 'moving' && TOOL_CALLS.has(p.type) ? {phase: 'tool'} : {};
+    return {success: true, condition: 'healthy', reason: null, turnSucceeded: true, ...phase};
   }
+  if (state.motion === 'moving' && TOOL_OUTPUTS.has(p.type)) return {phase: 'requesting'};
   return null;
 }
 
@@ -54,8 +71,15 @@ export function apply(state, change, at) {
   let changed = false;
   if (change.success) { state.lastSuccessAt = at; changed = true; }
   if ('turnSucceeded' in change) state.turnSucceeded = change.turnSucceeded;
-  for (const key of ['phase', 'motion', 'condition']) {
+  const was = {condition: state.condition, reason: state.reason};
+  for (const key of ['phase', 'motion', 'condition', 'reason']) {
     if (change[key] !== undefined && change[key] !== state[key]) { state[key] = change[key]; state.changedAt = at; changed = true; }
+  }
+  if (state.condition !== 'abnormal') {
+    state.reason = null;
+    state.conditionSince = null;
+  } else if (was.condition !== 'abnormal' || was.reason !== state.reason) {
+    state.conditionSince = at;
   }
   if (changed) state.seq += 1;
   return changed;
@@ -65,9 +89,9 @@ export function buildRecord(state, ident, now) {
   return {
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
     observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
-    seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: null,
+    seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
     last_success_at: state.lastSuccessAt, heartbeat_at: now, phase: state.phase, motion: state.motion,
-    condition: state.condition, reason: null,
+    condition: state.condition, reason: state.condition === 'abnormal' ? (state.reason || 'api-error') : null,
   };
 }
 
@@ -124,8 +148,18 @@ export class Observer {
     }
     this.gone = 0;
     const paths = await this.deps.openRollouts(panePid);
-    for (const p of paths) if (!this.metas.has(p)) this.metas.set(p, {...(await this.deps.readMeta(p)), path: p});
-    const file = pickRollout(paths.map((p) => this.metas.get(p)));
+    // Only the open files' classification is kept; an unreadable session_meta is retried.
+    const kept = new Map();
+    for (const p of paths) {
+      let kind = this.metas.get(p);
+      if (!kind) {
+        const meta = await this.deps.readMeta(p);
+        if (meta) kind = {parent_thread_id: meta.parent_thread_id || null, agent_path: meta.agent_path || null};
+      }
+      if (kind) kept.set(p, kind);
+    }
+    this.metas = kept;
+    const file = pickRollout(paths.map((p) => (kept.has(p) ? {...kept.get(p), path: p} : null)));
     if (file === null && this.target && ++this.misses < 2) return true;
     this.misses = 0;
     this.select(file);

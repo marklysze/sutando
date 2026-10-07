@@ -213,12 +213,16 @@ request completes or the observer stops.
 **Codex core.** `src/agent/codex/cli/codex-observer.mjs`, started by the Codex launcher in its own
 `<session>-observer` tmux session, writes the core's record. It finds the rollout file the core's
 Codex process holds open (`lsof` over the pane's process tree; one top-level file, else no record)
-and follows it: `task_started` reads `requesting · moving`, a tool call `tool`, each `token_count`
-stamps `last_success_at` and `healthy`, `task_complete` reads `idle` (`healthy` only if the turn
-had a completed response, else `unknown`). The rollout records no failures, so this record is never
-abnormal; it adds motion and positive recovery only. Nor does it see a stall: a turn that writes
-nothing for an hour still reads `moving`, and stalls stay with the screen-derived sources. It does not use the app-server daemon: a core
-launched with `--search` does not register there. It exits when the core session is gone.
+and follows it: `task_started` reads `requesting · moving`, a tool call `tool`. A model output
+(an assistant message, reasoning or a tool call) stamps `last_success_at` and `healthy`;
+`token_count` does not, since Codex writes one from running totals before a usage-limit failure.
+`task_complete` reads `idle`, or, when it carries an `error`, `failed · idle · abnormal` with
+`codex_error_info` mapped to `needs-login` (`unauthorized`), `quota-limit`
+(`usage_limit_exceeded`, `session_budget_exceeded`) or `api-error` (anything else). A failure stands
+until a later model output. The record does not see a stall: a turn that writes nothing for an hour
+still reads `moving`, and stalls stay with the screen-derived sources. It does not use the
+app-server daemon: a core launched with `--search` does not register there. It exits when the core
+session is gone on two discoveries in a row.
 
 Seats with no observer (Codex pool workers, an older engine, the observer disabled) have no record:
 their verdicts and the `summary` view are exactly what the other sources say, and `full` only gains

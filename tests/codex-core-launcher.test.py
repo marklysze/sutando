@@ -274,6 +274,9 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        # A suite run from a core shell must not point the launcher at the live socket or session.
+        env.pop("SUTANDO_TMUX_SOCKET", None)
+        env.pop("SUTANDO_TMUX_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -304,6 +307,9 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        # A suite run from a core shell must not point the launcher at the live socket or session.
+        env.pop("SUTANDO_TMUX_SOCKET", None)
+        env.pop("SUTANDO_TMUX_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
