@@ -57,6 +57,7 @@ class DrainStatus(str, Enum):
 class DrainResult:
     status: DrainStatus
     outcome: Optional[DeliveryOutcome] = None   # set iff status is ATTEMPTED
+    detail: str = ""
 
     def __post_init__(self):
         attempted = self.status is DrainStatus.ATTEMPTED
@@ -74,6 +75,10 @@ class ProviderIndeterminate(Exception):
 class ProviderRefused(Exception):
     """The provider definitely did not perform the side effect (validation
     rejection, refusal before dispatch). Maps to NOT_DELIVERED."""
+
+
+class ProviderPermanentRefused(ProviderRefused):
+    """A definitive refusal which another automatic send cannot repair."""
 
 
 @dataclass(frozen=True)
@@ -214,7 +219,8 @@ class ClaimBackend(Protocol):
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
-                 destination: Optional[str] = None) -> bool:
+                 destination: Optional[str] = None,
+                 terminal_reason: Optional[str] = None) -> bool:
         """Validate the exact incarnation, apply the outcome transition, and
         retire the claim — ALL inside one backend critical section, in that
         order. A stale token must change nothing: validating after mutating
@@ -224,6 +230,8 @@ class ClaimBackend(Protocol):
         step: recording the attempt and parking at the ceiling must not be
         two transactions, or a successor can claim and confirm between them
         and the stale caller's park overwrites its DELIVERED state.
+        `terminal_reason` parks a definitive refusal in that same transaction,
+        regardless of any retry schedule or attempt ceiling.
         True = this incarnation owned the claim and it is now retired."""
         ...
 

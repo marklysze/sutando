@@ -22,9 +22,13 @@ class DesignAClaimBackend:
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
-    def __init__(self, root: Path, reclaim_ttl_s: float = 300.0):
+    def __init__(self, root: Path, reclaim_ttl_s: float = 300.0,
+                 retry_schedule: Optional[outbox.RetrySchedule] = None,
+                 clock=time.time):
         self.root = Path(root)
         self.reclaim_ttl_s = reclaim_ttl_s
+        self.retry_schedule = retry_schedule
+        self.clock = clock
 
     def publish(self, item_id: str, payload: bytes) -> bool:
         with outbox._item_lock(self.root, item_id):
@@ -68,6 +72,13 @@ class DesignAClaimBackend:
                         self.root, item_id, self.reclaim_ttl_s):
                     outbox._release_locked(self.root, item_id, rec.drainer_id)
                 return None
+            rec = outbox.read_delivery_claim(self.root, item_id)
+            if rec is not None and not outbox.may_reclaim_delivery(
+                    self.root, item_id, self.reclaim_ttl_s):
+                return None
+            if self.retry_schedule is not None and not outbox.retry_ready_locked(
+                    self.root, item_id, self.retry_schedule, self.clock()):
+                return None
             took = (outbox._acquire_locked(self.root, item_id, worker)
                     or outbox._reclaim_locked(self.root, item_id,
                                               self.reclaim_ttl_s, worker))
@@ -89,7 +100,8 @@ class DesignAClaimBackend:
     def complete(self, token: ClaimToken, outcome: DeliveryOutcome,
                  park_at_attempts: Optional[int] = None,
                  provider: Optional[str] = None,
-                 destination: Optional[str] = None) -> bool:
+                 destination: Optional[str] = None,
+                 terminal_reason: Optional[str] = None) -> bool:
         item_id = token.item_id
         # Validate -> transition -> retire, all under the item lock: a stale
         # incarnation must not mutate or park its successor's item.
@@ -103,6 +115,11 @@ class DesignAClaimBackend:
                                         provider=provider, destination=destination)
             elif outcome is DeliveryOutcome.OUTCOME_UNKNOWN:
                 outbox.park_item(self.root, item_id, "outcome-unknown")
+            elif terminal_reason:
+                outbox.note_attempt(self.root, item_id)
+                outbox.park_item(self.root, item_id, terminal_reason)
+            elif self.retry_schedule is not None:
+                outbox.retry_failed_locked(self.root, item_id, self.clock())
             else:
                 attempts = outbox.note_attempt(self.root, item_id)
                 if park_at_attempts is not None and attempts >= park_at_attempts:

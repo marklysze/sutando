@@ -25,6 +25,7 @@ import ctypes.util
 import errno
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -786,6 +787,64 @@ def attempts_for(root: Path, item_id: str) -> int:
     return int(_read_item(Path(root), item_id).get("attempts", 0))
 
 
+@dataclass(frozen=True)
+class RetrySchedule:
+    window_s: float = 600.0
+    initial_delay_s: float = 2.0
+    max_delay_s: float = 30.0
+
+    def __post_init__(self):
+        if not all(math.isfinite(v) for v in (
+                self.window_s, self.initial_delay_s, self.max_delay_s)) or not (
+                0 < self.initial_delay_s <= self.max_delay_s <= self.window_s):
+            raise ValueError("retry delays must be positive and within the window")
+
+
+def retry_ready_locked(root: Path, item_id: str, schedule: RetrySchedule,
+                       now: float) -> bool:
+    """Called under the item lock, before acquiring a delivery claim."""
+    d = _read_item(root, item_id)
+    retry = d.get("retry")
+    if retry is None:
+        retry = {"started_at": now, "deadline": now + schedule.window_s,
+                 "next_attempt_at": now, "failures": 0,
+                 "initial_delay_s": schedule.initial_delay_s,
+                 "max_delay_s": schedule.max_delay_s}
+        d["retry"] = retry
+        _write_item(root, item_id, d)
+    try:
+        valid = (isinstance(retry, dict)
+                 and all(math.isfinite(retry[k]) for k in (
+                     "started_at", "deadline", "next_attempt_at", "initial_delay_s", "max_delay_s"))
+                 and retry["started_at"] <= retry["next_attempt_at"] <= retry["deadline"]
+                 and retry["started_at"] < retry["deadline"]
+                 and 0 < retry["initial_delay_s"] <= retry["max_delay_s"]
+                 and isinstance(retry["failures"], int) and retry["failures"] >= 0)
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        park_item(root, item_id, "invalid-retry-state")
+        return False
+    if now >= retry["deadline"]:
+        park_item(root, item_id, "retry-window-exhausted")
+        return False
+    return now >= retry["next_attempt_at"]
+
+
+def retry_failed_locked(root: Path, item_id: str, now: float) -> None:
+    """Persist failure accounting and the next eligible time under the claim lock."""
+    d = _read_item(root, item_id)
+    retry = d["retry"]
+    retry["failures"] += 1
+    delay = min(retry["max_delay_s"],
+                retry["initial_delay_s"] * 2 ** min(retry["failures"] - 1, 30))
+    retry["next_attempt_at"] = min(now + delay, retry["deadline"])
+    d["attempts"] = int(d.get("attempts", 0)) + 1
+    if now >= retry["deadline"]:
+        d.update(status="PARKED", reason="retry-window-exhausted")
+    _write_item(root, item_id, d)
+
+
 def note_attempt(root: Path, item_id: str) -> int:
     d = _read_item(Path(root), item_id)
     d["attempts"] = int(d.get("attempts", 0)) + 1
@@ -877,6 +936,7 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         d["reason"] = None
         if reset_attempts:
             d["attempts"] = 0
+            d.pop("retry", None)
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
