@@ -103,6 +103,8 @@ export class Observer {
     this.offset = 0;
     this.rest = '';
     this.ticks = 0;
+    this.gone = 0;
+    this.misses = 0;
     this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
     this.dirty = false;
     this.timer = null;
@@ -111,21 +113,30 @@ export class Observer {
     this.metas = new Map();
   }
 
-  // false once the core session is gone, so the caller can stop.
+  // false once the core session is gone, so the caller can stop. One failed probe proves
+  // nothing: a session or a rollout counts as gone on the second miss in a row.
   async discover() {
     const panePid = await this.deps.panePid();
-    if (!panePid) { this.select(null); return false; }
+    if (!panePid) {
+      if (++this.gone < 2) return true;
+      this.select(null);
+      return false;
+    }
+    this.gone = 0;
     const paths = await this.deps.openRollouts(panePid);
     for (const p of paths) if (!this.metas.has(p)) this.metas.set(p, {...(await this.deps.readMeta(p)), path: p});
-    const metas = paths.map((p) => this.metas.get(p));
-    this.select(pickRollout(metas));
+    const file = pickRollout(paths.map((p) => this.metas.get(p)));
+    if (file === null && this.target && ++this.misses < 2) return true;
+    this.misses = 0;
+    this.select(file);
     return true;
   }
 
   select(file) {
     if (file === this.target) return;
     this.target = file;
-    this.state = newState();
+    // The writer refuses a lower seq from the same observer_id, so seq never goes back.
+    this.state = {...newState(), seq: this.state.seq};
     this.rest = '';
     if (!file) return;
     const {text, size} = this.deps.readTail(file, TAIL_BYTES);
@@ -199,12 +210,20 @@ export function parseArgs(argv) {
   return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || ''};
 }
 
-function run(file, args, input) {
+// partialOk: exit 1 with output is a result (lsof exits 1 when one listed pid has gone).
+// A timeout, signal or overflow is never one: its output may be cut short.
+function run(file, args, input, partialOk = false) {
   return new Promise((resolve) => {
-    const child = execFile(file, args, {timeout: RUN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024},
-      (err, stdout) => resolve(err ? null : stdout));
+    const child = execFile(file, args, {timeout: RUN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024}, (err, stdout) => {
+      const partial = partialOk && err && err.code === 1 && !err.killed && !err.signal && stdout;
+      resolve(err && !partial ? null : stdout);
+    });
     if (input !== undefined) child.stdin.end(input);
   });
+}
+
+export async function lsofRollouts(pids) {
+  return rolloutPaths((await run('lsof', ['-a', '-p', pids.join(','), '-Fn'], undefined, true)) || '');
 }
 
 function readRange(file, start) {
@@ -247,8 +266,7 @@ export function fileDeps(opts) {
     panePid: async () => Number(((await run('tmux', ['-S', opts.tmuxSocket, 'list-panes', '-t', `=${opts.session}`,
       '-F', '#{pane_pid}'])) || '').split('\n')[0]) || 0,
     openRollouts: async (panePid) => {
-      const pids = descendants(panePid, (await run('ps', ['-A', '-o', 'pid=,ppid='])) || '');
-      return rolloutPaths((await run('lsof', ['-a', '-p', pids.join(','), '-Fn'])) || '');
+      return lsofRollouts(descendants(panePid, (await run('ps', ['-A', '-o', 'pid=,ppid='])) || ''));
     },
     readMeta: async (file) => {
       try {

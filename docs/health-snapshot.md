@@ -216,7 +216,8 @@ Codex process holds open (`lsof` over the pane's process tree; one top-level fil
 and follows it: `task_started` reads `requesting · moving`, a tool call `tool`, each `token_count`
 stamps `last_success_at` and `healthy`, `task_complete` reads `idle` (`healthy` only if the turn
 had a completed response, else `unknown`). The rollout records no failures, so this record is never
-abnormal; it adds motion and positive recovery only. It does not use the app-server daemon: a core
+abnormal; it adds motion and positive recovery only. Nor does it see a stall: a turn that writes
+nothing for an hour still reads `moving`, and stalls stay with the screen-derived sources. It does not use the app-server daemon: a core
 launched with `--search` does not register there. It exits when the core session is gone.
 
 Seats with no observer (Codex pool workers, an older engine, the observer disabled) have no record:

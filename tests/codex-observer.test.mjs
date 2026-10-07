@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, lineChange, newState, parseArgs, pickRollout, rolloutPaths,
+  Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, lineChange, lsofRollouts, newState, parseArgs, pickRollout,
+  rolloutPaths,
 } from '../src/agent/codex/cli/codex-observer.mjs';
 
 const ev = (type, extra = {}, ts = '2026-10-06T02:57:50.000Z') => ({timestamp: ts, type: 'event_msg', payload: {type, ...extra}});
@@ -138,9 +140,63 @@ test('no core rollout, two top-level rollouts, or no python mean no write', asyn
   assert.equal(f.writes.length, 0);
 });
 
-test('a gone core session stops the observer', async () => {
+test('a core session gone on two discoveries in a row stops the observer; one miss does not', async () => {
   const f = fake({'/a': {meta: {}, text: ''}}, {gone: true});
-  assert.equal(await new Observer({session: 's'}, f.deps).tick(), false);
+  const o = new Observer({session: 's'}, f.deps);
+  assert.equal(await o.discover(), true);
+  assert.equal(await o.discover(), false);
+});
+
+test('one discovery that finds no rollout keeps the target; a second drops it', async () => {
+  const files = {'/a': {meta: {}, text: jl(ev('task_started'))}};
+  const f = fake(files);
+  const o = new Observer({session: 's'}, f.deps);
+  await o.discover();
+  f.deps.openRollouts = async () => [];
+  await o.discover();
+  assert.equal(o.target, '/a');
+  await o.discover();
+  assert.equal(o.target, null);
+});
+
+test('reselecting a rollout never lowers seq, so the real writer keeps accepting records', async () => {
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-ws-'));
+  const writer = new URL('../src/runtime_observation.py', import.meta.url).pathname;
+  const stored = () => JSON.parse(fs.readFileSync(path.join(ws, 'state/runtime-observations/core.json'), 'utf8'));
+  const busy = jl(...Array.from({length: 15}, (_, i) => ev(i % 2 ? 'task_complete' : 'task_started')));
+  const files = {'/a': {meta: {}, text: busy}, '/b': {meta: {}, text: jl(ev('task_started'))}};
+  const f = fake(files);
+  f.deps.now = () => Date.now() / 1000;
+  f.deps.write = async (py, rec) => execFileSync('python3', [writer, 'write', '--workspace', ws], {input: JSON.stringify(rec)});
+  f.deps.openRollouts = async () => ['/a'];
+  const o = new Observer({session: 'sutando-core'}, f.deps);
+  await o.discover();
+  await f.flush();
+  const before = stored();
+  f.deps.openRollouts = async () => ['/b'];
+  await o.discover();
+  await o.discover();
+  await f.flush();
+  const after = stored();
+  assert(after.seq > before.seq, `seq ${after.seq} after ${before.seq}`);
+  assert.deepEqual([after.phase, after.motion], ['requesting', 'moving']);
+  fs.rmSync(ws, {recursive: true});
+});
+
+test('lsof output still counts when one listed pid has already exited', {skip: !fs.existsSync('/usr/sbin/lsof') && !fs.existsSync('/usr/bin/lsof')}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-lsof-'));
+  const file = fs.realpathSync(dir) + '/rollout-held.jsonl';
+  fs.writeFileSync(file, '');
+  const holder = spawn(process.execPath, ['-e', `require('fs').openSync(${JSON.stringify(file)}, 'r'); setTimeout(() => {}, 20000)`]);
+  const gone = spawn(process.execPath, ['-e', '0']);
+  await new Promise((r) => gone.on('exit', r));
+  await new Promise((r) => setTimeout(r, 300));
+  try {
+    assert.deepEqual(await lsofRollouts([holder.pid, gone.pid]), [file]);
+  } finally {
+    holder.kill();
+    fs.rmSync(dir, {recursive: true});
+  }
 });
 
 test('a failing write never throws out of the observer', async () => {
