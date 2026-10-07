@@ -95,10 +95,11 @@ export function buildRecord(state, ident, now) {
   };
 }
 
-// The core's own rollout among those its processes hold open: the one top-level thread.
-// Subagents' rollouts name a parent; more than one top-level file means no opinion.
+// The core's own rollout among those its processes hold open: the one top-level thread. Subagents'
+// rollouts name a parent; an unreadable one could be top-level, so it is as ambiguous as a second.
 export function pickRollout(metas) {
-  const top = metas.filter((m) => m && !m.parent_thread_id && !m.agent_path);
+  if (metas.some((m) => !m)) return null;
+  const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path);
   return top.length === 1 ? top[0].path : null;
 }
 
@@ -260,16 +261,18 @@ export async function lsofRollouts(pids) {
   return rolloutPaths((await run('lsof', ['-a', '-p', pids.join(','), '-Fn'], undefined, true)) || '');
 }
 
-function readRange(file, start) {
-  const size = fs.statSync(file).size;
-  if (size <= start) return {buf: Buffer.alloc(0), size};
-  const fd = fs.openSync(file, 'r');
+// One fd, one size snapshot: the returned end is exactly where the bytes read stop, so a write
+// landing during the read is picked up by the next follow, never skipped or read twice.
+function readRange(io, file, startOf) {
+  const fd = io.openSync(file, 'r');
   try {
+    const size = io.fstatSync(fd).size;
+    const start = Math.min(startOf(size), size);
     const buf = Buffer.alloc(size - start);
-    fs.readSync(fd, buf, 0, buf.length, start);
-    return {buf, size};
+    const n = buf.length ? io.readSync(fd, buf, 0, buf.length, start) : 0;
+    return {buf: buf.subarray(0, n), end: start + n};
   } finally {
-    fs.closeSync(fd);
+    io.closeSync(fd);
   }
 }
 
@@ -293,7 +296,7 @@ function firstLine(file, limit = 4 * 1024 * 1024) {
   }
 }
 
-export function fileDeps(opts) {
+export function fileDeps(opts, io = fs) {
   return {
     now: () => Date.now() / 1000,
     after: (ms, fn) => setTimeout(fn, ms),
@@ -309,12 +312,11 @@ export function fileDeps(opts) {
       } catch { return null; }
     },
     readTail: (file, bytes) => {
-      const size = fs.statSync(file).size;
-      const {buf} = readRange(file, Math.max(0, size - bytes));
-      return {text: buf.toString('utf8'), size};
+      const {buf, end} = readRange(io, file, (size) => Math.max(0, size - bytes));
+      return {text: buf.toString('utf8'), size: end};
     },
     readFrom: (file, offset) => {
-      const {buf} = readRange(file, offset);
+      const {buf} = readRange(io, file, () => offset);
       return buf.length ? {text: buf.toString('utf8'), bytes: buf.length} : null;
     },
     resolvePython: async () => ((await run('bash', ['-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', opts.engine])) || '').trim(),

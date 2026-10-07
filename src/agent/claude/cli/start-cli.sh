@@ -240,12 +240,7 @@ release_orchestrator_lock() {
   return 0
 }
 log_restart_attempt() {
-  local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  [ -n "$ws" ] || return 0
-  mkdir -p "$ws/logs" 2>/dev/null || true
-  printf '%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1" \
-    >> "$ws/logs/restart-attempts.log" 2>/dev/null || true
+  sutando_restart_attempt_log "$REPO" "${FORCE_RESTART:+force-restart}${FORCE_RESTART:-restart}" "$1"
 }
 # Enforces the HAZARD above; the decision and its message are shared with
 # the codex launcher, this adapter keeps only its own attempt logging.

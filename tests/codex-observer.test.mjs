@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, lineChange, lsofRollouts, newState, parseArgs, pickRollout,
   rolloutPaths,
@@ -13,7 +14,7 @@ const ev = (type, extra = {}, ts = '2026-10-06T02:57:50.000Z') => ({timestamp: t
 const item = (type, ts = '2026-10-06T02:57:51.000Z', extra = {}) => ({timestamp: ts, type: 'response_item', payload: {type, ...extra}});
 const said = (ts) => item('message', ts, {role: 'assistant'});
 const quota = {message: "You've hit your usage limit.", codex_error_info: 'usage_limit_exceeded'};
-const REPO = new URL('..', import.meta.url).pathname;
+const REPO = fileURLToPath(new URL('..', import.meta.url));
 // The repository's interpreter policy, never a bare python3 (the macOS developer-tools stub).
 const PY = execFileSync('bash', ['-c', '. "$1/scripts/python-binary.sh" && resolve_python "$1"', 'resolve', REPO]).toString().trim();
 const writeRecord = (ws, rec) => execFileSync(PY, [REPO + 'src/runtime_observation.py', 'write', '--workspace', ws], {input: JSON.stringify(rec)});
@@ -272,15 +273,64 @@ test('discovery keeps only open rollouts, only their classification, and retries
   f.deps.openRollouts = async () => ['/main', '/sub'];
   const o = new Observer({session: 's'}, f.deps);
   await o.discover();
-  assert.equal(o.target, '/main', 'an unreadable sibling is not a second top-level rollout');
+  assert.equal(o.target, null, 'an unreadable sibling could be a second top-level rollout');
   assert.deepEqual([...o.metas.keys()], ['/main']);
   assert.deepEqual(o.metas.get('/main'), {parent_thread_id: null, agent_path: null});
   metas['/sub'] = {id: 's', parent_thread_id: 'm'};
   await o.discover();
-  assert.deepEqual([...o.metas.keys()], ['/main', '/sub']);
-  assert.equal(o.target, '/main');
+  assert.equal(o.target, '/main', 'repaired as a subagent');
   f.deps.openRollouts = async () => ['/main'];
   await o.discover();
   assert.deepEqual([...o.metas.keys()], ['/main'], 'closed rollouts are pruned');
   assert.equal(reads, 3, 'a cached classification is not re-read; a failed read is');
+});
+
+test('an open rollout that stays unreadable drops the target on the second discovery', async () => {
+  const metas = {'/old': {id: 'o'}, '/new': null};
+  const f = fake({'/old': {meta: null, text: jl(ev('task_started'), ev('task_complete'))}, '/new': {meta: null, text: ''}});
+  f.deps.readMeta = async (p) => metas[p];
+  f.deps.openRollouts = async () => ['/old'];
+  const o = new Observer({session: 's'}, f.deps);
+  await o.discover();
+  assert.equal(o.target, '/old');
+  f.deps.openRollouts = async () => ['/old', '/new'];
+  await o.discover();
+  assert.equal(o.target, '/old', 'one ambiguous discovery keeps the target');
+  await o.discover();
+  assert.equal(o.target, null, 'a second one drops it');
+  const before = f.writes.length;
+  o.heartbeat();
+  await f.flush();
+  assert.equal(f.writes.length, before, 'no target, no renewed record');
+});
+
+test('an unreadable rollout repaired as a second top-level thread leaves no target', async () => {
+  const metas = {'/a': {id: 'a'}, '/b': null};
+  const f = fake({'/a': {meta: null, text: ''}, '/b': {meta: null, text: ''}});
+  f.deps.readMeta = async (p) => metas[p];
+  f.deps.openRollouts = async () => ['/a', '/b'];
+  const o = new Observer({session: 's'}, f.deps);
+  await o.discover();
+  metas['/b'] = {id: 'b'};
+  await o.discover();
+  assert.equal(o.target, null);
+});
+
+test('a write landing during the initial tail read is applied exactly once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-race-'));
+  const file = path.join(dir, 'rollout-race.jsonl');
+  const done = JSON.stringify(ev('task_complete', {error: quota})) + '\n';
+  fs.writeFileSync(file, jl(ev('task_started')) + done.slice(0, 20));
+  // Codex extends the half-written line just after the reader first learns the file's size.
+  let appended = false;
+  const afterSize = (stat) => { if (!appended) { appended = true; fs.appendFileSync(file, done.slice(20, 40)); } return stat; };
+  const io = {...fs, statSync: (...a) => afterSize(fs.statSync(...a)), fstatSync: (...a) => afterSize(fs.fstatSync(...a))};
+  const deps = fileDeps({engine: REPO, tmuxSocket: '/s', session: 's'}, io);
+  const o = new Observer({session: 's'}, {...fake({}).deps, readTail: deps.readTail, readFrom: deps.readFrom});
+  o.select(file);
+  fs.appendFileSync(file, done.slice(40));
+  o.follow();
+  assert.deepEqual([o.state.phase, o.state.condition, o.state.reason], ['failed', 'abnormal', 'quota-limit']);
+  assert.equal(o.offset, fs.statSync(file).size);
+  fs.rmSync(dir, {recursive: true});
 });

@@ -212,8 +212,9 @@ request completes or the observer stops.
 
 **Codex core.** `src/agent/codex/cli/codex-observer.mjs`, started by the Codex launcher in its own
 `<session>-observer` tmux session, writes the core's record. It finds the rollout file the core's
-Codex process holds open (`lsof` over the pane's process tree; one top-level file, else no record)
-and follows it: `task_started` reads `requesting · moving`, a tool call `tool`. A model output
+Codex process holds open (`lsof` over the pane's process tree). It needs exactly one top-level
+rollout and none it cannot classify; otherwise it keeps its target for one discovery, then writes no
+record. It follows that file: `task_started` reads `requesting · moving`, a tool call `tool`. A model output
 (an assistant message, reasoning or a tool call) stamps `last_success_at` and `healthy`;
 `token_count` does not, since Codex writes one from running totals before a usage-limit failure.
 `task_complete` reads `idle`, or, when it carries an `error`, `failed · idle · abnormal` with

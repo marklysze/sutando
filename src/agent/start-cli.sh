@@ -120,6 +120,7 @@ case "${1:-}" in
   --restart|--force-restart)
     if sutando_restart_guard_refuses "${SUTANDO_CORE_SESSION:-}"; then
       sutando_restart_guard_explain
+      sutando_restart_attempt_log "$REPO" "${1#--}" "$SUTANDO_RESTART_GUARD_REASON"
       exit 1
     fi
     ;;
