@@ -6,8 +6,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, lineChange, lsofRollouts, newState, parseArgs, pickRollout,
-  rolloutPaths,
+  Observer, TAIL_BYTES, apply, buildRecord, descendants, fileDeps, isEntrypoint, lineChange, lsofRollouts, newState, parseArgs,
+  pickRollout, rolloutPaths, runLoop,
 } from '../src/agent/codex/cli/codex-observer.mjs';
 
 const ev = (type, extra = {}, ts = '2026-10-06T02:57:50.000Z') => ({timestamp: ts, type: 'event_msg', payload: {type, ...extra}});
@@ -338,5 +338,55 @@ test('a write landing during the initial tail read is applied exactly once', asy
   o.follow();
   assert.deepEqual([o.state.phase, o.state.condition, o.state.reason], ['failed', 'abnormal', 'quota-limit']);
   assert.equal(o.offset, fs.statSync(file).size);
+  fs.rmSync(dir, {recursive: true});
+});
+
+test('started through a symlinked path, the observer runs and probes the core session', async () => {
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-link-')));
+  const bin = path.join(dir, 'bin');
+  fs.mkdirSync(bin);
+  const log = path.join(dir, 'tmux.log');
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh\necho "$*" >> ${JSON.stringify(log)}\n`, {mode: 0o755});
+  const link = path.join(dir, 'engine-link');
+  fs.symlinkSync(path.join(REPO, 'src/agent/codex/cli'), link);
+  const child = spawn(process.execPath, [path.join(link, 'codex-observer.mjs'), '--engine', REPO, '--tmux-socket', '/x.sock',
+    '--session', 'sutando-core'], {env: {...process.env, PATH: `${bin}:${process.env.PATH}`}, stdio: 'ignore'});
+  try {
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline && !(fs.existsSync(log) && fs.readFileSync(log, 'utf8').includes('list-panes'))) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.match(fs.readFileSync(log, 'utf8'), /-S \/x\.sock list-panes -t =sutando-core/);
+  } finally {
+    child.kill();
+    fs.rmSync(dir, {recursive: true});
+  }
+});
+
+test('the entrypoint check resolves argv[1] and refuses a missing path', () => {
+  const real = fileURLToPath(new URL('../src/agent/codex/cli/codex-observer.mjs', import.meta.url));
+  const url = new URL('../src/agent/codex/cli/codex-observer.mjs', import.meta.url).href;
+  assert.equal(isEntrypoint(real, url), true);
+  assert.equal(isEntrypoint('/no/such/file.mjs', url), false);
+  assert.equal(isEntrypoint(undefined, url), false);
+});
+
+test('the main loop survives a tick that throws and stops when the core is gone', async () => {
+  const outcomes = [() => { throw new Error('bad read'); }, () => true, () => false];
+  let ticks = 0;
+  let sleeps = 0;
+  await runLoop({tick: async () => outcomes[ticks++]()}, async () => { sleeps += 1; });
+  assert.deepEqual([ticks, sleeps], [3, 2]);
+});
+
+test('fileDeps.write runs the engine writer with the workspace and the record on stdin', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-observer-write-'));
+  const py = path.join(dir, 'py');
+  const out = path.join(dir, 'argv');
+  fs.writeFileSync(py, `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(out)}\ncat >> ${JSON.stringify(out)}\n`, {mode: 0o755});
+  const deps = fileDeps({engine: '/eng', tmuxSocket: '/s', session: 's', workspace: '/ws dir'});
+  await deps.write(py, {seat: 'core'});
+  assert.deepEqual(fs.readFileSync(out, 'utf8').split('\n'),
+    ['/eng/src/runtime_observation.py', 'write', '--workspace', '/ws dir', '{"seat":"core"}']);
   fs.rmSync(dir, {recursive: true});
 });

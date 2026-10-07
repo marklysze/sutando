@@ -328,16 +328,31 @@ export function fileDeps(opts, io = fs) {
   };
 }
 
+// Runs ticks until the core is gone; a tick that throws is one bad read, not the end of the core.
+export async function runLoop(observer, sleep) {
+  for (;;) {
+    let alive = true;
+    try { alive = await observer.tick(); } catch { /* keep going */ }
+    if (!alive) return;
+    await sleep(TICK_MS);
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const observer = new Observer(opts, fileDeps(opts));
   setInterval(() => observer.heartbeat(), HEARTBEAT_MS);
-  for (;;) {
-    let alive = true;
-    try { alive = await observer.tick(); } catch { /* one bad read is not the end of the core */ }
-    if (!alive) process.exit(0);
-    await new Promise((r) => setTimeout(r, TICK_MS));
+  await runLoop(observer, (ms) => new Promise((r) => setTimeout(r, ms)));
+  process.exit(0);
+}
+
+// import.meta.url is the resolved path; argv[1] keeps a symlinked spelling such as /tmp.
+export function isEntrypoint(argv1, moduleUrl) {
+  try {
+    return Boolean(argv1) && moduleUrl === pathToFileURL(fs.realpathSync(argv1)).href;
+  } catch {
+    return false;
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) main();
+if (isEntrypoint(process.argv[1], import.meta.url)) main();

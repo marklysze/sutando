@@ -752,6 +752,17 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("new-session -d -s sutando-core", calls)
         self.assertLess(calls.index("kill-session -t =sutando-core-watcher"),
                         calls.index("new-session -d -s sutando-core"))
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
+                        calls.index("new-session -d -s sutando-core"))
+
+    def test_direct_launcher_replacing_a_foreign_session_kills_the_observer_too(self):
+        # The dispatcher turns this into --restart; called directly, the replace branch itself must reap.
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "unknown"}, launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._tmux_calls()
+        self.assertIn("Replacing unmarked or non-Codex sutando-core session.", result.stdout)
+        self.assertLess(calls.index("kill-session -t =sutando-core-observer"),
+                        calls.index("new-session -d -s sutando-core"))
 
     def test_stale_notifier_version_is_replaced_without_restarting_core(self):
         result = self.run_launcher(env_extra={
