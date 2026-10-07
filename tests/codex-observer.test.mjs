@@ -258,9 +258,15 @@ test('/health reads a usage-limit failure after a success as abnormal quota-limi
   const s = run([ev('task_started', {}, at(-120)), said(at(-118)), ev('task_complete', {}, at(-117)),
     ev('task_started', {}, at(-30)), ev('token_count', {info: {}}, at(-29)), ev('task_complete', {error: quota}, at(-29))]);
   writeRecord(ws, buildRecord(s, {observerId: 'o'.repeat(16), startedAt: now - 300, session: 'sutando-core'}, now - 1));
-  const snap = JSON.parse(execFileSync(PY, [REPO + 'src/health_snapshot.py', '--workspace', ws, '--agent', 'core']).toString());
+  // The pane's own quota claim began after the real success: a false later success would supersede it.
+  fs.mkdirSync(path.join(ws, 'state/cli-wedge'), {recursive: true});
+  fs.writeFileSync(path.join(ws, 'state/cli-wedge/window.jsonl'), [-100, -70, -40].map((dt) => JSON.stringify(
+    {ts: now + dt, state: 's', raw_state: 'r', patterns: [], abnormal: ['quota-limit']})).join('\n') + '\n');
+  const snap = JSON.parse(execFileSync(PY, [REPO + 'src/health_snapshot.py', '--workspace', ws, '--agent', 'core', '--view', 'full']).toString());
   const core = snap.agents[0];
   assert.deepEqual([core.condition, core.reason], ['abnormal', 'quota-limit']);
+  assert.equal(core.sources.cli_wedge.opinion?.reason, 'quota-limit');
+  assert.equal(core.sources.cli_wedge.value.superseded_by, undefined, 'the pane quota claim stands');
   fs.rmSync(ws, {recursive: true});
 });
 
