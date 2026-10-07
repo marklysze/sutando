@@ -59,6 +59,9 @@ class RecoveryTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.server = Gateway()
         self.policy_outbox = outbox
+        observer = patch.object(outbox, '_activity_completed', return_value=None)
+        observer.start()
+        self.addCleanup(observer.stop)
         self.results = self.root / 'results'
         self.tasks = self.root / 'tasks'
         self.results.mkdir()
@@ -507,6 +510,7 @@ class CanonicalRecoveryTest(RecoveryTest):
         self.policy_outbox = canonical_outbox
         from ag2_sparrow.delivery_core import backend_a
         for module, name, value in (
+            (canonical_outbox, '_activity_completed', lambda item_id: None),
             (backend_a, 'outbox', canonical_outbox),
             (gw, 'plan_dedup_recovery', canonical_dedup.plan_dedup_recovery),
             (gw, 'classify_holder_delivery', canonical_dedup.classify_holder_delivery),
