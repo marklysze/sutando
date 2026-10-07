@@ -67,6 +67,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/tmux-pane-keys.sh",
+            "src/bounded-wait.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
             "src/agent/task-event-handler-lookup.sh",
@@ -983,6 +984,56 @@ exit 0
         self.assertIn("typing task-123.txt failed (rc 124); counted as a failed attempt", result.stderr)
         self.assertIn("submitting task-123.txt: typing prompt (attempt 2)", result.stderr)
         self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 2)
+
+    def _failed_send(self, key, managed=False):
+        stage = Path(self.tmp.name) / "staged"
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   STAGE=str(stage), FAIL_KEY=key, SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
+                   SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_RETRIES="1")
+        self._write_exe("tmux", r'''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+case "$1" in
+  capture-pane)
+    if [ -e "$STAGE" ]; then printf '› Sutando task ready: task-123.txt.\n← for agents\n'
+    else printf '› \n← for agents\n'; fi;;
+  send-keys)
+    case "$*" in
+      *"-l --"*) [ "$FAIL_KEY" = literal ] && exec sleep 60; touch "$STAGE";;
+      *C-m*) exec sleep 60;;
+    esac;;
+esac
+exit 0
+''')
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        args = ["/bin/bash", str(script), "--event", "task-123.txt"]
+        if managed:
+            tasks = self.root / "workspace/tasks"
+            tasks.mkdir(exist_ok=True)
+            (tasks / "task-123.txt").write_text("task: test\n")
+            (self.root / "src/watch-tasks-stream.sh").write_text("#!/bin/bash\nprintf 'TASK_FILE: task-123.txt\\n'\n")
+            args = args[:2]
+        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
+
+    def test_notifier_rejects_two_literal_timeouts_without_pressing_enter(self):
+        r = self._failed_send("literal")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._tmux_calls().count("-l -- Sutando task ready: task-123.txt"), 2)
+        self.assertNotIn(" C-m", self._tmux_calls())
+
+    def test_notifier_rejects_enter_timeout_while_prompt_remains_staged(self):
+        r = self._failed_send("enter")
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("C-m for task-123.txt failed (rc 124)", r.stderr)
+        self.assertEqual(self._tmux_calls().count(" C-m"), 1)
+
+    def test_managed_notifier_defers_known_failure_without_waiting_for_result(self):
+        r = self._failed_send("literal", managed=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("will retry on the next idle cycle", r.stderr)
+        self.assertNotIn("timed out waiting for result", r.stderr)
+        self.assertNotIn(" C-m", self._tmux_calls())
 
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"
@@ -2030,7 +2081,7 @@ exit 0
         )
 
         self.assertNotEqual(result.returncode, 0, result.stderr)
-        self.assertIn("refusing --event task-owner.txt: composer was not idle-ready", result.stderr)
+        self.assertIn("refusing --event task-owner.txt: delivery was not confirmed", result.stderr)
         self.assertNotIn("will retry on the next idle cycle", result.stderr)
         self.assertNotIn("send-keys", self._tmux_calls())
 

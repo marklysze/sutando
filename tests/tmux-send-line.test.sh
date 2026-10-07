@@ -70,8 +70,8 @@ cat > "$T/bin/sleep" <<'SH'
 printf 'sleep %s\n' "$*" >> "$TMUX_LOG"
 SH
 chmod +x "$T/bin/sleep"
-# The key sender's own 20ms poll is not a pause between the line and Enter.
-seq(){ grep -E '^sleep |send-keys' "$TMUX_LOG" | grep -v '^sleep 0.02$' | sed -E 's/^-S [^ ]+ //' | tr '\n' '|'; }
+# Exclude bounded-wait's polls so the log measures the sender's Enter delay.
+seq(){ grep -E '^sleep |send-keys' "$TMUX_LOG" | grep -Ev '^sleep 0\.(01|02|04|05)$' | sed -E 's/^-S [^ ]+ //' | tr '\n' '|'; }
 rc=$(TMUX_PANE_TEXT_AFTER='› hello\n' run probe hello --socket "$T/s.sock" --runtime codex); SEQ="$(seq)"
 [ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|sleep 0.25|send-keys -t probe Enter|" ] && ok "C7 codex: literal line, sleep 0.25, then Enter (an Enter inside Codex's 120ms paste-burst window reads as a newline)" || fail "C7 codex enter delay" "rc=$rc seq=$SEQ"
 

@@ -26,7 +26,7 @@ cap() { tmux -S "$SOCK" capture-pane -p -t "$SESSION" 2>/dev/null || { echo "CAP
 count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | grep -Eci -- "$ACCEPT"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
-  cancel) bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Escape; echo CANCELLED; exit 0;;
+  cancel) bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Escape || exit $?; echo CANCELLED; exit 0;;
   wait) ;;
   *) echo "pane-observe: one of --count/--wait/--cancel" >&2; exit 2;;
 esac

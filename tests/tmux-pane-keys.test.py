@@ -99,6 +99,44 @@ class Timeout(unittest.TestCase):
         self.assertEqual(run("-S", "/x", "-t", "=c:0").returncode, 2)
         self.assertEqual(run("-S", "/x", "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
 
+    def test_hanging_probe_is_bounded_and_send_still_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) exec sleep 30;; *send-keys*) echo SENT;; esac\n')
+            fake.chmod(0o755)
+            start = time.monotonic()
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "SENT")
+            self.assertLess(time.monotonic() - start, 4)
+
+    def test_term_resistant_send_is_killed_before_it_can_deliver_late(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            marker = Path(d) / "delivered"
+            fake.write_text(f'''#!/bin/bash
+case "$*" in
+  *display-message*) echo 0;;
+  *send-keys*) exec "{sys.executable}" -c 'import signal,time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(4); Path("{marker}").touch()';;
+esac
+''')
+            fake.chmod(0o755)
+            start = time.monotonic()
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            self.assertEqual(r.returncode, 124, r.stderr)
+            self.assertLess(time.monotonic() - start, 3.5)
+            time.sleep(4)
+            self.assertFalse(marker.exists())
+
+    def test_hanging_mode_exit_does_not_send_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 1;; *copy-mode*) exec sleep 30;; *send-keys*) echo SENT;; esac\n')
+            fake.chmod(0o755)
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            self.assertEqual(r.returncode, 124, r.stderr)
+            self.assertNotIn("SENT", r.stdout)
+
     def test_python_argv(self):
         self.assertEqual(tmux_pane_keys.argv("/s", "=c:0", "Escape", tmux="/bin/tmux"),
                          ["bash", str(HELPER), "--tmux", "/bin/tmux", "-S", "/s", "-t", "=c:0", "--", "Escape"])

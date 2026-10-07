@@ -29,7 +29,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth-preflight-gate.sh`** — auth-preflight-gate.sh — boot gate for the logged-out-CLI class (#2396).
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
-- **`bounded-wait.sh`** — The watcher's one bounded child run.
+- **`bounded-wait.sh`** — Shared bounded child run.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -223,7 +223,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
-- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> The one way to send keys into an agent pane: leave any pane mode first, then send-keys under a timeout.
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leave pane mode before sending; each tmux operation is bounded.
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — argv that sends keys into an agent pane through src/tmux-pane-keys.sh, which leaves any pane mode first and bounds the send; Python callers run it with their own runner.

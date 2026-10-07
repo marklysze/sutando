@@ -31,6 +31,7 @@ case " $* " in *" capture-pane "*)
     [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
   done
   printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
+case " $* " in *" send-keys "*" Escape "*) [ -n "${TMUX_HANG_ESCAPE:-}" ] && exec sleep 60;; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
@@ -140,4 +141,12 @@ rm -f "$GREC"; rc=$(run haiku --dry-run); [ "$rc" = 0 ] && [ ! -e "$GREC" ] && o
 rm -f "$GREC"; rc=$(TMUX_DIALOG=1 TMUX_ACCEPT_AS=haiku run opus --confirm --accept-timeout 1)
 [ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && ok "40 confirmed but not accepted: attribution kept, claim window closed at exit" || fail "40" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 40 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+rm -f "$GREC" "$T/state/model-switch.json"
+rc=$(TMUX_DIALOG=1 TMUX_HANG_ESCAPE=1 run opus)
+[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && [ ! -e "$T/state/model-switch.json" ] && grep -q 'cancel failed (rc=124)' "$T/err" && ! grep -q 'Dialog cancelled' "$T/err" \
+  && ok "41 Escape timeout: failed cancellation keeps attribution with a closed claim window" || fail "41" "rc=$rc $(cat "$T/err")"
+: > "$TMUX_LOG"
+TMUX_HANG_ESCAPE=1 bash "$HERE/skills/model-switch/scripts/pane-observe.sh" sutando-core --socket "$T/x.sock" --cancel > "$T/out" 2> "$T/err"; rc=$?
+[ "$rc" = 124 ] && ! grep -q CANCELLED "$T/out" && ok "42 pane observer propagates Escape timeout without claiming cancellation" || fail "42" "rc=$rc $(cat "$T/out")"
+
+echo; [ $fails -eq 0 ] && echo "switch-model: all 42 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

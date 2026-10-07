@@ -14675,7 +14675,7 @@ def _default_cron_nudge(
         send = subprocess.run(
             # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
             tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
-            env=env, capture_output=True, timeout=15,
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:

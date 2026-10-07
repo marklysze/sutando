@@ -103,7 +103,12 @@ case "$VERDICT" in
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null; CANCEL_RC=$?
+      if [ "$CANCEL_RC" != 0 ]; then
+        "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2
+        exit 8
+      fi
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
       echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
     fi;;
