@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO / 'packages' / 'ag2-sparrow'))
 from ag2_sparrow import outbox, remote_gateway_bridge as gw, undelivered_quarantine
 from ag2_sparrow.delivery_core import DeliveryCore, DesignAClaimBackend, RetryPolicy, DrainStatus
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceResultProvider
+from ag2_sparrow.delivery_core import ProviderPermanentRefused
 
 ROOM = '!same:ag2.space'
 HOLDER = 'task-holder'
@@ -57,6 +58,7 @@ class RecoveryTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.server = Gateway()
+        self.policy_outbox = outbox
         self.results = self.root / 'results'
         self.tasks = self.root / 'tasks'
         self.results.mkdir()
@@ -66,7 +68,7 @@ class RecoveryTest(unittest.TestCase):
 
     def core(self, timed=True):
         backend = DesignAClaimBackend(
-            self.outbox, retry_schedule=outbox.RetrySchedule() if timed else None,
+            self.outbox, retry_schedule=self.policy_outbox.RetrySchedule() if timed else None,
             clock=lambda: self.server.now)
         return DeliveryCore(backend, AG2SpaceResultProvider(self.server.request),
                             RetryPolicy(max_attempts=5, defer_idempotent_resend=timed))
@@ -313,6 +315,60 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(len(self.server.calls), 1)
         self.assertEqual(outbox.read_item(self.outbox, HOLDER)['reason'], 'outcome-unknown')
 
+    def test_invalid_retry_configuration_is_rejected(self):
+        for config in ({'window_s': float('nan')}, {'initial_delay_s': 0},
+                       {'initial_delay_s': 31}, {'window_s': 29}):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                self.policy_outbox.RetrySchedule(**config)
+
+    def test_failure_finishing_after_deadline_retains_terminal_answer(self):
+        core = self.core()
+        def stalled(method, path, payload):
+            self.server.now += 601
+            raise urllib.error.HTTPError('https://gateway.invalid', 503, 'outage', None, None)
+        core.provider._request = stalled
+        self.deliver(core)
+        record = outbox.read_item(self.outbox, HOLDER)
+        self.assertEqual(record['status'], 'PARKED')
+        self.assertEqual(record['reason'], 'retry-window-exhausted')
+        self.assertEqual(json.loads(record['payload'])['body'], 'Existing answer')
+
+    def test_holder_markers_require_receipt_and_destination_evidence(self):
+        for record, body, live, expected in (
+            (None, '[no-send]', True, 'missing'),
+            (None, '[REPLIED]', False, 'missing'),
+            ({'status': 'DELIVERED'}, '[REPLIED]', False, 'accepted'),
+            ({'status': 'PARKED'}, 'Existing answer', True, 'failed'),
+            (None, '[channel: !other:ag2.space]\nExisting answer', True, 'failed'),
+        ):
+            with self.subTest(body=body, record=record):
+                self.assertEqual(gw.classify_holder_delivery(record, body, live), expected)
+
+    def test_unverified_holder_metadata_reports_without_reasking(self):
+        self.bridge()
+        self.seed_duplicates()
+        (self.tasks / f'{HOLDER}.txt').unlink()
+        action, body, room = gw._dedup_plan('task-duplicate1', HOLDER)
+        self.assertEqual(action, 'report')
+        self.assertIn('could not be verified', body)
+        self.assertEqual(len(list(self.tasks.glob('task-*.txt'))), 2)
+
+    def test_invalid_holder_identity_and_payload_fail_closed(self):
+        core = self.bridge()
+        self.assertEqual(gw._holder_delivery_state('../holder'), 'failed')
+        with patch.object(gw, '_delivery_tid', return_value=None):
+            self.assertEqual(gw._holder_delivery_state(HOLDER), 'failed')
+        core.backend.publish(HOLDER, b'{broken')
+        self.assertEqual(gw._holder_delivery_state(HOLDER), 'failed')
+        self.assertEqual(self.server.calls, [])
+
+    def test_malformed_envelopes_are_terminal_before_network_io(self):
+        provider = AG2SpaceResultProvider(self.server.request)
+        for payload in (b'\xff', b'{broken', b'[]', b'{}'):
+            with self.subTest(payload=payload), self.assertRaises(ProviderPermanentRefused):
+                provider.deliver(HOLDER, payload, HOLDER)
+        self.assertEqual(self.server.calls, [])
+
     def test_invalid_retry_state_parks_without_resetting_budget(self):
         core = self.core()
         self.server.available_at += 120
@@ -437,6 +493,27 @@ print('pending:', sorted(inflight))
         (self.results / 'archive').mkdir()
         (self.results / f'{HOLDER}.txt').rename(self.results / 'archive' / f'{HOLDER}-123.txt')
         self.assertEqual(gw._dedup_plan('task-duplicate1', HOLDER)[0], 'report')
+
+
+class CanonicalRecoveryTest(RecoveryTest):
+    """The same recovery contract exercises the canonical shared policy writers."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(REPO / 'src'))
+        self.addCleanup(lambda: sys.path.remove(str(REPO / 'src')))
+        import outbox as canonical_outbox
+        import dedup_recovery as canonical_dedup
+        self.policy_outbox = canonical_outbox
+        from ag2_sparrow.delivery_core import backend_a
+        for module, name, value in (
+            (backend_a, 'outbox', canonical_outbox),
+            (gw, 'plan_dedup_recovery', canonical_dedup.plan_dedup_recovery),
+            (gw, 'classify_holder_delivery', canonical_dedup.classify_holder_delivery),
+        ):
+            override = patch.object(module, name, value)
+            override.start()
+            self.addCleanup(override.stop)
 
 
 if __name__ == '__main__':
