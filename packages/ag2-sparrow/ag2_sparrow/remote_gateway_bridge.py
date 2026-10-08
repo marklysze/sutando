@@ -4423,8 +4423,9 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["metadata"] = {"worker_id": worker}
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
-    accepted = read_item(core.backend.root, broker_tid) or {}
-    item_id = f"{broker_tid}.lease-close" if no_send and accepted.get("status") == "DELIVERED" else broker_tid
+    accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
+    item_id = (f"{broker_tid}.lease-close"
+               if accepted.get("status") == "DELIVERED" else broker_tid)
     if item_id != broker_tid:
         core.backend.publish(item_id, payload, republish_delivered=True)
     else:
