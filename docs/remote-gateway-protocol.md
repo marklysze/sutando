@@ -286,7 +286,8 @@ response defers the idempotent resend to the next scheduled attempt. The answer
 and broker result ID remain the same. No agent task is created to regenerate
 an answer because its POST failed.
 
-HTTP 408, 429, 5xx and transport failures are retryable. Other 4xx responses,
+HTTP 401/403 (while polling recovers authentication), 408, 425, 429, 5xx and
+transport failures are retryable. Other 4xx responses,
 malformed envelopes and explicit decline envelopes are permanent refusals and
 park on the first attempt. This policy applies to the gateway **task-result**
 leg only; proactive room sends and other providers keep their existing retry
@@ -295,11 +296,14 @@ park an ambiguous outcome rather than retrying it automatically.
 
 The outbox item stores its start, absolute deadline, next eligible time and
 failure count atomically under the delivery claim lock. A restart retains these
-values; time spent stopped consumes the window. Scheduling uses Unix wall time.
+values; time spent stopped consumes the window. At least five failed sends are
+required before expiry parks an answer, so sparse orphan sweeps and laptop sleep
+do not reduce recovery to a single attempt. Scheduling uses Unix wall time; clock
+adjustments can shorten or extend the window, while the minimum remains intact.
 A crashed claim owner is recovered by the existing owner-liveness/TTL protocol
 (up to its 300-second reclaim delay), without stealing an active sender's claim.
-An attempt already in progress at the deadline can finish; no new attempt
-starts after the deadline. Invalid schedule state parks visibly instead of
+An attempt already in progress at the deadline can finish. After the deadline,
+remaining minimum attempts still use backoff; further failures park the answer. Invalid schedule state parks visibly instead of
 silently granting a fresh budget.
 
 Success means **accepted by the gateway**, including result-ID deduplication and

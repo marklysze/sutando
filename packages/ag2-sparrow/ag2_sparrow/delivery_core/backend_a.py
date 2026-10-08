@@ -72,6 +72,7 @@ class DesignAClaimBackend:
                         self.root, item_id, self.reclaim_ttl_s):
                     outbox._release_locked(self.root, item_id, rec.drainer_id)
                 return None
+            # A live sender owns timing too; do not expire its retry record.
             rec = outbox.read_delivery_claim(self.root, item_id)
             if rec is not None and not outbox.may_reclaim_delivery(
                     self.root, item_id, self.reclaim_ttl_s):

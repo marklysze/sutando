@@ -9,6 +9,8 @@ import json
 import urllib.error
 from typing import Callable, Optional
 
+from ..send_failure_policy import is_retryable_http_status
+
 from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
                        ProviderCapabilities, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused)
@@ -39,8 +41,8 @@ class AG2SpaceResultProvider:
         try:
             resp = self._request("POST", RESULTS_PATH, envelope) or {}
         except urllib.error.HTTPError as e:
-            # Request timeout and throttling can recover; other 4xx cannot.
-            if 400 <= e.code < 500 and e.code not in (408, 429):
+            # The bridge refreshes credentials through its polling loop.
+            if not is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderPermanentRefused(
                     f"gateway refused {item_id}: HTTP {e.code}") from e
             raise ProviderIndeterminate(

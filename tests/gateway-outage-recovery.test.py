@@ -181,6 +181,9 @@ class RecoveryTest(unittest.TestCase):
         self.server.available_at += 900
         inflight = {HOLDER}
         gw._post_ready_results(inflight)
+        for _ in range(4):
+            self.next_attempt()
+            gw._post_ready_results(inflight)
         deadline = outbox.read_item(self.outbox, HOLDER)['retry']['deadline']
         with patch.object(gw, '_DELIVERY_CORE', self.core()):
             self.server.now = deadline
@@ -197,7 +200,7 @@ class RecoveryTest(unittest.TestCase):
         self.assertFalse(inflight)
 
     def test_permanent_failures_park_immediately(self):
-        for code in (400, 401, 403, 404, 409, 410, 422):
+        for code in (400, 404, 409, 410, 422):
             with self.subTest(code=code):
                 self.outbox = self.results / f'.outbox-{code}'
                 self.server.code = code
@@ -205,13 +208,74 @@ class RecoveryTest(unittest.TestCase):
                 self.deliver(core)
                 self.assertTrue(core.backend.is_terminal(HOLDER))
                 self.assertEqual(outbox.read_item(self.outbox, HOLDER)['reason'], 'permanent-refusal')
-        for code in (408, 429, 500, 502, 503, 504):
+        for code in (401, 403, 408, 425, 429, 500, 502, 503, 504, 520):
             with self.subTest(retryable=code):
                 self.outbox = self.results / f'.outbox-{code}'
                 self.server.code = code
                 core = self.core()
                 self.deliver(core)
                 self.assertFalse(core.backend.is_terminal(HOLDER))
+
+    def test_auth_and_early_data_failures_recover_without_quarantine(self):
+        for code in (401, 403, 425):
+            with self.subTest(code=code):
+                self.outbox = self.results / f'.auth-{code}'
+                self.server.code = code
+                core = self.core()
+                self.deliver(core)
+                self.assertFalse(core.backend.is_terminal(HOLDER))
+                self.server.code = None
+                self.next_attempt()
+                self.deliver(self.core())
+                self.assertEqual(outbox.read_item(self.outbox, HOLDER)['status'], 'DELIVERED')
+
+    def test_sleep_past_deadline_still_recovers_existing_answer(self):
+        core = self.core()
+        self.server.available_at += 601
+        self.deliver(core)
+        self.server.now += 601
+        self.deliver(self.core())
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER)['status'], 'DELIVERED')
+        self.assertEqual(len(self.server.calls), 2)
+        self.assertEqual(len(self.server.replies), 1)
+
+    def test_legacy_retry_record_retains_minimum_and_post_deadline_backoff(self):
+        self.server.code = 503
+        self.deliver(self.core())
+        record = outbox.read_item(self.outbox, HOLDER)
+        record['retry'].pop('min_attempts')
+        with self.policy_outbox._item_lock(self.outbox, HOLDER):
+            self.policy_outbox._write_item(self.outbox, HOLDER, record)
+        self.server.now += 601
+        self.deliver(self.core())
+        self.assertEqual(len(self.server.calls), 2)
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER)['status'], 'READY')
+        self.deliver(self.core())
+        self.assertEqual(len(self.server.calls), 2)
+        self.next_attempt()
+        self.server.code = None
+        self.deliver(self.core())
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER)['status'], 'DELIVERED')
+
+    def test_wait_keeps_dependent_and_holder_leases_in_heartbeat_set(self):
+        self.bridge()
+        self.seed_duplicates()
+        self.server.available_at += 120
+        inflight = {'task-duplicate1', 'task-duplicate2'}
+        gw._post_ready_results(inflight)
+        self.assertTrue({'task-duplicate1', 'task-duplicate2', HOLDER} <= inflight)
+
+    def test_sparse_sweeps_get_five_attempts_then_park(self):
+        self.server.code = 503
+        for attempt in range(5):
+            self.deliver(self.core())
+            self.assertEqual(len(self.server.calls), attempt + 1)
+            record = outbox.read_item(self.outbox, HOLDER)
+            self.assertEqual(record['status'], 'PARKED' if attempt == 4 else 'READY')
+            self.server.now += 601
+        self.assertIs(self.deliver(self.core()).status, DrainStatus.TERMINAL)
+        self.assertEqual(len(self.server.calls), 5)
+        self.assertEqual(record['reason'], 'retry-window-exhausted')
 
     def test_pending_duplicates_wait_restart_then_close_each_lease(self):
         self.bridge()
@@ -320,7 +384,8 @@ class RecoveryTest(unittest.TestCase):
 
     def test_invalid_retry_configuration_is_rejected(self):
         for config in ({'window_s': float('nan')}, {'initial_delay_s': 0},
-                       {'initial_delay_s': 31}, {'window_s': 29}):
+                       {'initial_delay_s': 31}, {'window_s': 29},
+                       {'min_attempts': 0}, {'min_attempts': True}, {'min_attempts': 1.5}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 self.policy_outbox.RetrySchedule(**config)
 
@@ -330,7 +395,9 @@ class RecoveryTest(unittest.TestCase):
             self.server.now += 601
             raise urllib.error.HTTPError('https://gateway.invalid', 503, 'outage', None, None)
         core.provider._request = stalled
-        self.deliver(core)
+        for _ in range(5):
+            self.deliver(core)
+            self.next_attempt()
         record = outbox.read_item(self.outbox, HOLDER)
         self.assertEqual(record['status'], 'PARKED')
         self.assertEqual(record['reason'], 'retry-window-exhausted')
@@ -473,7 +540,7 @@ print('pending:', sorted(inflight))
         core = self.bridge()
         self.seed_duplicates()
         gw._post_ready_results({HOLDER})
-        self.server.code = 403
+        self.server.code = 422
         inflight = {'task-duplicate1', 'task-duplicate2'}
         gw._post_ready_results(inflight)
         gw._post_ready_results(inflight)
