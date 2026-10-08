@@ -170,7 +170,7 @@ clear_automation_leftover() {
   target="$(core_target)" || return 1
   pane="$(tmux -S "$TMUX_SOCKET" capture-pane -e -p -t "$target" 2>/dev/null)" || return 1
   leftover="$(printf '%s\n' "$pane" | "$NOTIFIER_PY" "$PANE_GATE_PY" leftover --runtime codex --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || return 1
-  tmux -S "$TMUX_SOCKET" send-keys -t "$target" C-a C-k || return 1
+  bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-a C-k || return 1
   log_notifier "cleared rejected automation input '$leftover' from the composer"
 }
 
