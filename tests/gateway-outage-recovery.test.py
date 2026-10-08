@@ -334,6 +334,41 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(outbox.read_item(self.outbox, HOLDER), record)
         self.assertEqual(len(self.server.calls), 1)
 
+    def test_accepted_redeliveries_close_each_lease_without_republishing_answer(self):
+        self.bridge()
+        self.task(HOLDER)
+        self.assertTrue(gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer'))
+        receipt = outbox.read_item(self.outbox, HOLDER)
+        for _ in range(2):
+            self.assertTrue(gw._deliver_result_payload(HOLDER, HOLDER, '[no-send]', no_send=True))
+            self.assertEqual(outbox.read_item(self.outbox, HOLDER), receipt)
+        self.assertEqual(len(self.server.calls), 3)
+        self.assertEqual(len(self.server.replies), 1)
+        self.assertTrue(all(p['id'] == HOLDER for p in self.server.calls))
+        self.assertTrue(all(p.get('no_send') is True for p in self.server.calls[1:]))
+
+    def test_lease_close_retry_and_quarantine_preserve_original_receipt(self):
+        self.bridge()
+        self.task(HOLDER)
+        gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer')
+        receipt = outbox.read_item(self.outbox, HOLDER)
+        result = self.results / f'{HOLDER}.txt'
+        result.write_text('[no-send]')
+        self.server.code = 503
+        self.assertFalse(gw._deliver_result_payload(HOLDER, HOLDER, '[no-send]', no_send=True))
+        control = f'{HOLDER}.lease-close'
+        retry = outbox.read_item(self.outbox, control)['retry']
+        with patch.object(gw, '_DELIVERY_CORE', self.core()):
+            self.server.now = retry['next_attempt_at']
+            self.server.code = 422
+            self.assertFalse(gw._deliver_result_payload(HOLDER, HOLDER, '[no-send]', no_send=True))
+            with patch.object(gw, '_log') as log:
+                self.assertFalse(gw._deliver_result_payload(
+                    HOLDER, HOLDER, '[no-send]', no_send=True, result_file=result))
+                self.assertIn(f'requeue {control} --reset-attempts', log.call_args.args[0])
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER), receipt)
+        self.assertEqual(len(self.server.replies), 1)
+
     def test_reasked_holder_retains_receipt_identity_for_waiting_duplicate(self):
         self.bridge()
         self.seed_duplicates()

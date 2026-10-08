@@ -212,15 +212,16 @@ def main() -> int:
     real_after = [r for r in STATE["results"] if not str(r.get("body", "")).startswith("[no-send]")]
     marker_after = [r for r in STATE["results"] if str(r.get("body", "")).startswith("[no-send]")]
     # Gateway acceptance already closed the lease; the reconnect still ACKs.
-    check(len(real_after) == 1 and len(STATE["results"]) == results_before,
+    check(len(real_after) == 1 and len(STATE["results"]) == results_before + 1,
           "exactly ONE real result across the whole cycle — no duplicate delivery")
-    check(not marker_after and rtc.read_item(
+    check(len(marker_after) == 1 and marker_after[0].get("no_send") is True
+          and rtc.read_item(
           rtc._delivery_core().backend.root, "task-E2E1") == receipt_before,
-          "redelivery preserves gateway acceptance without republishing a control result")
+          "redelivery POSTs a lease-close control while preserving the accepted receipt")
     check(rtc._load_inflight() == set(), "inflight empty after recovery (no leaked in-flight)")
     log("gateway", f"final: tasks_served={STATE['tasks_served']}, acks={len(STATE['acks'])}, "
                     f"real_results={len(real_after)}, marker_results={len(marker_after)}")
-    log("result", "redelivery re-ACKed; accepted receipt retained; marker archived")
+    log("result", "redelivery re-ACKed and lease-close control POSTed; original receipt retained")
 
     srv.shutdown()
     print()

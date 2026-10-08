@@ -4152,7 +4152,7 @@ def _delivery_core() -> DeliveryCore:
     return _DELIVERY_CORE
 
 
-def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
+def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None) -> None:
     """Move a result the outbox has finally refused into results/undelivered/,
     the same quarantine the proactive path uses. Without this the file is
     rescanned every pass and the refusal is invisible.
@@ -4166,7 +4166,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str) -> None:
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
              f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
-             f"requeue {_broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
+             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except OSError as e:
         _log(f"result {tid}: {why} but quarantine failed ({e}) — "
@@ -4423,28 +4423,33 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["metadata"] = {"worker_id": worker}
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
-    core.backend.publish(broker_tid, payload)   # False = already live: retry pass
-    res = core.deliver_one(broker_tid, payload)
+    accepted = read_item(core.backend.root, broker_tid) or {}
+    item_id = f"{broker_tid}.lease-close" if no_send and accepted.get("status") == "DELIVERED" else broker_tid
+    if item_id != broker_tid:
+        core.backend.publish(item_id, payload, republish_delivered=True)
+    else:
+        core.backend.publish(item_id, payload)
+    res = core.deliver_one(item_id, payload)
     if res.status is DrainStatus.TERMINAL:
-        record = read_item(core.backend.root, broker_tid) or {}
+        record = read_item(core.backend.root, item_id) or {}
         if record.get("status") == "DELIVERED":
             return True
         # The outbox has decided this item; no pass will ever claim it again,
         # so retrying logs forever and hides the failure behind "will retry".
         why = (f"outbox item is terminal: {record.get('reason')} after "
-               f"{core.backend.attempts(broker_tid)} attempt(s)")
+               f"{core.backend.attempts(item_id)} attempt(s)")
         if result_file is not None:
-            _quarantine_undelivered(result_file, tid, why)
+            _quarantine_undelivered(result_file, tid, why, outbox_item_id=item_id)
         else:
             _log(f"result {tid}: {why} — not retrying")
         return False
     if res.status is DrainStatus.NOT_CLAIMED:
         # A dead prior incarnation's claim; reclaim-TTL recovers it, and
         # with an idempotent provider nothing parks on ambiguity.
-        record = read_item(core.backend.root, broker_tid) or {}
+        record = read_item(core.backend.root, item_id) or {}
         retry = record.get("retry", {})
         _log(f"result {tid}: pending retry or delivery claim "
-             f"(attempts={core.backend.attempts(broker_tid)}, "
+             f"(attempts={core.backend.attempts(item_id)}, "
              f"next={retry.get('next_attempt_at')}, deadline={retry.get('deadline')})")
         return False
     if res.outcome is CoreDeliveryOutcome.CONFIRMED:
@@ -4455,7 +4460,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
         return True
-    record = read_item(core.backend.root, broker_tid) or {}
+    record = read_item(core.backend.root, item_id) or {}
     retry = record.get("retry", {})
     _log(f"result POST not confirmed for {tid} "
          f"({res.outcome.value if res.outcome else '?'}: {res.detail}) — "

@@ -31,12 +31,15 @@ class DesignAClaimBackend:
         self.clock = clock
         self.republish_delivered = republish_delivered
 
-    def publish(self, item_id: str, payload: bytes) -> bool:
+    def publish(self, item_id: str, payload: bytes, *,
+                republish_delivered: Optional[bool] = None) -> bool:
+        allow_republish = (self.republish_delivered if republish_delivered is None
+                           else republish_delivered)
         with outbox._item_lock(self.root, item_id):
             if outbox._item_path(self.root, item_id).exists():
                 # DELIVERED = completed lifecycle -> fresh cycle (C-parity);
                 # PARKED stays refused: the operator holds it.
-                if (not self.republish_delivered
+                if (not allow_republish
                         or outbox._read_item(self.root, item_id).get("status") != "DELIVERED"):
                     return False
                 if outbox.read_delivery_claim(self.root, item_id) is not None:

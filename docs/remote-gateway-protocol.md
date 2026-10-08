@@ -307,7 +307,13 @@ remaining minimum attempts still use backoff; further failures park the answer. 
 silently granting a fresh budget.
 
 The gateway outbox preserves an accepted record when an unarchived result is
-seen again after a crash; it does not start another delivery cycle. Retries use
+seen again after a crash; it does not start another answer delivery cycle.
+If the broker redelivers an accepted task, the bridge re-ACKs it and POSTs a
+structured `no_send` lease-close control through a separate outbox item. The
+original accepted answer and receipt stay intact. Repeated redeliveries can
+start another control cycle; failed controls retain the usual bounded retry
+schedule. The broker must finalize duplicate results as well as fresh results
+for this control to clear a lingering lease. Retries use
 the originally published payload even if the caller rebuilds different text.
 Accepted re-ask aliases remain available so waiting dependents resolve the
 holder's broker receipt after its result is archived. Abandoned torn claims
