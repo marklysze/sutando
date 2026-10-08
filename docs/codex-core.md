@@ -77,7 +77,21 @@ waiting on an output pipe after the client exits. Killing a client does not with
 a request already queued with a stopped server, so the send runs inside `if-shell`
 only if tmux can claim a one-time ticket file when it executes; on timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
-returned 124 sends nothing. Explicit typing failures with
+returned 124 sends nothing. If the ticket was already claimed at timeout, the
+outcome is uncertain: status 125 retains a socket-wide send lock at
+`<socket>.pane-keys-lock`. Every caller must acquire that same atomic lock before
+probing or sending, so retries, Enter and recovery keys cannot reach the server
+while an uncertain send is outstanding. An interrupted sender also retains the
+lock once sending starts. A concurrent send is refused with 125 until the active
+sender releases the lock; ordinary successful sends remove it automatically.
+
+An uncertain send blocks automation on every pane of that socket. To recover,
+stop the old tmux server, reconcile the affected task and composer (the send may
+have applied), and remove the empty lock directory with
+`rmdir "${SUTANDO_TMUX_SOCKET}.pane-keys-lock"` before starting a fresh server.
+Do not clear the lock while an old request can still run. This state is tied to
+the IPC socket, survives notifier restarts, and is never cleared by a retry.
+Explicit typing failures with
 no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
 also defers after the configured confirmation retries. An unobservable successful
 send keeps the existing advisory behavior. A race with scrolling can leave the

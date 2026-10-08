@@ -226,7 +226,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`telegram-bridge.py`** — Telegram bridge for Sutando — polls bot messages, writes to tasks/, sends replies from results/.
 - **`telemetry.py`** — Anonymous, opt-out product telemetry for Sutando (PostHog).
 - **`tmp-paths.ts`** — Shared cross-platform temp-file paths used by both writers and readers.
-- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leave pane mode before sending; each tmux operation is bounded.
+- **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leave pane mode before sending; bounded operations.
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
 - **`tmux_pane_keys.py`** — argv that sends keys into an agent pane through src/tmux-pane-keys.sh, which leaves any pane mode first and bounds the send; Python callers run it with their own runner.

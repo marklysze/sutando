@@ -278,6 +278,7 @@ deliver_prompt() {
     type_rc=0
     bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- -l -- "$prompt" || type_rc=$?
     [ "$type_rc" = 0 ] || log_notifier "typing $filename failed (rc $type_rc); counted as a failed attempt"
+    [ "$type_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
     stage_checks=0
     while [ "$stage_checks" -lt 4 ]; do
       sleep "$POLL_INTERVAL"
@@ -300,6 +301,7 @@ deliver_prompt() {
   submit_rc=0
   target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
   [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
+  [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   # Nothing observable staged: the submit is sent and unverifiable — never
   # re-press C-m blind into a live session.
   [ "$staged" = 1 ] || return "$submit_rc"
@@ -323,6 +325,7 @@ deliver_prompt() {
     submit_rc=0
     target="$(core_target)" && bash "$REPO/src/tmux-pane-keys.sh" -S "$TMUX_SOCKET" -t "$target" -- C-m || submit_rc=$?
     [ "$submit_rc" = 0 ] || log_notifier "C-m for $filename failed (rc $submit_rc)"
+    [ "$submit_rc" != 125 ] || { log_notifier "delivery of $filename blocked pending socket recovery; not retrying"; return 125; }
   done
 }
 
@@ -339,7 +342,7 @@ task_payload() {
 }
 
 submit_task() {
-  local filename="$1" wait_for_result="${2:-0}" prompt started
+  local filename="$1" wait_for_result="${2:-0}" prompt started delivery_rc=0
   case "$filename" in
     ""|*/*|*..*) return 0 ;;
   esac
@@ -380,8 +383,14 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if ! deliver_prompt "$filename" "$prompt"; then
+  deliver_prompt "$filename" "$prompt" || delivery_rc=$?
+  if [ "$delivery_rc" != 0 ]; then
     clear_workstream_context
+    if [ "$delivery_rc" = 125 ]; then
+      log_notifier "delivery blocked for $filename until socket recovery; task retained, automatic sends refused"
+      [ "$wait_for_result" = 1 ] && return 0
+      return 125
+    fi
     if [ "$wait_for_result" = "1" ]; then
       log_notifier "deferring $filename: delivery was not confirmed, will retry on the next idle cycle"
       return 0

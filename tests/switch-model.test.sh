@@ -36,7 +36,7 @@ case " $* " in *" send-keys "*" Escape "*) [ -n "${TMUX_HANG_ESCAPE:-}" ] && exe
 exit 0
 SH
 chmod +x "$T/bin/tmux"
-export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="/tmp/sutando-tmux.sock"
+export PATH="$T/bin:$PATH" TMUX_LOG="$T/tmux.log" SUTANDO_TMUX_SOCKET="$T/default.sock"
 printf '{"model":"claude-opus-5","permissions":{"allow":["Bash"]}}\n' > "$T/cfg/settings.json"; SETTINGS_BEFORE="$(cat "$T/cfg/settings.json")"
 fails=0; ok(){ echo "  ok   $1"; }; fail(){ echo "  FAIL $1 — $2"; fails=$((fails+1)); }
 run(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.caps"; "$HERE/scripts/switch-model.sh" --accept-timeout 3 "$@" --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?; }
@@ -144,10 +144,10 @@ rm -f "$GREC"; rc=$(TMUX_DIALOG=1 TMUX_ACCEPT_AS=haiku run opus --confirm --acce
 
 rm -f "$GREC" "$T/state/model-switch.json"
 rc=$(TMUX_DIALOG=1 TMUX_HANG_ESCAPE=1 run opus)
-[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && [ ! -e "$T/state/model-switch.json" ] && grep -q 'cancel failed (rc=124)' "$T/err" && ! grep -q 'Dialog cancelled' "$T/err" \
+[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && [ ! -e "$T/state/model-switch.json" ] && grep -q 'cancel failed (rc=125)' "$T/err" && ! grep -q 'Dialog cancelled' "$T/err" \
   && ok "41 Escape timeout: failed cancellation keeps attribution with a closed claim window" || fail "41" "rc=$rc $(cat "$T/err")"
 : > "$TMUX_LOG"
 TMUX_HANG_ESCAPE=1 bash "$HERE/skills/model-switch/scripts/pane-observe.sh" sutando-core --socket "$T/x.sock" --cancel > "$T/out" 2> "$T/err"; rc=$?
-[ "$rc" = 124 ] && ! grep -q CANCELLED "$T/out" && ok "42 pane observer propagates Escape timeout without claiming cancellation" || fail "42" "rc=$rc $(cat "$T/out")"
+[ "$rc" = 125 ] && ! grep -q CANCELLED "$T/out" && ! grep -q "send-keys" "$TMUX_LOG" && ok "42 pane observer refuses cancellation on the retained uncertainty lock" || fail "42" "rc=$rc $(cat "$T/out")"
 
 echo; [ $fails -eq 0 ] && echo "switch-model: all 42 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

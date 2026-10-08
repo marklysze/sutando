@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...>
-# Leave pane mode before sending; each tmux operation is bounded. Exit: command status, 124 timeout, 2 usage.
+# Leave pane mode before sending; bounded operations. Exit: status, 124 revoked timeout, 125 uncertain/busy, 2 usage.
 
 # Copy-mode letters can open a command-prompt that blocks the sending client.
 set -u
@@ -20,8 +20,19 @@ case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seco
 
 [ "$((10#$TIMEOUT))" -gt 0 ] || { echo "tmux-pane-keys: --timeout must be positive" >&2; exit 2; }
 source "$(dirname "${BASH_SOURCE[0]}")/bounded-wait.sh"
+LOCK="$SOCK.pane-keys-lock"
+if ! mkdir -m 700 "$LOCK" 2>/dev/null; then
+  if [ -d "$LOCK" ]; then
+    echo "tmux-pane-keys: sends blocked by $LOCK (active or uncertain send); recover before retrying" >&2
+    exit 125
+  fi
+  echo "tmux-pane-keys: cannot acquire send lock $LOCK" >&2
+  exit 1
+fi
+KEEP_LOCK=0
+WORK=""
+trap 'rm -rf "$WORK"; [ "$KEEP_LOCK" = 1 ] || rmdir "$LOCK"' EXIT
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-pane-keys.XXXXXX")" || exit 1
-trap 'rm -rf "$WORK"' EXIT
 TIMEOUT_FLAG="$WORK/timed-out"
 
 # Output goes to files, never to a pipe anyone waits on: a client killed while its server is
@@ -56,9 +67,14 @@ for key in "$@"; do
   case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
   SEND="$SEND $(tmux_quote "$key")"
 done
+# An interrupted helper must leave the socket fenced if the server may have claimed its ticket.
+KEEP_LOCK=1
 bounded if-shell "mv '$TICKET' '$TICKET.claimed'" "$SEND"; rc=$?
 if [ "$rc" = 124 ] && ! rm "$TICKET" 2>/dev/null; then
-  echo "tmux-pane-keys: the send to $TARGET was already running when the bound expired; it may have partly applied" >&2
+  echo "tmux-pane-keys: uncertain send to $TARGET; sends remain blocked by $LOCK until recovery" >&2
+  rc=125
+else
+  KEEP_LOCK=0
 fi
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"

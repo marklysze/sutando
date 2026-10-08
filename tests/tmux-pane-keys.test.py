@@ -127,15 +127,90 @@ class StoppedServer(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(Path(self.bytes).read_bytes(), text.encode() + b"end;\x7f\x7f\r")
 
+    def test_stopped_after_claim_refuses_retries_even_after_server_resumes(self):
+        bin_dir = Path(self.dir) / "bin"
+        bin_dir.mkdir()
+        claimed = Path(self.dir) / "claimed"
+        mv = bin_dir / "mv"
+        mv.write_text(f'''#!/bin/sh
+"{shutil.which('mv')}" "$@" || exit $?
+touch "{claimed}"
+kill -STOP {self.pid}
+''')
+        mv.chmod(0o755)
+        subprocess.run(["tmux", "-S", self.sock, "set-environment", "-g", "PATH",
+                        str(bin_dir) + ":" + os.environ["PATH"]], check=True)
+        r = run("-S", self.sock, "-t", "=t:0", "--timeout", "1", "--", "-l", "--", "FIRST", timeout=8)
+        self.assertTrue(claimed.exists())
+        self.assertEqual(r.returncode, 125, r.stderr)
+        before = self.landed_after_resume()
+        retry = run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", "UNSAFE-RETRY")
+        self.assertEqual(retry.returncode, 125, retry.stderr)
+        time.sleep(0.3)
+        self.assertEqual(Path(self.bytes).read_text(), before)
+        subprocess.run(["tmux", "-S", self.sock, "set-environment", "-g", "PATH", os.environ["PATH"]], check=True)
+        Path(self.sock + ".pane-keys-lock").rmdir()
+        recovered = run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", "RECOVERED")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        time.sleep(0.3)
+        self.assertEqual(Path(self.bytes).read_text(), before + "RECOVERED")
+
 
 class Timeout(unittest.TestCase):
+    def test_concurrent_send_is_refused_and_success_releases_the_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock = str(Path(d) / "s")
+            claimed = Path(d) / "claimed"
+            fake = Path(d) / "tmux"
+            fake.write_text(f'''#!/bin/bash
+[ "$3" = display-message ] && {{ echo 0; exit 0; }}
+[ "$3" = if-shell ] && {{ sh -c "$4"; touch '{claimed}'; sleep 1; }}
+''')
+            fake.chmod(0o755)
+            args = ["--tmux", str(fake), "-S", sock, "-t", "=t:0", "--", "Enter"]
+            first = subprocess.Popen(["bash", str(HELPER), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 3
+                while not claimed.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(claimed.exists())
+                self.assertEqual(run(*args).returncode, 125)
+                _, stderr = first.communicate(timeout=5)
+                self.assertEqual(first.returncode, 0, stderr)
+                self.assertFalse(Path(sock + ".pane-keys-lock").exists())
+                self.assertEqual(run(*args).returncode, 0)
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                first.communicate()
+
+    def test_claimed_timeout_blocks_every_later_sender_until_recovery(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock = str(Path(d) / "s")
+            fake = Path(d) / "tmux"
+            log = Path(d) / "calls"
+            fake.write_text(f'''#!/bin/bash
+echo "$*" >> '{log}'
+[ "$3" = display-message ] && {{ echo 0; exit 0; }}
+[ "$3" = if-shell ] && {{ sh -c "$4"; exec sleep 30; }}
+''')
+            fake.chmod(0o755)
+            r = run("--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "1", "--", "Enter")
+            self.assertEqual(r.returncode, 125, r.stderr)
+            calls = log.read_text()
+            for target, key in (("=t:0", "Enter"), ("=other:0", "Escape")):
+                retry = run("--tmux", str(fake), "-S", sock, "-t", target, "--", key)
+                self.assertEqual(retry.returncode, 125, retry.stderr)
+                self.assertEqual(log.read_text(), calls)
+            self.assertTrue(Path(sock + ".pane-keys-lock").is_dir())
+
     def test_a_send_that_never_returns_fails_with_124_inside_the_bound(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "tmux"
             fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 0;; *send-keys*) exec sleep 30;; esac\n')
             fake.chmod(0o755)
             start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=core:0", "--timeout", "1", "--", "-l", "--", "hi")
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=core:0", "--timeout", "1", "--", "-l", "--", "hi")
             self.assertEqual(r.returncode, 124, r.stderr)
             self.assertIn("timed out after 1s", r.stderr)
             self.assertLess(time.monotonic() - start, 5)
@@ -146,13 +221,13 @@ class Timeout(unittest.TestCase):
             log = Path(d) / "log"
             fake.write_text(f'#!/bin/bash\necho "$*" >> {log}\ncase "$*" in *display-message*) echo 1;; *send-keys*) exit 3;; esac\n')
             fake.chmod(0o755)
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--", "Enter")
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
             calls = log.read_text().splitlines()[1:]
-            self.assertEqual(calls[0], "-S /x copy-mode -q -t =c:0")
-            self.assertRegex(calls[1], r"^-S /x if-shell mv '[^']+/ticket' '[^']+/ticket\.claimed' send-keys -t '=c:0' 'Enter'$")
-        self.assertEqual(run("-S", "/x", "-t", "=c:0").returncode, 2)
-        self.assertEqual(run("-S", "/x", "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
+            self.assertEqual(calls[0], f"-S {Path(d) / 's'} copy-mode -q -t =c:0")
+            self.assertRegex(calls[1], rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '[^']+/ticket' '[^']+/ticket\.claimed' send-keys -t '=c:0' 'Enter'$")
+        self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0").returncode, 2)
+        self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
 
     def test_hanging_probe_is_bounded_and_send_still_runs(self):
         with tempfile.TemporaryDirectory() as d:
@@ -160,7 +235,7 @@ class Timeout(unittest.TestCase):
             fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) exec sleep 30;; *send-keys*) echo SENT;; esac\n')
             fake.chmod(0o755)
             start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "SENT")
             self.assertLess(time.monotonic() - start, 4)
@@ -172,7 +247,7 @@ class Timeout(unittest.TestCase):
             fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) sleep 8;; *send-keys*) echo SENT;; esac\n')
             fake.chmod(0o755)
             start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
             self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)
             self.assertLess(time.monotonic() - start, 4)
 
@@ -182,7 +257,7 @@ class Timeout(unittest.TestCase):
             fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 0;; *send-keys*) sleep 8;; esac\n')
             fake.chmod(0o755)
             start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
             self.assertEqual(r.returncode, 124, r.stderr)
             self.assertLess(time.monotonic() - start, 4)
 
@@ -198,7 +273,7 @@ esac
 ''')
             fake.chmod(0o755)
             start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
             self.assertEqual(r.returncode, 124, r.stderr)
             self.assertLess(time.monotonic() - start, 3.5)
             time.sleep(4)
@@ -209,7 +284,7 @@ esac
             fake = Path(d) / "tmux"
             fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 1;; *copy-mode*) exec sleep 30;; *send-keys*) echo SENT;; esac\n')
             fake.chmod(0o755)
-            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
             self.assertEqual(r.returncode, 124, r.stderr)
             self.assertNotIn("SENT", r.stdout)
 
