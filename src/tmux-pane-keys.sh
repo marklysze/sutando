@@ -20,13 +20,16 @@ case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seco
 
 [ "$((10#$TIMEOUT))" -gt 0 ] || { echo "tmux-pane-keys: --timeout must be positive" >&2; exit 2; }
 source "$(dirname "${BASH_SOURCE[0]}")/bounded-wait.sh"
-TIMEOUT_FLAG="$(mktemp "${TMPDIR:-/tmp}/tmux-pane-keys.XXXXXX")" || exit 1
-trap 'rm -f "$TIMEOUT_FLAG"' EXIT
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-pane-keys.XXXXXX")" || exit 1
+trap 'rm -rf "$WORK"' EXIT
+TIMEOUT_FLAG="$WORK/timed-out"
 
+# Output goes to files, never to a pipe anyone waits on: a client killed while its server is
+# stopped leaves its fds with that server, which would hold a pipe open past the bound.
 bounded() {
   local rc
   rm -f "$TIMEOUT_FLAG"
-  run_bounded "$TIMEOUT" "$TIMEOUT_FLAG" -- "$TMUX_BIN" -S "$SOCK" "$@"
+  run_bounded "$TIMEOUT" "$TIMEOUT_FLAG" -- "$TMUX_BIN" -S "$SOCK" "$@" > "$WORK/out" 2> "$WORK/err" < /dev/null
   rc=$?
   if [ -e "$TIMEOUT_FLAG" ]; then
     echo "tmux-pane-keys: $1 to $TARGET timed out after ${TIMEOUT}s" >&2
@@ -35,7 +38,11 @@ bounded() {
   return "$rc"
 }
 
-if [ "$(bounded display-message -p -t "$TARGET" '#{pane_in_mode}' 2>/dev/null)" = 1 ]; then
-  bounded copy-mode -q -t "$TARGET" || exit $?
+if bounded display-message -p -t "$TARGET" '#{pane_in_mode}' && [ "$(cat "$WORK/out")" = 1 ]; then
+  bounded copy-mode -q -t "$TARGET"; rc=$?
+  cat "$WORK/err" >&2
+  [ "$rc" = 0 ] || exit "$rc"
 fi
-bounded send-keys -t "$TARGET" "$@"
+bounded send-keys -t "$TARGET" "$@"; rc=$?
+cat "$WORK/out"; cat "$WORK/err" >&2
+exit "$rc"

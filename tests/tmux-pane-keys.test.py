@@ -5,6 +5,7 @@ other caller in src/, skills/ or scripts/ runs send-keys itself."""
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -75,6 +76,26 @@ class RealTmux(unittest.TestCase):
             p.wait()
 
 
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class StoppedServer(unittest.TestCase):
+    def test_a_stopped_tmux_server_cannot_hold_the_helper_past_its_bound(self):
+        d = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        sock = os.path.join(d, "s")
+        subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "t", "cat"], check=True)
+        pid = int(subprocess.run(["tmux", "-S", sock, "display-message", "-p", "#{pid}"],
+                                 capture_output=True, text=True, check=True).stdout)
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            start = time.monotonic()
+            r = run("-S", sock, "-t", "=t:0", "--timeout", "1", "--", "Enter", timeout=12)
+            self.assertEqual(r.returncode, 124, r.stderr)
+            self.assertLess(time.monotonic() - start, 5)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+            subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class Timeout(unittest.TestCase):
     def test_a_send_that_never_returns_fails_with_124_inside_the_bound(self):
         with tempfile.TemporaryDirectory() as d:
@@ -108,6 +129,27 @@ class Timeout(unittest.TestCase):
             r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "SENT")
+            self.assertLess(time.monotonic() - start, 4)
+
+    def test_a_probe_whose_descendant_holds_stdout_cannot_hang_the_helper(self):
+        # A killed client whose server is stopped leaves its fds behind: a child holding stdout is that shape.
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) sleep 8;; *send-keys*) echo SENT;; esac\n')
+            fake.chmod(0o755)
+            start = time.monotonic()
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)
+            self.assertLess(time.monotonic() - start, 4)
+
+    def test_a_send_whose_descendant_holds_stdout_times_out_inside_the_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "tmux"
+            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 0;; *send-keys*) sleep 8;; esac\n')
+            fake.chmod(0o755)
+            start = time.monotonic()
+            r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
+            self.assertEqual(r.returncode, 124, r.stderr)
             self.assertLess(time.monotonic() - start, 4)
 
     def test_term_resistant_send_is_killed_before_it_can_deliver_late(self):
