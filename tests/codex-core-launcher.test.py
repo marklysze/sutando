@@ -260,7 +260,8 @@ exit 0
     def _write_exe(self, name, body):
         path = self.bin / name
         if name == "tmux" and body.startswith("#!/bin/bash\n"):
-            body = body.replace("#!/bin/bash\n", "#!/bin/bash\n" + self._CORE_WINDOW, 1)
+            unwrap = f'. "{REAL_REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
+            body = body.replace("#!/bin/bash\n", "#!/bin/bash\n" + unwrap + self._CORE_WINDOW, 1)
         path.write_text(body)
         path.chmod(0o755)
 

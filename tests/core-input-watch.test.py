@@ -909,7 +909,7 @@ class TestCodexIdleIsNotHung(unittest.TestCase):
         d = tempfile.mkdtemp()
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\n" + body + "\n")
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\n" + body + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d
 
@@ -1021,7 +1021,7 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
                     + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log

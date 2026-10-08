@@ -444,6 +444,7 @@ def _fake_tmux(td: Path, has_rc: int, send_rc: int) -> "tuple[str, Path]":
     script = td / "tmux"
     script.write_text(
         "#!/bin/sh\n"
+        f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
         f'echo "$@" >> "{log}"\n'
         f'case "$*" in *has-session*) exit {has_rc};; *send-keys*) exit {send_rc};; esac\n'
         "exit 0\n"

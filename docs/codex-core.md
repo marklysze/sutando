@@ -73,7 +73,11 @@ Task wakeups leave tmux copy mode before typing. The shared sender bounds the
 mode probe, mode exit and key send separately to 5 seconds, then allows a
 1-second TERM grace before KILL. Each operation buffers stdout and stderr in
 private temporary files, so a stopped tmux server cannot keep the caller
-waiting on an output pipe after the client exits. Explicit typing failures with
+waiting on an output pipe after the client exits. Killing a client does not withdraw
+a request already queued with a stopped server, so the send runs inside `if-shell`
+only if tmux can claim a one-time ticket file when it executes; on timeout the
+sender revokes the ticket first, so a request tmux reaches after the sender has
+returned 124 sends nothing. Explicit typing failures with
 no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
 also defers after the configured confirmation retries. An unobservable successful
 send keeps the existing advisory behavior. A race with scrolling can leave the

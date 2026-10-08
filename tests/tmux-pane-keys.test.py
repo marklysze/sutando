@@ -77,23 +77,55 @@ class RealTmux(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class StoppedServer(unittest.TestCase):
-    def test_a_stopped_tmux_server_cannot_hold_the_helper_past_its_bound(self):
-        d = tempfile.mkdtemp(prefix="pk", dir="/tmp")
-        sock = os.path.join(d, "s")
-        subprocess.run(["tmux", "-S", sock, "new-session", "-d", "-s", "t", "cat"], check=True)
-        pid = int(subprocess.run(["tmux", "-S", sock, "display-message", "-p", "#{pid}"],
-                                 capture_output=True, text=True, check=True).stdout)
-        os.kill(pid, signal.SIGSTOP)
-        try:
-            start = time.monotonic()
-            r = run("-S", sock, "-t", "=t:0", "--timeout", "1", "--", "Enter", timeout=12)
-            self.assertEqual(r.returncode, 124, r.stderr)
-            self.assertLess(time.monotonic() - start, 5)
-        finally:
-            os.kill(pid, signal.SIGCONT)
-            subprocess.run(["tmux", "-S", sock, "kill-server"], capture_output=True)
-            shutil.rmtree(d, ignore_errors=True)
+    """A request queued with a stopped server is not withdrawn by killing its client; once the
+    helper has reported 124, resuming the server must not apply the keys late."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        self.sock = os.path.join(self.dir, "s")
+        self.bytes = os.path.join(self.dir, "bytes")
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "t", "-x", "120", "-y", "20",
+                        f"stty raw -echo; cat > {self.bytes}"], check=True)
+        self.pid = int(subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "#{pid}"],
+                                      capture_output=True, text=True, check=True).stdout)
+        time.sleep(0.3)
+
+    def tearDown(self):
+        os.kill(self.pid, signal.SIGCONT)
+        subprocess.run(["tmux", "-S", self.sock, "kill-server"], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def landed_after_resume(self):
+        os.kill(self.pid, signal.SIGCONT)
+        time.sleep(1.5)
+        return Path(self.bytes).read_text()
+
+    def test_stopped_before_the_call_returns_124_and_nothing_lands_after_resume(self):
+        os.kill(self.pid, signal.SIGSTOP)
+        start = time.monotonic()
+        r = run("-S", self.sock, "-t", "=t:0", "--timeout", "1", "--", "-l", "--", "LATE-MARKER", timeout=12)
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(self.landed_after_resume(), "")
+
+    def test_stopped_just_before_the_send_returns_124_and_nothing_lands_after_resume(self):
+        shim = Path(self.dir) / "tmux"
+        shim.write_text(f'#!/bin/bash\ncase "$*" in *if-shell*|*send-keys*) kill -STOP {self.pid};; esac\nexec tmux "$@"\n')
+        shim.chmod(0o755)
+        r = run("--tmux", str(shim), "-S", self.sock, "-t", "=t:0", "--timeout", "1", "--", "-l", "--", "RACE-MARKER", timeout=12)
+        self.assertEqual(r.returncode, 124, r.stderr)
+        self.assertEqual(self.landed_after_resume(), "")
+
+    def test_a_live_server_receives_the_keys_exactly(self):
+        text = "it's \"x\"; a\\;b $HOME #{pane_id}"
+        self.assertEqual(run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", text).returncode, 0)
+        self.assertEqual(run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", "end\\;").returncode, 0)
+        self.assertEqual(run("-S", self.sock, "-t", "=t:0", "--", "-N", "2", "BSpace").returncode, 0)
+        self.assertEqual(run("-S", self.sock, "-t", "=t:0", "--", "C-m").returncode, 0)
+        time.sleep(0.5)
+        self.assertEqual(Path(self.bytes).read_bytes(), text.encode() + b"end;\x7f\x7f\r")
 
 
 class Timeout(unittest.TestCase):
@@ -116,7 +148,9 @@ class Timeout(unittest.TestCase):
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", "/x", "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
-            self.assertEqual(log.read_text().splitlines()[1:], ["-S /x copy-mode -q -t =c:0", "-S /x send-keys -t =c:0 Enter"])
+            calls = log.read_text().splitlines()[1:]
+            self.assertEqual(calls[0], "-S /x copy-mode -q -t =c:0")
+            self.assertRegex(calls[1], r"^-S /x if-shell mv '[^']+/ticket' '[^']+/ticket\.claimed' send-keys -t '=c:0' 'Enter'$")
         self.assertEqual(run("-S", "/x", "-t", "=c:0").returncode, 2)
         self.assertEqual(run("-S", "/x", "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
 

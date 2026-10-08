@@ -3,10 +3,11 @@
 # the shared sender. It NEVER writes settings.json — the CLI persists /model
 # itself. tmux is a PATH shim; python is the real resolver.
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+HERE="$(cd "$(dirname "$0")/.." && pwd)"; export TMUX_FAKE_UNWRAP="$HERE/tests/lib/tmux-fake-unwrap.sh"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/cfg" "$T/state"
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+. "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
 # The core has one window, index 0: what the shared core-target lookup asks first.

@@ -2,9 +2,10 @@
 # One sender for lines typed into a core pane: session check, current-prompt
 # read, queued-input policy, literal send + Enter. tmux is a PATH shim.
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+HERE="$(cd "$(dirname "$0")/.." && pwd)"; export TMUX_FAKE_UNWRAP="$HERE/tests/lib/tmux-fake-unwrap.sh"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin"; cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+. "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case " $* " in *" has-session "*) [ -n "${TMUX_NO_SESSION:-}" ] && exit 1;; *" capture-pane "*) printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 exit 0
@@ -18,6 +19,7 @@ run(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.n"; PATH="$T/bin:$PATH" $SEND "$@" > "$
 # --- shim leg (always runs): policy and failure paths through the PATH shim, which the resolver finds first
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+. "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case " $* " in
   *" has-session "*) [ -n "${TMUX_NO_SESSION:-}" ] && exit 1;;

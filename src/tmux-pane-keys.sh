@@ -43,6 +43,22 @@ if bounded display-message -p -t "$TARGET" '#{pane_in_mode}' && [ "$(cat "$WORK/
   cat "$WORK/err" >&2
   [ "$rc" = 0 ] || exit "$rc"
 fi
-bounded send-keys -t "$TARGET" "$@"; rc=$?
+# tmux single-quoted word: literal; an embedded ' closes, is double-quoted, reopens.
+tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
+
+# Killing a client does not withdraw a request already queued with a stopped server, so the send
+# runs only if tmux can claim this one-time ticket when it executes; on timeout we revoke it first.
+TICKET="$WORK/ticket"
+: > "$TICKET"
+SEND="send-keys -t $(tmux_quote "$TARGET")"
+for key in "$@"; do
+  # As argv, a trailing ';' ends the command and a trailing '\;' is a literal ';'.
+  case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
+  SEND="$SEND $(tmux_quote "$key")"
+done
+bounded if-shell "mv '$TICKET' '$TICKET.claimed'" "$SEND"; rc=$?
+if [ "$rc" = 124 ] && ! rm "$TICKET" 2>/dev/null; then
+  echo "tmux-pane-keys: the send to $TARGET was already running when the bound expired; it may have partly applied" >&2
+fi
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"
