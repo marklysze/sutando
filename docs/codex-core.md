@@ -71,8 +71,10 @@ The Codex implementation:
 
 Task wakeups leave tmux copy mode before typing. The shared sender bounds the
 mode probe, mode exit and key send separately to 5 seconds, then allows a
-1-second TERM grace before KILL. Explicit typing failures with no staged prompt
-skip Enter and defer the task; an Enter failure with the prompt still staged
+1-second TERM grace before KILL. Each operation buffers stdout and stderr in
+private temporary files, so a stopped tmux server cannot keep the caller
+waiting on an output pipe after the client exits. Explicit typing failures with
+no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
 also defers after the configured confirmation retries. An unobservable successful
 send keeps the existing advisory behavior. A race with scrolling can leave the
 attached terminal's jump prompt visible; Escape dismisses that client prompt.
