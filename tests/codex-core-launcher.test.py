@@ -511,6 +511,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--sandbox danger-full-access", calls)
         self.assertIn("--ask-for-approval never", calls)
         self.assertIn("--search", calls)
+        self.assertIn("-c check_for_update_on_startup=false", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
         self.assertIn("task-notifier-supervisor.sh", calls)

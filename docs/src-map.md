@@ -115,6 +115,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
 - **`local_task_protocol.py`** — Local Task Protocol — read-side reference implementation.
+- **`meeting-dictation.ts`** — Meeting mode on bodhi's dictation (transcription) mode: while a meeting runs the voice model is quiesced, each final transcript line is appended to the day's meeting note, and an exit phrase returns the session to agent mode.
 - **`meeting-tools.ts`** — Meeting tools — Google Meet, phone call, and meeting ID lookup.
 - **`mention_gate.py`** — Owner @-mention ingestion trigger: shared policy for whether a message that tags the OWNER counts as a mention of the bot.
 - **`message_chunking.py`** — Shared message chunking — one fence-aware chunker for every outbound surface.
@@ -265,7 +266,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-watchdog-shadow.ts`** — Shadow-mode host for the ACTIVE-silence recovery reducer — Phase 0a of docs/design-voice-active-silence-recovery.md (desktop repo): derives diagnostic events from the health tick, feeds the pure reducer in chronological order, persists would-fire evidence, and never touches the live session.
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
+- **`watcher-rearm-session-hint.sh`** — SessionStart(compact|resume) hook: when no ready session-role watcher holds this session's inbox, inject the exact command that re-arms it.
 - **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
+- **`watcher_rearm.py`** — Which inbox a Claude session owes a task watcher, and the Monitor command that re-arms it.
 - **`watcher_sentinel.sh`** — Ownership protocol for state/watch-tasks-stream.pid — the ONE writer contract.
 - **`web-client.ts`** — Web Audio Client for Sutando
 - **`web-voice-transport.ts`** — web-voice-transport — the framework-agnostic browser voice-client CORE.
