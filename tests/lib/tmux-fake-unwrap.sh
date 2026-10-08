@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Sourced first by a fake tmux: turns src/tmux-pane-keys.sh's ticket-guarded send back into argv.
 # Claims the ticket as tmux would, then restores each key exactly as it was passed (';' -> '\;').
 if [ "${1:-}" = -S ] && [ "${3:-}" = if-shell ]; then
