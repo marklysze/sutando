@@ -306,6 +306,13 @@ An attempt already in progress at the deadline can finish. After the deadline,
 remaining minimum attempts still use backoff; further failures park the answer. Invalid schedule state parks visibly instead of
 silently granting a fresh budget.
 
+The gateway outbox preserves an accepted record when an unarchived result is
+seen again after a crash; it does not start another delivery cycle. Retries use
+the originally published payload even if the caller rebuilds different text.
+Accepted re-ask aliases remain available so waiting dependents resolve the
+holder's broker receipt after its result is archived. Abandoned torn claims
+use the outbox's existing grace-period sweep; fresh torn claims remain guarded.
+
 Success means **accepted by the gateway**, including result-ID deduplication and
 closing its task lease. It does not establish downstream Matrix delivery.
 The outbox's historical `DELIVERED` label represents gateway acceptance for this

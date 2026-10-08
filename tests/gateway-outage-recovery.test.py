@@ -72,7 +72,7 @@ class RecoveryTest(unittest.TestCase):
     def core(self, timed=True):
         backend = DesignAClaimBackend(
             self.outbox, retry_schedule=self.policy_outbox.RetrySchedule() if timed else None,
-            clock=lambda: self.server.now)
+            clock=lambda: self.server.now, republish_delivered=not timed)
         return DeliveryCore(backend, AG2SpaceResultProvider(self.server.request),
                             RetryPolicy(max_attempts=5, defer_idempotent_resend=timed))
 
@@ -276,6 +276,76 @@ class RecoveryTest(unittest.TestCase):
         self.assertIs(self.deliver(self.core()).status, DrainStatus.TERMINAL)
         self.assertEqual(len(self.server.calls), 5)
         self.assertEqual(record['reason'], 'retry-window-exhausted')
+
+    def test_abandoned_torn_claim_recovers_but_fresh_torn_claim_waits(self):
+        core = self.core()
+        core.backend.publish(HOLDER, self.payload)
+        claim = self.policy_outbox._claim_path(self.outbox, HOLDER)
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text('')
+        self.assertIs(core.deliver_one(HOLDER, self.payload).status, DrainStatus.NOT_CLAIMED)
+        self.assertNotIn('retry', outbox.read_item(self.outbox, HOLDER))
+        old = __import__('time').time() - 3600
+        os.utime(claim, (old, old))
+        self.assertIs(core.deliver_one(HOLDER, self.payload).status, DrainStatus.ATTEMPTED)
+        self.assertEqual(len(self.server.replies), 1)
+
+    def test_torn_recovery_obeys_backoff_and_releases_unused_claim(self):
+        core = self.core()
+        self.server.available_at += 60
+        self.deliver(core)
+        record = outbox.read_item(self.outbox, HOLDER)
+        claim = self.policy_outbox._claim_path(self.outbox, HOLDER)
+        claim.write_text('')
+        old = __import__('time').time() - 3600
+        os.utime(claim, (old, old))
+        self.assertIs(self.deliver(self.core()).status, DrainStatus.NOT_CLAIMED)
+        self.assertFalse(claim.exists())
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER), record)
+        self.assertEqual(len(self.server.calls), 1)
+
+    def test_claim_payload_rejects_released_ownership(self):
+        core = self.core()
+        core.backend.publish(HOLDER, self.payload)
+        token = core.backend.claim(HOLDER, 'test-worker')
+        core.backend.force_release(HOLDER)
+        with self.assertRaises(ValueError):
+            core.backend.payload_for_claim(token)
+
+    def test_retry_sends_stored_payload_despite_changed_caller_body(self):
+        self.server.available_at += 2
+        core = self.core()
+        self.deliver(core)
+        self.next_attempt()
+        changed = json.dumps({'id': HOLDER, 'body': 'Changed answer'}).encode()
+        core.deliver_one(HOLDER, changed)
+        self.assertEqual([p['body'] for p in self.server.calls],
+                         ['Existing answer', 'Existing answer'])
+
+    def test_gateway_republish_retains_acceptance_after_crash_before_archive(self):
+        core = self.bridge()
+        self.task(HOLDER)
+        result = self.results / f'{HOLDER}.txt'
+        result.write_text('Existing answer')
+        gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer')
+        record = outbox.read_item(self.outbox, HOLDER)
+        self.assertEqual(record['status'], 'DELIVERED')
+        gw._deliver_result_payload(HOLDER, HOLDER, 'Existing answer')
+        self.assertEqual(outbox.read_item(self.outbox, HOLDER), record)
+        self.assertEqual(len(self.server.calls), 1)
+
+    def test_reasked_holder_retains_receipt_identity_for_waiting_duplicate(self):
+        self.bridge()
+        self.seed_duplicates()
+        gw._save_dedup_aliases({HOLDER: 'task-original'})
+        gw._post_ready_results({HOLDER})
+        self.assertEqual(gw._holder_delivery_state(HOLDER), 'accepted')
+        inflight = {'task-duplicate1', 'task-duplicate2'}
+        gw._post_ready_results(inflight)
+        self.assertFalse(inflight)
+        for tid in ('task-duplicate1', 'task-duplicate2'):
+            self.assertTrue(self.server.accepted[tid]['no_send'])
+        self.assertEqual(len(self.server.replies), 1)
 
     def test_pending_duplicates_wait_restart_then_close_each_lease(self):
         self.bridge()

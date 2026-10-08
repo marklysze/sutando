@@ -102,6 +102,9 @@ class DeliveryCore:
             return DrainResult(status=DrainStatus.NOT_CLAIMED)
         # A requeued item must present a NEW logical side effect, or the
         # provider dedupes the re-send against the attempt that parked it.
+        stored_payload = getattr(self.backend, "payload_for_claim", None)
+        if callable(stored_payload):
+            payload = stored_payload(token)
         key = idempotency_key(item_id, _resend_epoch(self.backend, item_id))
         outcome, destination, permanent, detail = self._attempt(item_id, payload, key)
         if outcome is DeliveryOutcome.OUTCOME_UNKNOWN:

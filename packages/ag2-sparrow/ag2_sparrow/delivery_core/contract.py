@@ -176,7 +176,11 @@ class ClaimBackend(Protocol):
     def capabilities(self) -> BackendCapabilities: ...
 
     def publish(self, item_id: str, payload: bytes) -> bool:
-        """True = newly published; False = this id is already live."""
+        """True = newly published; False = this id is already live.
+
+        Durable backends may expose payload_for_claim(token) so the core sends
+        the original published bytes rather than a rebuilt caller payload.
+        """
         ...
 
     def claim(self, item_id: str, worker: str) -> Optional[ClaimToken]:

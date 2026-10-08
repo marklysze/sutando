@@ -3514,8 +3514,13 @@ def _forget_dedup_alias(tid: str) -> None:
     aliases = _load_dedup_aliases()
     if aliases is None:
         return
+    delivery = aliases.get(tid)
+    if delivery is not None:
+        record = read_item(_delivery_core().backend.root, _broker_tid(delivery))
+        if record and record.get("status") == "DELIVERED":
+            return  # Waiting dependents still resolve the holder's accepted broker id.
     if aliases.pop(tid, None) is not None:
-        _save_dedup_aliases(aliases)  # cleanup: a stale entry is harmless
+        _save_dedup_aliases(aliases)
 
 
 def _load_task_rooms() -> dict[str, str]:
@@ -4137,7 +4142,7 @@ def _delivery_core() -> DeliveryCore:
     root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
     if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
         _DELIVERY_CORE = DeliveryCore(
-            DesignAClaimBackend(root, retry_schedule=RetrySchedule()),
+            DesignAClaimBackend(root, retry_schedule=RetrySchedule(), republish_delivered=False),
             # Late-bound so token rotation reassigning module globals (and the
             # test harness's _req double) reach the provider mid-process.
             AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
