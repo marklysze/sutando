@@ -149,7 +149,7 @@ kill -STOP {self.pid}
         time.sleep(0.3)
         self.assertEqual(Path(self.bytes).read_text(), before)
         subprocess.run(["tmux", "-S", self.sock, "set-environment", "-g", "PATH", os.environ["PATH"]], check=True)
-        Path(self.sock + ".pane-keys-lock").rmdir()
+        subprocess.run([sys.executable, str(REPO / "src/tmux_pane_keys.py"), "recover", self.sock], check=True)
         recovered = run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", "RECOVERED")
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         time.sleep(0.3)
@@ -157,6 +157,56 @@ kill -STOP {self.pid}
 
 
 class Timeout(unittest.TestCase):
+    def _interrupt_sender(self, sig, phase, claimed=False):
+        with tempfile.TemporaryDirectory() as d:
+            sock = str(Path(d) / "s")
+            ready = Path(d) / "ready"
+            fake = Path(d) / "tmux"
+            claim = 'sh -c "$4"' if claimed else ":"
+            fake.write_text(f'''#!/bin/bash
+if [ "$3" = {phase} ] && [ ! -e '{ready}' ]; then
+  {claim}
+  touch '{ready}'
+  exec sleep 3
+fi
+[ "$3" = display-message ] && {{ echo 0; exit 0; }}
+[ "$3" = if-shell ] && echo SENT
+''')
+            fake.chmod(0o755)
+            args = ["--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "5", "--", "Enter"]
+            p = subprocess.Popen(["bash", str(HELPER), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                p.send_signal(sig)
+                p.communicate(timeout=5)
+                r = run(*args)
+                self.assertEqual(r.returncode, 125 if claimed else 0, r.stderr)
+                self.assertEqual(tmux_pane_keys.fence_status(sock), "uncertain" if claimed else "clear")
+                if not claimed:
+                    self.assertEqual(r.stdout.strip(), "SENT")
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                p.communicate()
+
+    def test_term_revokes_an_unclaimed_send_and_allows_the_next_sender(self):
+        self._interrupt_sender(signal.SIGTERM, "if-shell")
+
+    def test_kill_during_probe_allows_the_next_sender(self):
+        self._interrupt_sender(signal.SIGKILL, "display-message")
+
+    def test_kill_revokes_an_unclaimed_send_and_allows_the_next_sender(self):
+        self._interrupt_sender(signal.SIGKILL, "if-shell")
+
+    def test_kill_after_claim_keeps_the_uncertain_fence(self):
+        self._interrupt_sender(signal.SIGKILL, "if-shell", claimed=True)
+
+    def test_term_after_claim_keeps_the_uncertain_fence(self):
+        self._interrupt_sender(signal.SIGTERM, "if-shell", claimed=True)
+
     def test_concurrent_send_is_refused_and_success_releases_the_lock(self):
         with tempfile.TemporaryDirectory() as d:
             sock = str(Path(d) / "s")
@@ -174,10 +224,10 @@ class Timeout(unittest.TestCase):
                 while not claimed.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertTrue(claimed.exists())
-                self.assertEqual(run(*args).returncode, 125)
+                self.assertEqual(run(*args).returncode, 75)
                 _, stderr = first.communicate(timeout=5)
                 self.assertEqual(first.returncode, 0, stderr)
-                self.assertFalse(Path(sock + ".pane-keys-lock").exists())
+                self.assertEqual(tmux_pane_keys.fence_status(sock), "clear")
                 self.assertEqual(run(*args).returncode, 0)
             finally:
                 if first.poll() is None:

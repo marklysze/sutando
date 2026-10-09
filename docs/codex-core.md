@@ -78,19 +78,33 @@ a request already queued with a stopped server, so the send runs inside `if-shel
 only if tmux can claim a one-time ticket file when it executes; on timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
 returned 124 sends nothing. If the ticket was already claimed at timeout, the
-outcome is uncertain: status 125 retains a socket-wide send lock at
-`<socket>.pane-keys-lock`. Every caller must acquire that same atomic lock before
+outcome is uncertain: status 125 retains a socket-wide fence at
+`<socket>.pane-keys-lock`. Every caller must acquire the same OS file lock before
 probing or sending, so retries, Enter and recovery keys cannot reach the server
-while an uncertain send is outstanding. An interrupted sender also retains the
-lock once sending starts. A concurrent send is refused with 125 until the active
-sender releases the lock; ordinary successful sends remove it automatically.
+while an uncertain send is outstanding. The file lock releases automatically on
+process death and is not inherited by tmux. Contention returns 75 (busy), rather
+than 125 (uncertain). The guard stores the unique ticket path before submitting
+the command. TERM cleanup revokes an unclaimed ticket; after SIGKILL, the next
+sender revokes it under the file lock. A claimed or unreadable ticket record
+remains fenced. Normal completion clears the pending record, while the guard's
+mutex stays in place for later senders. A legacy empty fence requires recovery.
 
 An uncertain send blocks automation on every pane of that socket. To recover,
 stop the old tmux server, reconcile the affected task and composer (the send may
-have applied), and remove the empty lock directory with
-`rmdir "${SUTANDO_TMUX_SOCKET}.pane-keys-lock"` before starting a fresh server.
+have applied), then explicitly clear the fence before starting a fresh server:
+
+```bash
+PY="$(bash scripts/sutando-config.sh python-bin)"
+"$PY" src/tmux_pane_keys.py recover "$SUTANDO_TMUX_SOCKET"
+```
+
+Recovery takes the same file lock and refuses with 75 while a sender is active;
+never delete the mutex to bypass it. `health-check.py` reports a standing or
+unreadable fence as a `pane-send-fence` failure, with the socket path and recovery
+instruction. Active contention is healthy. Health checks never clear a fence.
 Do not clear the lock while an old request can still run. This state is tied to
-the IPC socket, survives notifier restarts, and is never cleared by a retry.
+the IPC socket and survives notifier restarts. Only an atomically revoked,
+unclaimed ticket is automatically recovered; uncertainty never expires.
 Explicit typing failures with
 no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
 also defers after the configured confirmation retries. An unobservable successful

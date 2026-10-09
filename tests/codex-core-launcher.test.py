@@ -97,6 +97,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/tmux-pane-keys.sh",
+            "src/tmux_pane_keys.py",
             "src/bounded-wait.sh",
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",

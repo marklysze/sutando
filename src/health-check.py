@@ -6741,6 +6741,15 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
 
 
+def check_pane_send_fence() -> dict:
+    socket = _live_core_socket()
+    state = tmux_pane_keys.fence_status(socket)
+    if state == "uncertain":
+        return {"name": "pane-send-fence", "status": "fail",
+                "detail": f"automated sends blocked at {tmux_pane_keys.guard_path(socket)}; stop the old server and reconcile delivery before explicit recovery"}
+    return {"name": "pane-send-fence", "status": "ok", "detail": state}
+
+
 def check_core_supervisor() -> dict:
     """Surface the core-supervisor (Agent Shepherd M1) state for OSS users.
 
@@ -13393,6 +13402,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
+    checks.append(check_pane_send_fence())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_pool_advertisement())
     checks.append(check_pool_suspended())

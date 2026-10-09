@@ -229,7 +229,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`tmux-pane-keys.sh`** — tmux-pane-keys.sh [--tmux BIN] -S SOCKET -t TARGET [--timeout SECS] -- <send-keys args...> Leave pane mode before sending; bounded operations.
 - **`tmux-probe-cli.py`** — Tiny CLI over tmux_probe.has_session(), for callers (start-cli.sh's relay loop) that cannot import Python but must not duplicate its ABSENT_SIGNATURES.
 - **`tmux-status.ts`** — Tmux-pane status scraper.
-- **`tmux_pane_keys.py`** — argv that sends keys into an agent pane through src/tmux-pane-keys.sh, which leaves any pane mode first and bounds the send; Python callers run it with their own runner.
+- **`tmux_pane_keys.py`** — Shared tmux pane-key argv and crash-safe send guard.
 - **`tmux_probe.py`** — Tri-state tmux session probe shared by every core-liveness reader.
 - **`turn-start.sh`** — UserPromptSubmit hook: a new turn is starting, so re-arm the Stop reminder.
 - **`turn_ledger.py`** — The turn ledger — a record that the agent's turn produced an outbound message.
