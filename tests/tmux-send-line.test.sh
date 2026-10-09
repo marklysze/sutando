@@ -150,8 +150,9 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
     rm -f "$T/trig" "$T/rc"
     tmux -S "$SOCKW" new-session -d -s probe "printf '\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m'; while [ ! -f $T/trig ]; do sleep 0.02; done; printf '$1'; sleep 30"
     ( bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $? > "$T/rc" ) &
-    local sp=$! i; STAGED=0
-    for i in $(seq 1 250); do
+    local sp=$! end=$((SECONDS + 30)); STAGED=0
+    # A wall-clock bound: on a loaded runner the bounded, locked send can take seconds to stage.
+    while [ "$SECONDS" -lt "$end" ]; do
       tmux -S "$SOCKW" capture-pane -p -t probe 2>/dev/null | grep -q hello && { STAGED=1; break; }
       sleep 0.02
     done
