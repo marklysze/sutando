@@ -1427,7 +1427,7 @@ exit 0
         self.assertIn(needle, source)
         module.write_text(source.replace(
             needle,
-            needle + "    import time as _slow_history\n    _slow_history.sleep(4)\n",
+            needle + "    import time as _slow_history\n    _slow_history.sleep(8)\n",
             1,
         ))
         watcher = self.root / "src/watch-tasks-stream.sh"
@@ -1461,13 +1461,13 @@ exit 0
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         started = time.monotonic()
         result = subprocess.run(
-            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=8
+            ["/bin/bash", str(script)], env=env, capture_output=True, text=True, timeout=12
         )
         elapsed = time.monotonic() - started
 
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        # Well under the injected 4s scan, well over a loaded runner's own overhead.
-        self.assertLess(elapsed, 2.5, f"unassigned delivery took {elapsed:.2f}s")
+        # Half the injected 8s scan: a scan always fails it, a slow runner's bounded sends do not.
+        self.assertLess(elapsed, 4.0, f"unassigned delivery took {elapsed:.2f}s")
         calls = self._tmux_calls()
         self.assertIn("task-unassigned.txt", calls)
         self.assertNotIn("Related prior workstream context", calls)
