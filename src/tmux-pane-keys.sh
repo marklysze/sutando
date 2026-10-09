@@ -20,10 +20,10 @@ case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seco
 
 [ "$((10#$TIMEOUT))" -gt 0 ] || { echo "tmux-pane-keys: --timeout must be positive" >&2; exit 2; }
 source "$(dirname "${BASH_SOURCE[0]}")/bounded-wait.sh"
-# One socket-wide lock dir: pid = holder, ticket = the send tmux may still claim, uncertain = a
-# claimed send timed out. Exit 75 = another sender is active, 125 = sends fenced until recovery.
+# One socket-wide lock dir: pid = holder, ticket.* = each send's own ticket, uncertain = a claimed
+# send timed out. Exit 75 = another sender is active, 125 = sends fenced until recovery.
 LOCK="$SOCK.pane-keys-lock"
-TICKET="$LOCK/ticket"
+TICKET=""
 fence() {
   : > "$LOCK/uncertain"
   echo "tmux-pane-keys: uncertain send to ${1:-$TARGET}; sends remain blocked by $LOCK until recovery" >&2
@@ -37,12 +37,12 @@ acquire() {
   holder="$(cat "$LOCK/pid" 2>/dev/null)"
   if [ -z "$holder" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]; then holder=dead; fi
   if [ -n "$holder" ] && { [ "$holder" = dead ] || ! kill -0 "$holder" 2>/dev/null; }; then
-    # A dead holder: its unclaimed ticket is revoked here; a claimed one is an uncertain send.
-    if rm "$TICKET" 2>/dev/null || [ ! -e "$TICKET.claimed" ]; then
-      rm -rf "$LOCK"; mkdir -m 700 "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; return 0; }
-    else
-      fence "the dead sender's target"
-    fi
+    # A dead holder: revoke its unclaimed tickets first, so a request still queued in tmux can no
+    # longer claim one; any claimed ticket is then an uncertain send.
+    local t
+    for t in "$LOCK"/ticket.*; do case "$t" in *.claimed) ;; *) rm -f "$t" ;; esac; done
+    for t in "$LOCK"/ticket.*.claimed; do [ -e "$t" ] && fence "the dead sender's target"; done
+    rm -rf "$LOCK"; mkdir -m 700 "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; return 0; }
   fi
   echo "tmux-pane-keys: another send holds $LOCK; try again" >&2
   exit 75
@@ -87,8 +87,8 @@ fi
 tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
 
 # Killing a client does not withdraw a request already queued with a stopped server, so the send
-# runs only if tmux can claim this one-time ticket when it executes; on timeout we revoke it first.
-: > "$TICKET"
+# runs only if tmux can claim this send's own one-time ticket; on timeout we revoke it first.
+TICKET="$(mktemp "$LOCK/ticket.XXXXXX")" || exit 1
 SEND="send-keys -t $(tmux_quote "$TARGET")"
 for key in "$@"; do
   # As argv, a trailing ';' ends the command and a trailing '\;' is a literal ';'.
@@ -100,6 +100,10 @@ bounded if-shell "mv '$TICKET' '$TICKET.claimed'" "$SEND"; rc=$?
 if [ "$rc" = 124 ] && ! rm "$TICKET" 2>/dev/null; then
   cat "$WORK/err" >&2
   fence
+fi
+if [ "$rc" = 0 ] && [ ! -e "$TICKET.claimed" ]; then
+  echo "tmux-pane-keys: tmux did not claim the send's ticket for $TARGET; nothing was sent" >&2
+  rc=1
 fi
 SENDING=0
 cat "$WORK/out"; cat "$WORK/err" >&2

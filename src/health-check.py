@@ -842,18 +842,19 @@ def check_cli_wedge() -> dict:
     return check
 
 def check_pane_key_fence(socket: "str | None" = None) -> dict:
-    """An uncertain key send fences every automated send on the core's tmux socket until an
-    operator recovers it (docs/codex-core.md); report it so delivery does not stop silently."""
-    sock = socket or _live_core_socket()
-    lock = Path(sock + ".pane-keys-lock")
-    if (lock / "uncertain").exists():
+    """An uncertain key send fences every automated send on its tmux socket until an operator
+    recovers it (docs/codex-core.md). Workers share the core's socket or sit beside it."""
+    sock = Path(socket or _live_core_socket())
+    fenced = sorted(str(lock)[: -len(".pane-keys-lock")]
+                    for lock in sock.parent.glob("*.pane-keys-lock") if (lock / "uncertain").exists())
+    if fenced:
         return {
             "name": "pane-key-fence",
             "status": "fail",
             "detail": (
-                f"key sends to every pane on {sock} are blocked: a timed-out send may have applied. "
-                f"Stop that tmux server, reconcile the task and composer, then remove {lock} "
-                "(docs/codex-core.md)"
+                f"key sends are blocked on {', '.join(fenced)}: a timed-out send may have applied. "
+                "Stop that tmux server, reconcile the task and composer, then remove "
+                "<socket>.pane-keys-lock (docs/codex-core.md)"
             ),
         }
     return {"name": "pane-key-fence", "status": "ok", "detail": "no uncertain key send"}

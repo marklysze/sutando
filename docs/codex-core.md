@@ -81,13 +81,14 @@ returned 124 sends nothing. If the ticket was already claimed at timeout, the
 outcome is uncertain: status 125 retains a socket-wide send lock at
 `<socket>.pane-keys-lock` and marks it `uncertain`. Every caller must acquire that same
 atomic lock before probing or sending, so retries, Enter and recovery keys cannot reach the
-server while an uncertain send is outstanding. The lock records its holder's pid and the
-send's ticket. A concurrent send is refused with 75 (busy) while the holder is alive; ordinary
+server while an uncertain send is outstanding. The lock records its holder's pid and each
+send's own uniquely named ticket, so a request still queued in tmux from an earlier sender can
+never claim a later sender's ticket; a send whose ticket tmux did not claim returns 1. A concurrent send is refused with 75 (busy) while the holder is alive; ordinary
 sends remove the lock when they finish. A sender interrupted before tmux claimed its ticket
 revokes the ticket and releases the lock; a lock left by a killed sender is reclaimed by the
 next one, which revokes the dead sender's unclaimed ticket first. Only a claimed ticket that
-never finished fences the socket. `health-check.py` reports a standing fence as
-`pane-key-fence`.
+never finished fences the socket. `health-check.py` reports a standing fence, on the
+core's socket or a worker socket beside it, as `pane-key-fence`.
 
 An uncertain send blocks automation on every pane of that socket. To recover,
 stop the old tmux server, reconcile the affected task and composer (the send may

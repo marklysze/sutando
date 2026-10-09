@@ -28,8 +28,18 @@ class PaneKeyFence(unittest.TestCase):
             (lock / "uncertain").touch()
             out = hc.check_pane_key_fence(sock)
             self.assertEqual((out["name"], out["status"]), ("pane-key-fence", "fail"))
-            self.assertIn(str(lock), out["detail"])
+            self.assertIn(sock, out["detail"])
             self.assertIn("docs/codex-core.md", out["detail"])
+
+    def test_a_fenced_worker_socket_beside_the_core_socket_fails_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            core = str(Path(d) / "core.sock")
+            worker_lock = Path(d) / "worker-7.sock.pane-keys-lock"
+            worker_lock.mkdir()
+            (worker_lock / "uncertain").touch()
+            out = hc.check_pane_key_fence(core)
+            self.assertEqual(out["status"], "fail")
+            self.assertIn(str(Path(d) / "worker-7.sock"), out["detail"])
 
     def test_the_check_is_registered(self):
         self.assertIn("checks.append(check_pane_key_fence())", (REPO / "src" / "health-check.py").read_text())
