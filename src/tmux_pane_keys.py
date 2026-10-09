@@ -10,7 +10,7 @@ import sys
 import tempfile
 
 SCRIPT = Path(__file__).resolve().parent / "tmux-pane-keys.sh"
-# Three operations at 5 s each, plus a 1 s TERM grace per operation and polling overhead.
+# One bounded operation (5 s + 1 s TERM grace), the guard's start-up and polling, with margin.
 TIMEOUT_S = 22
 BUSY = 75
 UNCERTAIN = 125
@@ -61,8 +61,9 @@ def finish_guard(socket, completed=False):
         try:
             ticket.unlink()
         except FileNotFoundError:
-            (guard / "uncertain").touch()
-            return UNCERTAIN
+            if not ticket.with_name("ticket.orphaned").exists():
+                (guard / "uncertain").touch()
+                return UNCERTAIN
     if (guard / "uncertain").exists() and not completed:
         return UNCERTAIN
     (guard / "pending.json").unlink(missing_ok=True)
@@ -112,7 +113,8 @@ def fence_status(socket):
             if _lock_fd(stream.fileno()) == BUSY:
                 return "busy"
             ticket = _pending_ticket(guard)
-            if (guard / "uncertain").exists() or (ticket is not None and not ticket.exists()):
+            if (guard / "uncertain").exists() or (
+                    ticket is not None and not ticket.exists() and not ticket.with_name("ticket.orphaned").exists()):
                 return "uncertain"
             return "clear"
     except (OSError, ValueError, KeyError, TypeError):

@@ -32,12 +32,17 @@ case " $* " in
     if [ "$n" -ge 2 ] && [ -n "${TMUX_PANE_TEXT_AFTER+x}" ]; then printf '%b' "$TMUX_PANE_TEXT_AFTER"
     else printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}"; fi ;;
   *" display-message "*) printf '%s\n' "${TMUX_PANE_WIDTH:-80}";;
-  *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";;
+  *" send-keys "*" -l "*) [ -n "${TMUX_HANG_LITERAL:-}" ] && exec sleep 60;;
+  *" send-keys "*" Enter ") [ -n "${TMUX_HANG_ENTER:-}" ] && exec sleep 60;;
 esac
+case " $* " in *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
 rc=$(run probe hello --socket "$T/s.sock"); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "S1 shim: clear prompt → literal line then Enter" || fail "S1" "rc=$rc $(cat "$TMUX_LOG")"
+# A claimed send that times out may have applied: its 125 reaches the caller, never a plain 1.
+rc=$(TMUX_HANG_LITERAL=1 run probe hello --socket "$T/u1.sock"); [ "$rc" = 125 ] && ! grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "S11 uncertain literal → 125, no Enter" || fail "S11" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_HANG_ENTER=1 run probe hello --socket "$T/u2.sock"); [ "$rc" = 125 ] && ok "S12 uncertain Enter → 125" || fail "S12" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S2 shim: pending text → 5, nothing sent" || fail "S2" "rc=$rc"
 rc=$(TMUX_PANE_TEXT='❯ watcher\n' run probe watcher --socket "$T/s.sock" --skip-if-queued watcher); [ "$rc" = 6 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S3 shim: queued word → 6" || fail "S3" "rc=$rc"
 rc=$(TMUX_NO_SESSION=1 run probe x --socket "$T/s.sock"); [ "$rc" = 3 ] && ok "S4 shim: no session → 3" || fail "S4" "rc=$rc"

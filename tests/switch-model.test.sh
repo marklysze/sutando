@@ -33,6 +33,7 @@ case " $* " in *" capture-pane "*)
   done
   printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 case " $* " in *" send-keys "*" Escape "*) [ -n "${TMUX_HANG_ESCAPE:-}" ] && exec sleep 60;; esac
+case " $* " in *" send-keys "*" Enter ") [ -n "${TMUX_HANG_ENTER:-}" ] && exec sleep 60;; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
@@ -149,5 +150,8 @@ rc=$(TMUX_DIALOG=1 TMUX_HANG_ESCAPE=1 run opus)
 : > "$TMUX_LOG"
 TMUX_HANG_ESCAPE=1 bash "$HERE/skills/model-switch/scripts/pane-observe.sh" sutando-core --socket "$SUTANDO_TMUX_SOCKET" --cancel > "$T/out" 2> "$T/err"; rc=$?
 [ "$rc" = 125 ] && ! grep -q CANCELLED "$T/out" && ! grep -q "send-keys" "$TMUX_LOG" && ok "42 pane observer refuses cancellation on the retained uncertainty lock" || fail "42" "rc=$rc $(cat "$T/out")"
+rm -f "$GREC"; rc=$(SUTANDO_TMUX_SOCKET="$T/enter.sock" TMUX_HANG_ENTER=1 run haiku)
+[ "$rc" = 7 ] && [ -e "$GREC" ] && closed 5 && grep -q 'may have applied (rc=125)' "$T/err" && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "43 uncertain /model Enter: attribution kept with a closed claim window, nothing recorded" || fail "43" "rc=$rc $(cat "$T/err")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 42 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 43 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

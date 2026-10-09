@@ -158,8 +158,9 @@ kill -STOP {self.pid}
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class LateClaim(unittest.TestCase):
-    """A killed or timed-out sender's request can still be queued in tmux; it must never claim the
-    next sender's ticket. The server's mv is slowed so the old request claims after the reclaim."""
+    """A killed or timed-out sender's request can still be queued in tmux; it must never send, nor
+    claim the next sender's ticket. The server's mv is slowed so the old request claims late."""
+    MV_FIRST = "sleep 2"
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
@@ -167,7 +168,7 @@ class LateClaim(unittest.TestCase):
         self.bytes = os.path.join(self.dir, "bytes")
         bin_dir = Path(self.dir) / "bin"
         bin_dir.mkdir()
-        (bin_dir / "mv").write_text(f'#!/bin/sh\nsleep 2\nexec "{shutil.which("mv")}" "$@"\n')
+        (bin_dir / "mv").write_text(f'#!/bin/sh\n{self.MV_FIRST.format(sock=self.sock)}\nexec "{shutil.which("mv")}" "$@"\n')
         (bin_dir / "mv").chmod(0o755)
         subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "t", "-x", "120", "-y", "20",
                         f"stty raw -echo; cat > {self.bytes}"], check=True)
@@ -192,6 +193,18 @@ class LateClaim(unittest.TestCase):
         self.assertNotIn("STALE-A", landed)
         self.assertEqual((b.returncode, landed), (0, "FRESH-B"), b.stderr)
 
+    def test_a_killed_senders_late_claim_sends_nothing_with_no_successor(self):
+        a = subprocess.Popen(self.send("STALE-A"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.6)
+        a.kill()
+        a.wait()
+        # Both the claim and the orphan rename go through the slowed mv.
+        time.sleep(5)
+        self.assertEqual(Path(self.bytes).read_text(), "")
+        b = subprocess.run(self.send("FRESH-B"), capture_output=True, text=True, timeout=30)
+        time.sleep(0.5)
+        self.assertEqual((b.returncode, Path(self.bytes).read_text()), (0, "FRESH-B"), b.stderr)
+
     def test_a_timed_out_senders_late_claim_cannot_take_the_next_ticket(self):
         a = subprocess.run(self.send("STALE-A", timeout="1"), capture_output=True, text=True, timeout=30)
         self.assertEqual(a.returncode, 124, a.stderr)
@@ -200,6 +213,23 @@ class LateClaim(unittest.TestCase):
         landed = Path(self.bytes).read_text()
         self.assertNotIn("STALE-A", landed)
         self.assertEqual((b.returncode, landed), (0, "FRESH-B"), b.stderr)
+
+
+class ModeReentered(LateClaim):
+    """The pane enters copy mode after the request is queued, just before it claims: the same
+    uninterrupted tmux step must still leave the mode and deliver."""
+    MV_FIRST = "tmux -S {sock} copy-mode -t t:0"
+
+    def test_copy_mode_entered_before_the_claim_is_left_and_the_keys_land(self):
+        r = subprocess.run(self.send("hello"), capture_output=True, text=True, timeout=30)
+        time.sleep(0.3)
+        mode = subprocess.run(["tmux", "-S", self.sock, "display-message", "-p", "-t", "=t:0", "#{pane_in_mode}"],
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual((r.returncode, Path(self.bytes).read_text(), mode), (0, "hello", "0"), r.stderr)
+
+    test_a_killed_senders_queued_request_cannot_take_the_next_ticket = None
+    test_a_killed_senders_late_claim_sends_nothing_with_no_successor = None
+    test_a_timed_out_senders_late_claim_cannot_take_the_next_ticket = None
 
 
 class Timeout(unittest.TestCase):
@@ -240,9 +270,6 @@ fi
 
     def test_term_revokes_an_unclaimed_send_and_allows_the_next_sender(self):
         self._interrupt_sender(signal.SIGTERM, "if-shell")
-
-    def test_kill_during_probe_allows_the_next_sender(self):
-        self._interrupt_sender(signal.SIGKILL, "display-message")
 
     def test_kill_revokes_an_unclaimed_send_and_allows_the_next_sender(self):
         self._interrupt_sender(signal.SIGKILL, "if-shell")
@@ -319,33 +346,12 @@ echo "$*" >> '{log}'
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 3)
-            calls = log.read_text().splitlines()[1:]
-            self.assertEqual(calls[0], f"-S {Path(d) / 's'} copy-mode -q -t =c:0")
-            self.assertRegex(calls[1], rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '[^']+/ticket' '[^']+/ticket\.claimed' send-keys -t '=c:0' 'Enter'$")
+            [call] = log.read_text().splitlines()
+            self.assertRegex(call, rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
+                                   r"\{ kill -0 \d+ 2>/dev/null \|\| \{ mv '\1\.claimed' '\1\.orphaned'; false; \}; \} "
+                                   r"copy-mode -q -t '=c:0' ; send-keys -t '=c:0' 'Enter'$")
         self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0").returncode, 2)
         self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
-
-    def test_hanging_probe_is_bounded_and_send_still_runs(self):
-        with tempfile.TemporaryDirectory() as d:
-            fake = Path(d) / "tmux"
-            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) exec sleep 30;; *send-keys*) sh -c "$4" && echo SENT;; esac\n')
-            fake.chmod(0o755)
-            start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(r.stdout.strip(), "SENT")
-            self.assertLess(time.monotonic() - start, 4)
-
-    def test_a_probe_whose_descendant_holds_stdout_cannot_hang_the_helper(self):
-        # A killed client whose server is stopped leaves its fds behind: a child holding stdout is that shape.
-        with tempfile.TemporaryDirectory() as d:
-            fake = Path(d) / "tmux"
-            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) sleep 8;; *send-keys*) sh -c "$4" && echo SENT;; esac\n')
-            fake.chmod(0o755)
-            start = time.monotonic()
-            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=12)
-            self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)
-            self.assertLess(time.monotonic() - start, 4)
 
     def test_a_send_whose_descendant_holds_stdout_times_out_inside_the_bound(self):
         with tempfile.TemporaryDirectory() as d:
@@ -384,14 +390,15 @@ esac
             self.assertEqual(r.returncode, 1, r.stderr)
             self.assertIn("did not claim the send's ticket", r.stderr)
 
-    def test_hanging_mode_exit_does_not_send_keys(self):
+    def test_mode_exit_and_send_are_one_tmux_call(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "tmux"
-            fake.write_text('#!/bin/bash\ncase "$*" in *display-message*) echo 1;; *copy-mode*) exec sleep 30;; *send-keys*) sh -c "$4" && echo SENT;; esac\n')
+            log = Path(d) / "log"
+            fake.write_text(f'#!/bin/bash\necho "$3" >> {log}\n[ "$3" = if-shell ] && sh -c "$4" && echo SENT\n')
             fake.chmod(0o755)
-            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "1", "--", "Enter", timeout=5)
-            self.assertEqual(r.returncode, 124, r.stderr)
-            self.assertNotIn("SENT", r.stdout)
+            r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "SENT"), r.stderr)
+            self.assertEqual(log.read_text().split(), ["if-shell"])
 
     def test_python_argv(self):
         self.assertEqual(tmux_pane_keys.argv("/s", "=c:0", "Escape", tmux="/bin/tmux"),

@@ -1116,7 +1116,7 @@ exit 0
   *"'-l'"*) [ "$FAIL_KEY" = literal ] && _hang_unclaimed=1;;
 esac
 if [ "$_hang_unclaimed" = 1 ]; then
-  eval "set -- $5"
+  eval "set -- ${5#copy-mode -q -t * ; }"
   printf '%s\n' "$*" >> "$TMUX_LOG"
   exec sleep 60
 fi

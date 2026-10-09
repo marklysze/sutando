@@ -69,18 +69,21 @@ The Codex implementation:
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
-Task wakeups leave tmux copy mode before typing. The shared sender bounds the
-mode probe, mode exit and key send separately to 5 seconds, then allows a
-1-second TERM grace before KILL. Each operation buffers stdout and stderr in
+Task wakeups leave tmux copy mode before typing. The shared sender issues the
+mode exit and the key send as one tmux command list, which the server runs without
+interleaving, so the pane cannot re-enter a mode between them. That one call is
+bounded to 5 seconds, then a 1-second TERM grace before KILL. It buffers stdout and stderr in
 private temporary files, so a stopped tmux server cannot keep the caller
 waiting on an output pipe after the client exits. Killing a client does not withdraw
 a request already queued with a stopped server, so the send runs inside `if-shell`
-only if tmux can claim a one-time ticket file when it executes; on timeout the
+only if tmux can claim a one-time ticket file when it executes and the sending
+guard process is still alive after the claim (a dead guard's claim is renamed
+`ticket.orphaned` and sends nothing, with or without a later sender); on timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
 returned 124 sends nothing. If the ticket was already claimed at timeout, the
 outcome is uncertain: status 125 retains a socket-wide fence at
 `<socket>.pane-keys-lock`. Every caller must acquire the same OS file lock before
-probing or sending, so retries, Enter and recovery keys cannot reach the server
+sending, so retries, Enter and recovery keys cannot reach the server
 while an uncertain send is outstanding. The file lock releases automatically on
 process death and is not inherited by tmux. Contention returns 75 (busy), rather
 than 125 (uncertain). A successful tmux reply whose ticket was not claimed is a failed send (status 1).

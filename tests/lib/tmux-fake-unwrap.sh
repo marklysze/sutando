@@ -1,10 +1,13 @@
 # shellcheck shell=sh
 # Sourced first by a fake tmux: turns src/tmux-pane-keys.sh's ticket-guarded send back into argv.
-# Claims the ticket as tmux would, then restores each key exactly as it was passed (';' -> '\;').
+# Claims the ticket as tmux would, replays the mode exit as its own call, then restores each key.
 if [ "${1:-}" = -S ] && [ "${3:-}" = if-shell ]; then
   _tfu_sock="$2"
-  _tfu_cmd="$5"
+  _tfu_mode="${5%% ; *}"
+  _tfu_cmd="${5#copy-mode -q -t * ; }"
   sh -c "$4" || exit 0
+  eval "set -- $_tfu_mode"
+  "$0" -S "$_tfu_sock" "$@"
   eval "set -- $_tfu_cmd"
   _tfu_out=""
   for _tfu_k in "$@"; do
