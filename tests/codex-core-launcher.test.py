@@ -1666,7 +1666,8 @@ exit 0
         self.assertIsNotNone(calls_while_busy,
                              "notifier never observed the live core")
         busy.unlink()
-        stdout, stderr = process.communicate(timeout=5)
+        # A hang guard, not a speed bound: each bounded, locked key send costs a Python start.
+        stdout, stderr = process.communicate(timeout=15)
         self.assertEqual(process.returncode, 0, stderr or stdout)
         self.assertNotIn(
             "send-keys", calls_while_busy,
