@@ -841,6 +841,24 @@ def check_cli_wedge() -> dict:
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    """An uncertain key send fences every automated send on the core's tmux socket until an
+    operator recovers it (docs/codex-core.md); report it so delivery does not stop silently."""
+    sock = socket or _live_core_socket()
+    lock = Path(sock + ".pane-keys-lock")
+    if (lock / "uncertain").exists():
+        return {
+            "name": "pane-key-fence",
+            "status": "fail",
+            "detail": (
+                f"key sends to every pane on {sock} are blocked: a timed-out send may have applied. "
+                f"Stop that tmux server, reconcile the task and composer, then remove {lock} "
+                "(docs/codex-core.md)"
+            ),
+        }
+    return {"name": "pane-key-fence", "status": "ok", "detail": "no uncertain key send"}
+
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -12942,6 +12960,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.

@@ -20,18 +20,47 @@ case "$TIMEOUT" in ''|*[!0-9]*) echo "tmux-pane-keys: --timeout takes whole seco
 
 [ "$((10#$TIMEOUT))" -gt 0 ] || { echo "tmux-pane-keys: --timeout must be positive" >&2; exit 2; }
 source "$(dirname "${BASH_SOURCE[0]}")/bounded-wait.sh"
+# One socket-wide lock dir: pid = holder, ticket = the send tmux may still claim, uncertain = a
+# claimed send timed out. Exit 75 = another sender is active, 125 = sends fenced until recovery.
 LOCK="$SOCK.pane-keys-lock"
-if ! mkdir -m 700 "$LOCK" 2>/dev/null; then
-  if [ -d "$LOCK" ]; then
-    echo "tmux-pane-keys: sends blocked by $LOCK (active or uncertain send); recover before retrying" >&2
-    exit 125
+TICKET="$LOCK/ticket"
+fence() {
+  : > "$LOCK/uncertain"
+  echo "tmux-pane-keys: uncertain send to ${1:-$TARGET}; sends remain blocked by $LOCK until recovery" >&2
+  exit 125
+}
+acquire() {
+  local holder
+  mkdir -m 700 "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; return 0; }
+  [ -d "$LOCK" ] || { echo "tmux-pane-keys: cannot acquire send lock $LOCK" >&2; exit 1; }
+  [ -e "$LOCK/uncertain" ] && { echo "tmux-pane-keys: sends blocked by $LOCK (uncertain send); recover before retrying" >&2; exit 125; }
+  holder="$(cat "$LOCK/pid" 2>/dev/null)"
+  if [ -z "$holder" ] && [ -z "$(find "$LOCK" -maxdepth 0 -mmin -1 2>/dev/null)" ]; then holder=dead; fi
+  if [ -n "$holder" ] && { [ "$holder" = dead ] || ! kill -0 "$holder" 2>/dev/null; }; then
+    # A dead holder: its unclaimed ticket is revoked here; a claimed one is an uncertain send.
+    if rm "$TICKET" 2>/dev/null || [ ! -e "$TICKET.claimed" ]; then
+      rm -rf "$LOCK"; mkdir -m 700 "$LOCK" 2>/dev/null && { echo "$$" > "$LOCK/pid"; return 0; }
+    else
+      fence "the dead sender's target"
+    fi
   fi
-  echo "tmux-pane-keys: cannot acquire send lock $LOCK" >&2
-  exit 1
-fi
-KEEP_LOCK=0
+  echo "tmux-pane-keys: another send holds $LOCK; try again" >&2
+  exit 75
+}
+acquire
+SENDING=0
 WORK=""
-trap 'rm -rf "$WORK"; [ "$KEEP_LOCK" = 1 ] || rmdir "$LOCK"' EXIT
+# A TERM mid-send revokes an unclaimed ticket and releases; a claimed one leaves the fence.
+release() {
+  rm -rf "$WORK"
+  if [ "$SENDING" = 1 ] && ! rm "$TICKET" 2>/dev/null && [ -e "$TICKET.claimed" ]; then
+    : > "$LOCK/uncertain"
+    return
+  fi
+  rm -rf "$LOCK"
+}
+trap release EXIT
+trap 'exit 143' TERM INT HUP
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tmux-pane-keys.XXXXXX")" || exit 1
 TIMEOUT_FLAG="$WORK/timed-out"
 
@@ -59,7 +88,6 @@ tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
 
 # Killing a client does not withdraw a request already queued with a stopped server, so the send
 # runs only if tmux can claim this one-time ticket when it executes; on timeout we revoke it first.
-TICKET="$WORK/ticket"
 : > "$TICKET"
 SEND="send-keys -t $(tmux_quote "$TARGET")"
 for key in "$@"; do
@@ -67,14 +95,12 @@ for key in "$@"; do
   case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
   SEND="$SEND $(tmux_quote "$key")"
 done
-# An interrupted helper must leave the socket fenced if the server may have claimed its ticket.
-KEEP_LOCK=1
+SENDING=1
 bounded if-shell "mv '$TICKET' '$TICKET.claimed'" "$SEND"; rc=$?
 if [ "$rc" = 124 ] && ! rm "$TICKET" 2>/dev/null; then
-  echo "tmux-pane-keys: uncertain send to $TARGET; sends remain blocked by $LOCK until recovery" >&2
-  rc=125
-else
-  KEEP_LOCK=0
+  cat "$WORK/err" >&2
+  fence
 fi
+SENDING=0
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"

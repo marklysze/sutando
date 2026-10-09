@@ -79,16 +79,20 @@ only if tmux can claim a one-time ticket file when it executes; on timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
 returned 124 sends nothing. If the ticket was already claimed at timeout, the
 outcome is uncertain: status 125 retains a socket-wide send lock at
-`<socket>.pane-keys-lock`. Every caller must acquire that same atomic lock before
-probing or sending, so retries, Enter and recovery keys cannot reach the server
-while an uncertain send is outstanding. An interrupted sender also retains the
-lock once sending starts. A concurrent send is refused with 125 until the active
-sender releases the lock; ordinary successful sends remove it automatically.
+`<socket>.pane-keys-lock` and marks it `uncertain`. Every caller must acquire that same
+atomic lock before probing or sending, so retries, Enter and recovery keys cannot reach the
+server while an uncertain send is outstanding. The lock records its holder's pid and the
+send's ticket. A concurrent send is refused with 75 (busy) while the holder is alive; ordinary
+sends remove the lock when they finish. A sender interrupted before tmux claimed its ticket
+revokes the ticket and releases the lock; a lock left by a killed sender is reclaimed by the
+next one, which revokes the dead sender's unclaimed ticket first. Only a claimed ticket that
+never finished fences the socket. `health-check.py` reports a standing fence as
+`pane-key-fence`.
 
 An uncertain send blocks automation on every pane of that socket. To recover,
 stop the old tmux server, reconcile the affected task and composer (the send may
-have applied), and remove the empty lock directory with
-`rmdir "${SUTANDO_TMUX_SOCKET}.pane-keys-lock"` before starting a fresh server.
+have applied), and remove the lock directory with
+`rm -rf "${SUTANDO_TMUX_SOCKET}.pane-keys-lock"` before starting a fresh server.
 Do not clear the lock while an old request can still run. This state is tied to
 the IPC socket, survives notifier restarts, and is never cleared by a retry.
 Explicit typing failures with

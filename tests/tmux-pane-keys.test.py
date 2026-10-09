@@ -149,7 +149,7 @@ kill -STOP {self.pid}
         time.sleep(0.3)
         self.assertEqual(Path(self.bytes).read_text(), before)
         subprocess.run(["tmux", "-S", self.sock, "set-environment", "-g", "PATH", os.environ["PATH"]], check=True)
-        Path(self.sock + ".pane-keys-lock").rmdir()
+        shutil.rmtree(self.sock + ".pane-keys-lock")
         recovered = run("-S", self.sock, "-t", "=t:0", "--", "-l", "--", "RECOVERED")
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
         time.sleep(0.3)
@@ -157,7 +157,7 @@ kill -STOP {self.pid}
 
 
 class Timeout(unittest.TestCase):
-    def test_concurrent_send_is_refused_and_success_releases_the_lock(self):
+    def test_concurrent_send_is_refused_as_busy_and_success_releases_the_lock(self):
         with tempfile.TemporaryDirectory() as d:
             sock = str(Path(d) / "s")
             claimed = Path(d) / "claimed"
@@ -174,7 +174,7 @@ class Timeout(unittest.TestCase):
                 while not claimed.exists() and time.monotonic() < deadline:
                     time.sleep(0.01)
                 self.assertTrue(claimed.exists())
-                self.assertEqual(run(*args).returncode, 125)
+                self.assertEqual(run(*args).returncode, 75)
                 _, stderr = first.communicate(timeout=5)
                 self.assertEqual(first.returncode, 0, stderr)
                 self.assertFalse(Path(sock + ".pane-keys-lock").exists())
@@ -203,6 +203,61 @@ echo "$*" >> '{log}'
                 self.assertEqual(retry.returncode, 125, retry.stderr)
                 self.assertEqual(log.read_text(), calls)
             self.assertTrue(Path(sock + ".pane-keys-lock").is_dir())
+
+    def _killed_mid(self, d, fake_body, sig):
+        """Starts a send whose fake tmux runs fake_body, signals the helper once it is inside,
+        and returns (sock, lock, a fake that answers instantly)."""
+        sock = str(Path(d) / "s")
+        inside = Path(d) / "inside"
+        fake = Path(d) / "tmux"
+        fake.write_text(f'''#!/bin/bash
+touch '{inside}'
+{fake_body}
+''')
+        fake.chmod(0o755)
+        p = subprocess.Popen(["bash", str(HELPER), "--tmux", str(fake), "-S", sock, "-t", "=t:0", "--timeout", "5", "--", "Enter"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 3
+        while not inside.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)
+        p.send_signal(sig)
+        p.wait(timeout=10)
+        quick = Path(d) / "quick"
+        quick.write_text('#!/bin/bash\n[ "$3" = display-message ] && { echo 0; exit 0; }\n[ "$3" = if-shell ] && sh -c "$4"\nexit 0\n')
+        quick.chmod(0o755)
+        return sock, Path(sock + ".pane-keys-lock"), quick
+
+    def test_term_during_an_unclaimed_send_releases_the_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock, lock, quick = self._killed_mid(d, '[ "$3" = display-message ] && { echo 0; exit 0; }\nsleep 3', signal.SIGTERM)
+            self.assertFalse(lock.exists(), "an unclaimed ticket is revoked, so nothing fences")
+            self.assertEqual(run("--tmux", str(quick), "-S", sock, "-t", "=t:0", "--", "Enter").returncode, 0)
+
+    def test_a_helper_killed_during_the_probe_leaves_a_lock_the_next_sender_reclaims(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock, lock, quick = self._killed_mid(d, 'sleep 3', signal.SIGKILL)
+            self.assertTrue(lock.is_dir(), "SIGKILL runs no cleanup")
+            self.assertEqual(run("--tmux", str(quick), "-S", sock, "-t", "=t:0", "--", "Enter").returncode, 0)
+            self.assertFalse(lock.exists())
+
+    def test_a_helper_killed_before_its_ticket_is_claimed_cannot_send_late(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock, lock, quick = self._killed_mid(d, '[ "$3" = display-message ] && { echo 0; exit 0; }\nsleep 3', signal.SIGKILL)
+            self.assertTrue((lock / "ticket").exists())
+            self.assertEqual(run("--tmux", str(quick), "-S", sock, "-t", "=t:0", "--", "Enter").returncode, 0)
+            self.assertNotEqual(subprocess.run(["mv", str(lock / "ticket"), str(lock / "ticket.claimed")],
+                                               capture_output=True).returncode, 0, "the reclaimer revoked the old ticket")
+
+    def test_a_helper_killed_after_its_ticket_was_claimed_fences_every_later_sender(self):
+        with tempfile.TemporaryDirectory() as d:
+            sock, lock, quick = self._killed_mid(
+                d, '[ "$3" = display-message ] && { echo 0; exit 0; }\n[ "$3" = if-shell ] && sh -c "$4"\nsleep 3', signal.SIGKILL)
+            self.assertTrue((lock / "ticket.claimed").exists())
+            r = run("--tmux", str(quick), "-S", sock, "-t", "=other:0", "--", "Escape")
+            self.assertEqual(r.returncode, 125, r.stderr)
+            self.assertTrue((lock / "uncertain").exists())
+            self.assertEqual(run("--tmux", str(quick), "-S", sock, "-t", "=t:0", "--", "Enter").returncode, 125)
 
     def test_a_send_that_never_returns_fails_with_124_inside_the_bound(self):
         with tempfile.TemporaryDirectory() as d:
