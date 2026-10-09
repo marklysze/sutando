@@ -83,7 +83,8 @@ outcome is uncertain: status 125 retains a socket-wide fence at
 probing or sending, so retries, Enter and recovery keys cannot reach the server
 while an uncertain send is outstanding. The file lock releases automatically on
 process death and is not inherited by tmux. Contention returns 75 (busy), rather
-than 125 (uncertain). The guard stores the unique ticket path before submitting
+than 125 (uncertain). A successful tmux reply whose ticket was not claimed is a failed send (status 1).
+The guard stores the unique ticket path before submitting
 the command. TERM cleanup revokes an unclaimed ticket; after SIGKILL, the next
 sender revokes it under the file lock. A claimed or unreadable ticket record
 remains fenced. Normal completion clears the pending record, while the guard's
@@ -100,7 +101,7 @@ PY="$(bash scripts/sutando-config.sh python-bin)"
 
 Recovery takes the same file lock and refuses with 75 while a sender is active;
 never delete the mutex to bypass it. `health-check.py` reports a standing or
-unreadable fence as a `pane-send-fence` failure, with the socket path and recovery
+unreadable fence as a `pane-key-fence` failure, with the socket path and recovery
 instruction. Active contention is healthy. Health checks never clear a fence.
 Do not clear the lock while an old request can still run. This state is tied to
 the IPC socket and survives notifier restarts. Only an atomically revoked,

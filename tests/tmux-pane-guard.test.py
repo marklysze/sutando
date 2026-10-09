@@ -24,7 +24,10 @@ class GuardContracts(unittest.TestCase):
 case "$3" in
   claimed) mv "$2/ticket" "$2/ticket.claimed"; exit 124;;
   revoked) exit 124;;
+  unclaimed) exit 0;;
+  missing) rm "$2/ticket"; exit 0;;
 esac
+mv "$2/ticket" "$2/ticket.claimed"
 echo SENT
 echo DIAGNOSTIC >&2
 exit 0
@@ -61,6 +64,14 @@ exit 0
     def test_revoked_timeout_can_be_retried(self):
         self.assertEqual(self.cli("run", "revoked")[0], 124)
         self.assertEqual(self.cli("run", "success")[0], 0)
+
+    def test_missing_claim_is_failure_and_never_mistaken_for_delivery(self):
+        rc, _, err = self.cli("run", "unclaimed")
+        self.assertEqual(rc, 1)
+        self.assertIn(b"delivery not confirmed", err)
+        self.assertEqual(self.cli("run", "success")[0], 0)
+        self.assertEqual(self.cli("run", "missing")[0], 125)
+        self.assertEqual(self.cli("run", "success")[0], 125)
 
     def test_claimed_timeout_stays_fenced_until_explicit_recovery(self):
         self.assertEqual(self.cli("run", "claimed")[0], 125)

@@ -137,7 +137,12 @@ def run_guarded(socket, args):
                 result = subprocess.run(["bash", str(SCRIPT), "--guarded", str(work), *args],
                                         stdout=out, stderr=err, close_fds=True)
             rc = result.returncode
+            if rc == 0 and not (work / "ticket.claimed").exists():
+                rc = 1 if (work / "ticket").exists() else UNCERTAIN
+                print("tmux-pane-keys: tmux did not claim the send's ticket; delivery not confirmed", file=sys.stderr)
             completed = rc not in (124, 130, 143) and rc >= 0
+            if rc == UNCERTAIN:
+                completed = False
             finish_rc = finish_guard(socket, completed=completed)
             sys.stdout.buffer.write((work / "stdout").read_bytes())
             sys.stderr.buffer.write((work / "stderr").read_bytes())

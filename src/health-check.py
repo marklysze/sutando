@@ -841,6 +841,20 @@ def check_cli_wedge() -> dict:
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    sock = Path(socket or _live_core_socket())
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -6739,15 +6753,6 @@ def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
             "detail": f"running for {age}s on '{step}' — last heartbeat > {threshold_sec}s ago",
         }
     return {"name": name, "status": "ok", "detail": f"running ({age}s ago)"}
-
-
-def check_pane_send_fence() -> dict:
-    socket = _live_core_socket()
-    state = tmux_pane_keys.fence_status(socket)
-    if state == "uncertain":
-        return {"name": "pane-send-fence", "status": "fail",
-                "detail": f"automated sends blocked at {tmux_pane_keys.guard_path(socket)}; stop the old server and reconcile delivery before explicit recovery"}
-    return {"name": "pane-send-fence", "status": "ok", "detail": state}
 
 
 def check_core_supervisor() -> dict:
@@ -12951,6 +12956,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -13402,7 +13408,6 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_cron_schedule())
     checks.append(check_core_supervisor())
-    checks.append(check_pane_send_fence())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_pool_advertisement())
     checks.append(check_pool_suspended())
