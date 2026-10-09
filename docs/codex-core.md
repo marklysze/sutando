@@ -78,7 +78,9 @@ waiting on an output pipe after the client exits. Killing a client does not with
 a request already queued with a stopped server, so the send runs inside `if-shell`
 only if tmux can claim a one-time ticket file when it executes and the sending
 guard process is still alive after the claim (a dead guard's claim is renamed
-`ticket.orphaned` and sends nothing, with or without a later sender); on timeout the
+`ticket.orphaned` and sends nothing, with or without a later sender; liveness is
+`kill -0` on the guard's pid, so a pid reused by another process of the same user
+within one bounded send window would pass it); on timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
 returned 124 sends nothing. If the ticket was already claimed at timeout, the
 outcome is uncertain: status 125 retains a socket-wide fence at
