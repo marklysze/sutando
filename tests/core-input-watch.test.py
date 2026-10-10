@@ -1029,17 +1029,18 @@ class TestSendKeys(unittest.TestCase):
     def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
         from unittest.mock import patch
         d, log = self._with_fake_tmux("exit 0")
+        sock = os.path.join(d, "x.sock")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertTrue(_mod.send_keys(sock, "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
+                             ["-S", sock, "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
         d, _ = self._with_fake_tmux("exit 1")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertFalse(_mod.send_keys(os.path.join(d, "x.sock"), "sutando-core", "Enter"))
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch

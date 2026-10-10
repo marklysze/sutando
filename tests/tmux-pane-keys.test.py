@@ -205,6 +205,14 @@ class LateClaim(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual((b.returncode, Path(self.bytes).read_text()), (0, "FRESH-B"), b.stderr)
 
+    def test_a_killed_but_unreaped_sender_cannot_send_late(self):
+        a = subprocess.Popen(self.send("STALE-ZOMBIE"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.6)
+        os.kill(a.pid, signal.SIGKILL)
+        time.sleep(5)  # the claim and its liveness check run while A is still a zombie
+        a.wait()
+        self.assertEqual(Path(self.bytes).read_text(), "")
+
     def test_a_timed_out_senders_late_claim_cannot_take_the_next_ticket(self):
         a = subprocess.run(self.send("STALE-A", timeout="1"), capture_output=True, text=True, timeout=30)
         self.assertEqual(a.returncode, 124, a.stderr)
@@ -229,7 +237,54 @@ class ModeReentered(LateClaim):
 
     test_a_killed_senders_queued_request_cannot_take_the_next_ticket = None
     test_a_killed_senders_late_claim_sends_nothing_with_no_successor = None
+    test_a_killed_but_unreaped_sender_cannot_send_late = None
     test_a_timed_out_senders_late_claim_cannot_take_the_next_ticket = None
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class HookedServer(unittest.TestCase):
+    """tmux runs hooks between the commands of a list and after each one."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        self.sock = os.path.join(self.dir, "s")
+        self.bytes = os.path.join(self.dir, "bytes")
+        self.tmux("new-session", "-d", "-s", "t", "-x", "120", "-y", "20", f"stty raw -echo; cat > {self.bytes}")
+        time.sleep(0.3)
+
+    def tearDown(self):
+        subprocess.run(["tmux", "-S", self.sock, "kill-server"], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def tmux(self, *args):
+        return subprocess.run(["tmux", "-S", self.sock, *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def send(self, text):
+        return ["bash", str(HELPER), "-S", self.sock, "-t", "=t:0", "--", "-l", "--", text]
+
+    def test_a_hook_that_re_enters_copy_mode_withholds_the_send_and_reports_failure(self):
+        self.tmux("set-hook", "-g", "after-copy-mode", "copy-mode -t t:0")
+        self.tmux("copy-mode", "-t", "t:0")
+        r = subprocess.run(self.send("hello"), capture_output=True, text=True, timeout=30)
+        time.sleep(0.3)
+        self.assertEqual((r.returncode, Path(self.bytes).read_text()), (1, ""), r.stderr)
+        self.assertEqual(tmux_pane_keys.fence_status(self.sock), "clear")
+
+    def test_a_killed_client_after_the_keys_applied_keeps_the_fence(self):
+        self.tmux("set-hook", "-g", "after-send-keys", "run-shell 'sleep 4'")
+        p = subprocess.Popen(self.send("FIRST"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 10
+        while Path(self.bytes).read_text() != "FIRST" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(Path(self.bytes).read_text(), "FIRST")
+        subprocess.run(["pkill", "-KILL", "-f", f"tmux -S {self.sock} if-shell"])
+        _out, err = p.communicate(timeout=20)
+        self.assertEqual(p.returncode, tmux_pane_keys.UNCERTAIN, err)
+        self.assertEqual(tmux_pane_keys.fence_status(self.sock), "uncertain")
+        time.sleep(4)
+        self.assertEqual(subprocess.run(self.send("FIRST"), capture_output=True, text=True, timeout=30).returncode,
+                         tmux_pane_keys.UNCERTAIN)
+        self.assertEqual(Path(self.bytes).read_text(), "FIRST")
 
 
 class Timeout(unittest.TestCase):
@@ -348,8 +403,9 @@ echo "$*" >> '{log}'
             self.assertEqual(r.returncode, 3)
             [call] = log.read_text().splitlines()
             self.assertRegex(call, rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
-                                   r"\{ kill -0 \d+ 2>/dev/null \|\| \{ mv '\1\.claimed' '\1\.orphaned'; false; \}; \} "
-                                   r"copy-mode -q -t '=c:0' ; send-keys -t '=c:0' 'Enter'$")
+                                   r'case "\$\(ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
+            self.assertIn(" copy-mode -q -t '=c:0' ; if-shell -F -t '=c:0' '#{pane_in_mode}' ", call)
+            self.assertTrue(call.endswith("""'send-keys -t '"'"'=c:0'"'"' '"'"'Enter'"'"''"""), call)
         self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0").returncode, 2)
         self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0", "--timeout", "0.5", "--", "Enter").returncode, 2)
 
@@ -388,7 +444,7 @@ esac
             fake.chmod(0o755)
             r = run("--tmux", str(fake), "-S", str(Path(d) / "s"), "-t", "=c:0", "--", "Enter")
             self.assertEqual(r.returncode, 1, r.stderr)
-            self.assertIn("did not claim the send's ticket", r.stderr)
+            self.assertIn("tmux did not send the keys", r.stderr)
 
     def test_mode_exit_and_send_are_one_tmux_call(self):
         with tempfile.TemporaryDirectory() as d:

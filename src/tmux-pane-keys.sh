@@ -48,17 +48,22 @@ bounded() {
 tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
 
 # A request queued with a stopped server outlives its client: it sends only if it claims this one-time
-# ticket and the guard ($PPID) is still alive after the claim; a dead guard's claim is marked orphaned.
+# ticket and the guard ($PPID, same start time, not a zombie) is alive after the claim; else orphaned.
 TICKET="$WORK/ticket"
-CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && { kill -0 $PPID 2>/dev/null || { mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned"); false; }; }"
+STARTED="$(ps -o lstart= -p "$PPID" 2>/dev/null)"; STARTED="${STARTED%"${STARTED##*[! ]}"}"
+[ -n "$STARTED" ] || { echo "tmux-pane-keys: cannot read the guard's start time" >&2; exit 1; }
+ORPHAN="mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned")"
+CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
 
-# One command list runs uninterrupted in the server, so the pane cannot re-enter a mode in between.
-SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; send-keys -t $(tmux_quote "$TARGET")"
+# Hooks may run between the commands of a list, so the send is withheld (and its claim orphaned)
+# when the pane is back in a mode at the moment of sending.
+KEYS="send-keys -t $(tmux_quote "$TARGET")"
 for key in "$@"; do
   # As argv, a trailing ';' ends the command and a trailing '\;' is a literal ';'.
   case "$key" in *'\;') key="${key%\\;};" ;; *';') key="${key%;}" ;; esac
-  SEND="$SEND $(tmux_quote "$key")"
+  KEYS="$KEYS $(tmux_quote "$key")"
 done
+SEND="copy-mode -q -t $(tmux_quote "$TARGET") ; if-shell -F -t $(tmux_quote "$TARGET") '#{pane_in_mode}' $(tmux_quote "run-shell $(tmux_quote "$ORPHAN")") $(tmux_quote "$KEYS")"
 bounded if-shell "$CLAIM" "$SEND"; rc=$?
 cat "$WORK/out"; cat "$WORK/err" >&2
 exit "$rc"

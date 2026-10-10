@@ -140,7 +140,7 @@ class PaneSendFenceTests(unittest.TestCase):
         import tmux_pane_keys
         with tempfile.TemporaryDirectory() as td:
             sock = str(Path(td) / "core.sock")
-            with mock.patch.object(hc, "_live_core_socket", return_value=sock):
+            with mock.patch.object(hc, "_local_core_socket", return_value=sock):
                 self.assertEqual(hc.check_pane_key_fence()["status"], "ok")
                 with tmux_pane_keys.prepare_guard(sock).open("ab") as stream:
                     self.assertEqual(tmux_pane_keys.acquire_guard(sock, stream.fileno()), 0)
@@ -162,7 +162,7 @@ class PaneSendFenceTests(unittest.TestCase):
             sock = str(Path(td) / "core.sock")
             guard = tmux_pane_keys.guard_path(sock)
             guard.mkdir()
-            with mock.patch.object(hc, "_live_core_socket", return_value=sock):
+            with mock.patch.object(hc, "_local_core_socket", return_value=sock):
                 self.assertTrue(hc.is_issue(hc.check_pane_key_fence()))
             self.assertEqual(list(guard.iterdir()), [])
 

@@ -842,7 +842,8 @@ def check_cli_wedge() -> dict:
     return check
 
 def check_pane_key_fence(socket: "str | None" = None) -> dict:
-    sock = Path(socket or _live_core_socket())
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
     sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
                             for lock in sock.parent.glob("*.pane-keys-lock")}
     states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
