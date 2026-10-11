@@ -24,7 +24,7 @@ case " $* " in *" capture-pane "*)
   [ -n "${TMUX_NO_ACCEPT:-}" ] && { k=0; dlg=""; }
   # Render what the real CLI prints for each ACCEPTED send (display name, not id);
   # TMUX_ACCEPT_AS forces a different model's line; TMUX_PERSIST_SETTINGS mimics the CLI saving the pick.
-  disp() { case "$1" in claude-opus-5-1*) echo "Opus 5.1";; opus|claude-opus-5*) echo "Opus 5";; sonnet|claude-sonnet-5*) echo "Sonnet 5";; haiku|claude-haiku-4-5*) echo "Haiku 4.5";; fable|claude-fable-5-1*) echo "Fable 5.1";; default) echo "Default (recommended)";; *) echo "$1";; esac; }
+  disp() { case "$1" in claude-opus-5-1*) echo "Opus 5.1";; opus*|claude-opus-5*) echo "Opus 5";; sonnet*|claude-sonnet-5*) echo "Sonnet 5";; haiku*|claude-haiku-4-5*) echo "Haiku 4.5";; fable*|claude-fable-5-1*) echo "Fable 5.1";; default) echo "Default (recommended)";; *) echo "$1";; esac; }
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
@@ -144,14 +144,21 @@ rm -f "$GREC"; rc=$(TMUX_DIALOG=1 TMUX_ACCEPT_AS=haiku run opus --confirm --acce
 [ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && ok "40 confirmed but not accepted: attribution kept, claim window closed at exit" || fail "40" "rc=$rc $(cat "$T/err")"
 
 rm -f "$GREC" "$T/state/model-switch.json"
-rc=$(TMUX_DIALOG=1 TMUX_HANG_ESCAPE=1 run opus)
+rc=$(SUTANDO_TMUX_SOCKET="$T/escape.sock" TMUX_DIALOG=1 TMUX_HANG_ESCAPE=1 run opus)
 [ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && [ ! -e "$T/state/model-switch.json" ] && grep -q 'cancel failed (rc=125)' "$T/err" && ! grep -q 'Dialog cancelled' "$T/err" \
   && ok "41 Escape timeout: failed cancellation keeps attribution with a closed claim window" || fail "41" "rc=$rc $(cat "$T/err")"
 : > "$TMUX_LOG"
-TMUX_HANG_ESCAPE=1 bash "$HERE/skills/model-switch/scripts/pane-observe.sh" sutando-core --socket "$SUTANDO_TMUX_SOCKET" --cancel > "$T/out" 2> "$T/err"; rc=$?
+TMUX_HANG_ESCAPE=1 bash "$HERE/skills/model-switch/scripts/pane-observe.sh" sutando-core --socket "$T/escape.sock" --cancel > "$T/out" 2> "$T/err"; rc=$?
 [ "$rc" = 125 ] && ! grep -q CANCELLED "$T/out" && ! grep -q "send-keys" "$TMUX_LOG" && ok "42 pane observer refuses cancellation on the retained uncertainty lock" || fail "42" "rc=$rc $(cat "$T/out")"
 rm -f "$GREC"; rc=$(SUTANDO_TMUX_SOCKET="$T/enter.sock" TMUX_HANG_ENTER=1 run haiku)
 [ "$rc" = 7 ] && [ -e "$GREC" ] && closed 5 && grep -q 'may have applied (rc=125)' "$T/err" && [ ! -e "$T/state/model-switch.json" ] \
   && ok "43 uncertain /model Enter: attribution kept with a closed claim window, nothing recorded" || fail "43" "rc=$rc $(cat "$T/err")"
+# --- the menu's version-free family aliases carry the 1M tag
+rm -f "$T/state/model-switch.json"
+rc=$(run 'sonnet[1m]'); R=$(python3 -c "import json;print(json.load(open('$T/state/model-switch.json'))['model'])" 2>/dev/null)
+[ "$rc" = 0 ] && [ "$R" = "sonnet[1m]" ] && grep -q -- "-l /model sonnet\[1m\]" "$TMUX_LOG" && ok "44 a family alias with [1m] (sonnet[1m]) is sent and recorded as typed" || fail "44" "rc=$rc R=$R $(cat "$T/err")"
+rc=$(run 'fable[1m]'); [ "$rc" = 0 ] && ok "45 fable[1m] is matched against the CLI's display name (Fable 5.1)" || fail "45" "rc=$rc $(cat "$T/err")"
+bad=""; for m in 'sonnet[2m]' 'default[1m]' 'opusx' 'sonnet[1m]; rm -rf /' 'gpt[1m]'; do rc=$(run "$m"); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" || bad="$bad $m:$rc"; done
+[ -z "$bad" ] && ok "46 garbage around an alias (sonnet[2m], default[1m], opusx, injected suffix, gpt[1m]) is refused (rc=2), nothing sent" || fail "46" "$bad"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 43 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 46 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
