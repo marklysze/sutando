@@ -301,7 +301,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import local_task_protocol
+from . import gateway_instance, local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -310,12 +310,14 @@ from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
+from .outbox import list_items, requeue_item_with_epoch
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .outbox_adapter import classify_response
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, resolve_failed_send
 from .delivery_core import (DeliveryCore, DesignAClaimBackend, DrainStatus,
                             RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
+from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
@@ -358,13 +360,13 @@ except ImportError:  # pragma: no cover - flat src/ import path
 UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
-_INSTANCE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+_INSTANCE_RE = gateway_instance.INSTANCE_RE
 
 GATEWAY_INSTANCE = (os.environ.get("GATEWAY_INSTANCE") or "").strip()
 if GATEWAY_INSTANCE and not _INSTANCE_RE.fullmatch(GATEWAY_INSTANCE):
     sys.exit("FATAL: GATEWAY_INSTANCE must match "
              f"{_INSTANCE_RE.pattern} (ASCII only; got {GATEWAY_INSTANCE!r})")
-_INST_SUFFIX = f".{GATEWAY_INSTANCE}" if GATEWAY_INSTANCE else ""
+_INST_SUFFIX = gateway_instance.suffix(GATEWAY_INSTANCE)
 
 
 def _local_tid(broker_tid: str) -> str:
@@ -385,19 +387,12 @@ def _local_tid(broker_tid: str) -> str:
       consumers therefore gate on `_valid_local_tid`, and the wire id is
       re-derived and `_valid_tid`-checked at the ack/result egress points.
     Unset instance → identity (legacy single-gateway installs unchanged)."""
-    if not GATEWAY_INSTANCE:
-        return broker_tid
-    return f"task-{GATEWAY_INSTANCE}~{broker_tid}"
+    return gateway_instance.local_tid(broker_tid, GATEWAY_INSTANCE)
 
 
 def _broker_tid(local_tid: str) -> str:
     """Reverse of `_local_tid` — the id the GATEWAY knows this task by."""
-    if not GATEWAY_INSTANCE:
-        return local_tid
-    prefix = f"task-{GATEWAY_INSTANCE}~"
-    if local_tid.startswith(prefix):
-        return local_tid[len(prefix):]
-    return local_tid
+    return gateway_instance.broker_tid(local_tid, GATEWAY_INSTANCE)
 
 
 _LOCAL_TID_RE = re.compile(rf"task-{_INSTANCE_RE.pattern}~([A-Za-z0-9._-]{{1,64}})")
@@ -731,6 +726,15 @@ def _durable_write(path: Path, text: str) -> bool:
     return False
 
 
+def _read_review_json(path: Path) -> "dict | None":
+    """A review record read only through the guard's strict walk; None when it cannot be."""
+    try:
+        record = team_result_guard.read_json_strict(path)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
 def _read_private_json(path: Path) -> "dict | None":
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -829,11 +833,12 @@ def _review_buttons(review_id: str) -> dict:
 
 
 def _route_withheld_review(path: Path) -> bool:
-    record = _read_private_json(path)
+    record = _read_review_json(path)
     if not record:
         return False
     if record.get("status") != "pending_dm":
         return True
+    version = team_result_guard.record_version(record)
     owner = _gateway_owner()
     if not owner:
         raise RuntimeError("gateway returned no registered owner")
@@ -857,29 +862,55 @@ def _route_withheld_review(path: Path) -> bool:
     record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
                    "dm_event_id": str(answer.get("event_id") or ""),
                    "dm_sent_at": time.time()})
-    team_result_guard.update_record(path, record)
-    return True
+    if team_result_guard.update_record(path, record, expect=version):
+        return True
+    # Another writer moved the record on while the DM was in flight; its state stands.
+    current = _read_review_json(path) or {}
+    _log(f"withheld review {path.stem}: routed copy is stale; keeping {current.get('status')}")
+    return current.get("status") not in (None, "pending_dm")
 
 
 _REVIEW_DECISION_RE = re.compile(
     r"^(yes|no)(?:\s+(wr_[0-9a-f]{16}))?[.!]?$", re.IGNORECASE)
 
 
+class _ReviewsUnreadable(Exception):
+    """The reviews could not be inspected, which is not the same as no review matching."""
+
+    def __init__(self, detail, record: str = "", reason: str = ""):
+        super().__init__(detail)
+        self.record = record  # the review file to inspect, relative to the workspace
+        self.reason = reason  # plain words for the owner; never a host path
+
+
 def _pending_review_records() -> list[tuple[Path, dict]]:
     """Live reviews that own their id; the guard freezes any that conflict with
     their id's reservation or archived decision, and the owner is told."""
+    directory = _STATE / team_result_guard.WITHHELD_RESULT_DIR
+    for path in _review_paths(directory, False):
+        try:
+            if team_result_guard.proven_superseded_record(path):
+                _defers_to_archive(path)
+        except OSError:
+            continue
     try:
-        actionable, frozen = team_result_guard.actionable_records(
-            _STATE / team_result_guard.WITHHELD_RESULT_DIR)
+        actionable, frozen = team_result_guard.actionable_records(directory)
     except OSError:
         return []
     for path in frozen:
         _log(f"withheld review {path.name}: conflicts with its id's decision or reservation; "
              f"frozen in {path.parent.name}/ for the owner, never acted on")
-    return [(path, record) for path, record in actionable
-            if path.name.startswith("wr_") and record.get("status") in (
-                "awaiting_owner", "publish_pending", "kept_private", "published",
-                "publish_failed")]
+    listed = []
+    for path, record in actionable:
+        if not (path.name.startswith("wr_") and record.get("status") in (
+                "awaiting_owner", "publish_pending", "kept_private", "published", "publish_failed")):
+            continue
+        if not team_result_guard.decision_is_durable(record):
+            # The durability barrier: a decision acts only once it is durably on disk.
+            if team_result_guard.establish_decision(path):
+                record = _read_review_json(path) or record
+        listed.append((path, record))
+    return listed
 
 
 def _archive_resolved_review(path: Path, record: dict) -> bool:
@@ -892,14 +923,34 @@ def _archive_resolved_review(path: Path, record: dict) -> bool:
 
 def _decision_text(task: dict) -> str:
     text = str(task.get("task") or "").strip()
-    # Button replies can follow the broker's quoted context envelope; only text
-    # after its exact closing marker is the decision.
-    text = re.sub(
-        r"^\[AG2 Space reply context;[^\]]*\].*?"
-        r"\[End AG2 Space reply context\]\s*",
-        "", text, count=1, flags=re.DOTALL)
+    # Button replies can follow the broker's quoted context envelope; only the
+    # text after it is the decision.
+    text = local_task_protocol.split_reply_context(text)[1]
     text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
     return text.strip()
+
+
+def _review_paths(directory: Path, strict: bool) -> list[Path]:
+    try:
+        return team_result_guard.entries(directory, "wr_*.json")
+    except OSError as exc:
+        if strict:
+            raise _ReviewsUnreadable(exc) from exc
+        return []
+
+
+def _check_reviews_readable(directory: Path) -> None:
+    # The guard's one read-only preflight, under the ledger lock so no move races it: any entry
+    # a reader would refuse makes the reply unknown, never "no matching review".
+    if not team_result_guard.present(directory, stat.S_IFDIR):
+        return
+    with team_result_guard.withheld_decision_lock(directory):  # the lock also refuses an odd issued/
+        problems = team_result_guard.namespace_problems(directory)
+    if problems:
+        path, reason = problems[0]
+        workspace = _STATE.parent
+        name = str(path.relative_to(workspace)) if path.is_relative_to(workspace) else path.name
+        raise _ReviewsUnreadable(f"{name}: {reason}", name, reason)
 
 
 def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
@@ -915,6 +966,7 @@ def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
     room = str(task.get("channel_id") or "")
     reply_to = str(task.get("reply_to_event") or "")
     candidates = []
+    _check_reviews_readable(_STATE / team_result_guard.WITHHELD_RESULT_DIR)
     for path, record in _pending_review_records():
         if room != str(record.get("dm_room_id") or ""):
             continue
@@ -925,7 +977,25 @@ def _match_review_decision(task: dict) -> "tuple[Path, dict, str] | None":
                 candidates.append((path, record))
         elif reply_to and reply_to == str(record.get("dm_event_id") or ""):
             candidates.append((path, record))
+    if not candidates:
+        candidates = _archived_review_candidates(room, task, explicit_id, reply_to)
     return (*candidates[0], answer) if len(candidates) == 1 else None
+
+
+def _archived_review_candidates(room: str, task: dict, explicit_id, reply_to: str) -> list:
+    """Decided reviews a later owner reply names, by id or by replying to their card;
+    the reply is answered with the archived outcome and acts on nothing."""
+    archive = _STATE / team_result_guard.WITHHELD_RESULT_DIR / "archive"
+    found = []
+    for archived in _review_paths(archive, strict=True):
+        record = _read_review_json(archived) or {}  # the preflight already refused any it cannot read
+        if (room != str(record.get("dm_room_id") or "")
+                or str(task.get("user_id") or "") != str(record.get("owner") or "")):
+            continue
+        if (explicit_id == record.get("review_id")
+                or (not explicit_id and reply_to and reply_to == str(record.get("dm_event_id") or ""))):
+            found.append((archived.parent.parent / archived.name, record))
+    return found
 
 
 def _released_review_body(raw: str) -> str:
@@ -939,26 +1009,191 @@ def _released_review_body(raw: str) -> str:
     return f"{parsed.body}\n\n{note}" if parsed.body else note
 
 
+_REFUSED_REVIEW_PUBLICATIONS: set = set()
+
+
+def _stale_review_write(path: Path, step: str) -> None:
+    current = _read_review_json(path) or {}
+    _log(f"withheld review {path.stem}: {step} not recorded, the record changed meanwhile "
+         f"(now {current.get('status')}); the next beat retries from it")
+
+
+# Outbox park reasons that mean the release was never delivered; any other park may have landed.
+_DEFINITE_PUBLISH_FAILURES = ("permanent-refusal", "max-attempts", "retry-window-exhausted")
+
+
+def _post_room_message(room: str, body: str, dedupe_key: str) -> dict:
+    """The room-message send for an outbox provider: one /v1/room message POST."""
+    return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
+                                     "dedupe_key": dedupe_key}, timeout=20)
+
+
+def _record_release_receipt(item_id: str, event_id: str) -> None:
+    """The release's durable receipt, written to its review record before the outbox is
+    told it was delivered; raises when it cannot be written."""
+    review_id, _, claim = item_id.partition(".")
+    path = _STATE / team_result_guard.WITHHELD_RESULT_DIR / f"{review_id}.json"
+    if not team_result_guard.record_release_receipt(path, claim, event_id):
+        raise OSError(f"release receipt for {review_id} not recorded")
+
+
+def _withheld_outbox() -> DeliveryCore:
+    """The outbox that publishes an owner-released body to its room, at most once."""
+    return _delivery_core("withheld")
+
+
 def _publish_review(path: Path, record: dict) -> bool:
+    version = team_result_guard.record_version(record)
+    claim = record.get("decision_claim_id")
+    if not team_result_guard.withheld_claim_publishable(path, claim):
+        if str(path) not in _REFUSED_REVIEW_PUBLICATIONS:
+            _REFUSED_REVIEW_PUBLICATIONS.add(str(path))
+            _log(f"withheld review {path.stem}: publication refused, no matching release "
+                 "claim; the body stays private until the owner acts")
+        return False
     context = record.get("context") or {}
     room = str(context.get("channel_id") or "")
     body = _released_review_body(str(record.get("withheld_body") or ""))
     if not room.startswith("!") or not body:
-        record.update({"status": "publish_failed", "publish_error": "invalid origin/body",
-                       "card_resolution_pending": True})
-        team_result_guard.update_record(path, record)
+        return _record_publish_failure(path, record, version, "invalid origin/body")
+    core, item_id = _withheld_outbox(), f"{record['review_id']}.{claim}"
+    landed = _reread_record(path)
+    if (landed.get("decision_claim_id") == claim
+            and isinstance(landed.get("release_event_id"), str) and landed["release_event_id"]):
+        # A recorded event id proves the release landed: settle, never send it again.
+        _settle_landed_release(core, item_id, room)
+        return _commit_landed(path, record, landed)
+    payload = json.dumps({"room_id": room, "body": body}, sort_keys=True).encode("utf-8")
+    core.backend.publish(item_id, payload)  # once per claim; the outbox owns every retry
+    if (read_item(core.backend.root, item_id) or {}).get("status") not in core.backend.TERMINAL:
+        core.deliver_one(item_id, payload)
+    item = read_item(core.backend.root, item_id) or {}
+    if item.get("status") == "DELIVERED":
+        current = _reread_record(path)
+        if current.get("status") == "published":
+            return True
+        event_id = current.get("release_event_id")
+        if isinstance(event_id, str) and event_id:
+            return _commit_landed(path, record, current)
+        if f"no-receipt:{item_id}" not in _REFUSED_REVIEW_PUBLICATIONS:
+            _REFUSED_REVIEW_PUBLICATIONS.add(f"no-receipt:{item_id}")
+            _log(f"withheld review {path.stem}: the outbox marks the release delivered but no "
+                 "event id was recorded; it is left pending for the owner, not marked published")
         return False
-    answer = _req("POST", "/v1/room", {
-        "op": "message", "room_id": room, "body": body,
-        "dedupe_key": f"withheld-publish:{record['review_id']}",
-    }, timeout=20)
-    if not isinstance(answer, dict) or not answer.get("ok"):
-        return False
-    record.update({"status": "published", "published_at": time.time(),
-                   "published_event_id": str(answer.get("event_id") or ""),
+    if item.get("status") == "PARKED":
+        if item.get("reason") in _DEFINITE_PUBLISH_FAILURES:
+            return _record_publish_failure(path, record, version, item.get("reason"))
+        if not record.get("publish_parked"):
+            record.update({"publish_parked": str(item.get("reason")), "card_resolution_pending": True})
+            if not team_result_guard.update_record(path, record, expect=version):
+                _stale_review_write(path, "parked publication")
+        if f"unknown:{item_id}" not in _REFUSED_REVIEW_PUBLICATIONS:
+            _REFUSED_REVIEW_PUBLICATIONS.add(f"unknown:{item_id}")
+            _log(f"withheld review {path.stem}: the publication may have landed but was not "
+                 f"confirmed ({item.get('reason')}); it is not sent again and stays pending. "
+                 f"Check the room first; to send it again (a new dedupe key, so it may post "
+                 f"twice): {_requeue_command(core.backend.root, item_id)}")
+    return False
+
+
+def _commit_landed(path: Path, record: dict, current: dict) -> bool:
+    committed = _commit_publication(path, current, team_result_guard.record_version(current),
+                                    current["release_event_id"])
+    if committed:
+        record.clear()
+        record.update(current)  # the caller continues from the committed version
+    return committed
+
+
+def _settle_landed_release(core: DeliveryCore, item_id: str, room: str) -> bool:
+    """Drive an outbox item whose release a recorded event id proves to DELIVERED, through
+    the outbox's own requeue, claim and complete; never sends. False while a claim holds it."""
+    root = core.backend.root
+    if (read_item(root, item_id) or {}).get("status") == "PARKED":
+        requeue_item_with_epoch(root, item_id, operator=core.worker,
+                                reason="release proven by a recorded event id")
+    token = core.backend.claim(item_id, core.worker)
+    if token is None:
+        return (read_item(root, item_id) or {}).get("status") == "DELIVERED"
+    return core.backend.complete(token, CoreDeliveryOutcome.CONFIRMED,
+                                 provider=type(core.provider).__name__, destination=room)
+
+
+def _settle_landed_releases() -> None:
+    """Each beat: an outbox item not yet DELIVERED whose review holds the receipt for its claim
+    is driven to DELIVERED until it is, never sent again. Reads every item of this outbox."""
+    core = _withheld_outbox()
+    directory = _STATE / team_result_guard.WITHHELD_RESULT_DIR
+    for item in list_items(core.backend.root):
+        item_id = str(item.get("item_id") or "")
+        review_id, _, claim = item_id.partition(".")
+        if item.get("status") == "DELIVERED" or not claim:
+            continue
+        record = _settlement_record(directory, review_id)
+        if record is None:
+            if f"unreadable:{review_id}" not in _REFUSED_REVIEW_PUBLICATIONS:
+                _REFUSED_REVIEW_PUBLICATIONS.add(f"unreadable:{review_id}")
+                _log(f"withheld review {review_id}: its record could not be read; its outbox "
+                     "item is not settled until it can be")
+            continue
+        if (record.get("decision_claim_id") != claim
+                or not isinstance(record.get("release_event_id"), str) or not record["release_event_id"]):
+            continue
+        room = str((record.get("context") or {}).get("channel_id") or "")
+        try:
+            if not _settle_landed_release(core, item_id, room) and f"settle:{item_id}" not in \
+                    _REFUSED_REVIEW_PUBLICATIONS:
+                _REFUSED_REVIEW_PUBLICATIONS.add(f"settle:{item_id}")
+                _log(f"withheld review {review_id}: published; its outbox item is still claimed "
+                     "and is settled once that claim can be taken")
+        except Exception as exc:  # noqa: BLE001 — next beat retries
+            _log(f"withheld review {review_id}: outbox settlement deferred ({exc})")
+
+
+def _settlement_record(directory: Path, review_id: str) -> "dict | None":
+    """The archived decision owns its review, so it is read first and a live copy never hides
+    it; None (fail closed) when the record that would decide cannot be read."""
+    for path in (directory / "archive" / f"{review_id}.json", directory / f"{review_id}.json"):
+        try:
+            record = team_result_guard.read_json_strict(path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return None
+        return record if isinstance(record, dict) else None
+    return {}
+
+
+def _requeue_command(root, item_id: str) -> str:
+    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+
+
+def _reread_record(path: Path) -> dict:
+    """The live record, read again while it exists but does not read; {} once it is gone."""
+    for _attempt in range(5):
+        current = _read_review_json(path)
+        if current is not None or not team_result_guard.present(path):
+            return current or {}
+    return {}
+
+
+def _record_publish_failure(path: Path, record: dict, version: dict, reason) -> bool:
+    record.update({"status": "publish_failed", "publish_error": str(reason),
                    "card_resolution_pending": True})
-    team_result_guard.update_record(path, record)
-    return True
+    if not team_result_guard.update_record(path, record, expect=version):
+        _stale_review_write(path, "publication failure")
+    return False
+
+
+def _commit_publication(path: Path, record: dict, version: dict, event_id: str) -> bool:
+    """Record a confirmed publication on the review; a record that moved meanwhile is left
+    to the next beat, which commits it from the durable receipt and never sends again."""
+    record.update({"status": "published", "published_at": time.time(),
+                   "published_event_id": event_id, "card_resolution_pending": True})
+    if team_result_guard.update_record(path, record, expect=version):
+        return True
+    _stale_review_write(path, "publication")
+    return False
 
 
 def _resolved_review_body(record: dict) -> str:
@@ -971,26 +1206,76 @@ def _resolved_review_body(record: dict) -> str:
         outcome = "Published to the original room — the owner marked it as a false positive."
     elif status == "publish_failed":
         outcome = "False positive recorded, but publication failed and requires attention."
+    elif record.get("publish_parked"):
+        outcome = "False positive recorded, but publication could not be confirmed and requires attention."
     else:
         outcome = "False positive recorded; publication to the original room is pending."
     return f"**Private result review `{rid}` resolved**\n\n✓ {outcome}"
 
 
-def _resolve_review_card(path: Path, record: dict) -> bool:
+def _edit_review_card(record: dict) -> "dict | None":
     room = str(record.get("dm_room_id") or "")
     event_id = str(record.get("dm_event_id") or "")
     if not room.startswith("!") or not event_id.startswith("$"):
-        return False
+        return None
     answer = _req("POST", "/v1/room", {
         "op": "edit", "room_id": room, "event_id": event_id,
         "body": _resolved_review_body(record),
     }, timeout=20)
-    if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+    if (not isinstance(answer, dict) or room_response_refused(answer)
+            or not (answer.get("ok") or answer.get("event_id"))):
+        return None
+    return answer
+
+
+_RECONCILE_FAILURES: dict = {}
+# A reconcile that keeps failing stops re-editing the card after this many tries per process.
+_RECONCILE_GIVE_UP_AFTER = 3
+
+
+def _defers_to_archive(path: Path) -> bool:
+    """True when an archived decision owns this review: the live copy never acts. Only a
+    proven archived outcome restores the card, then retires the copy; never raises."""
+    try:
+        archived = team_result_guard.archived_withheld_decision(path)
+        if archived is None:
+            return False
+        if _RECONCILE_FAILURES.get(str(path), 0) >= _RECONCILE_GIVE_UP_AFTER:
+            return True
+        outcome = team_result_guard.archived_outcome(archived)
+        if (outcome is not None
+                and _edit_review_card(archived) is not None
+                and team_result_guard.retire_superseded_record(path)):
+            _log(f"withheld review {path.stem}: a live copy contradicted its archived "
+                 f"{outcome} decision; card restored and copy retired")
+            return True
+        note = ("its archived decision stands" if outcome is not None else
+                "its archived decision is not a recognised outcome; left for the owner")
+    except Exception as exc:  # noqa: BLE001 — one record's fault must never stop the beat
+        note = f"archive reconcile failed ({exc}); left for the owner"
+        failures = _RECONCILE_FAILURES[str(path)] = _RECONCILE_FAILURES.get(str(path), 0) + 1
+        if failures == _RECONCILE_GIVE_UP_AFTER:
+            _log(f"withheld review {path.stem}: archive reconcile failed {failures} times; "
+                 "no further card edits for it until the bridge restarts")
+    if f"archived:{path}" not in _REFUSED_REVIEW_PUBLICATIONS:
+        _REFUSED_REVIEW_PUBLICATIONS.add(f"archived:{path}")
+        _log(f"withheld review {path.stem}: live copy left untouched; {note}")
+    return True
+
+
+def _resolve_review_card(path: Path, record: dict) -> bool:
+    if not team_result_guard.decision_is_durable(record) or _defers_to_archive(path):
+        return False
+    version = team_result_guard.record_version(record)
+    answer = _edit_review_card(record)
+    if answer is None:
         return False
     record.update({"card_resolution_pending": False,
                    "card_resolved_at": time.time(),
                    "card_resolution_event_id": str(answer.get("event_id") or "")})
-    team_result_guard.update_record(path, record)
+    if not team_result_guard.update_record(path, record, expect=version):
+        _stale_review_write(path, "card resolution")
+        return False
     _archive_resolved_review(path, record)
     return True
 
@@ -1032,24 +1317,102 @@ def _handle_hitl_action(task: dict):
     return out or False
 
 
+def _claim_review_decision(task: dict, path: Path, updates: dict) -> "dict | None":
+    # The first durable decision is final; a later or racing reply is closed and logged.
+    try:
+        claimed = team_result_guard.claim_withheld_decision(path, updates)
+        if claimed is None:
+            _explain_unclaimed(task, path)
+    except Exception as exc:  # noqa: BLE001 — a failed claim is answered, never escapes the beat
+        _log(f"withheld review {path.stem}: reply {task.get('id')} could not be processed ({exc})")
+        _queue_review_control_result(task, body=(
+            f"Your decision on review `{path.stem}` could not be processed right now. Nothing "
+            "changed; please reply again."))
+        claimed = None
+    _queue_review_control_result(task)
+    return claimed
+
+
+def _explain_unclaimed(task: dict, path: Path) -> None:
+    current = _read_review_json(path) or {}
+    if team_result_guard.decision_lost(path):
+        _log(f"withheld review {path.stem}: an earlier decision was lost; reply "
+             f"{task.get('id')} not applied, left for the owner")
+        _queue_review_control_result(task, body=_lost_decision_notice(path, current))
+    elif current.get("status") not in (None, "awaiting_owner") \
+            and not team_result_guard.decision_is_durable(current):
+        _log(f"withheld review {path.stem}: decision recorded, it acts once it is durable; "
+             f"reply {task.get('id')} not applied again")
+    elif current.get("status") == "awaiting_owner":
+        _log(f"withheld review {path.stem}: decision could not be saved; reply "
+             f"{task.get('id')} not applied, the owner can answer again")
+        _queue_review_control_result(task, body=(
+            f"Your decision on review `{path.stem}` could not be saved. Nothing changed; "
+            "please reply again."))
+    else:
+        _log(f"withheld review {path.stem}: already decided; reply {task.get('id')} ignored")
+
+
+def _lost_decision_notice(path: Path, record: dict) -> str:
+    """What the owner is told about a decision lost after its claim was issued: whether a
+    publication was ever attempted, which only the outbox can prove, and how to unlock it."""
+    claims = team_result_guard.issued_claims(path)
+    root = _withheld_outbox().backend.root
+    attempted = any(read_item(root, f"{record.get('review_id') or path.stem}.{c}") is not None
+                    for c in claims)
+    sent = ("Its publication may already have been sent; check the room before answering."
+            if attempted else "Nothing was sent for it.")
+    unlock = shlex.join(["rm", "--", *(str(path.parent / "claims" / f"{path.stem}.{c}")
+                                       for c in claims)])
+    return (f"An earlier decision on review `{path.stem}` was not saved, so this reply was not "
+            f"applied. {sent} To answer again, remove its claim: {unlock}")
+
+
+def _archived_reply(path: Path) -> bool:
+    present = team_result_guard.present
+    return not present(path) and present(path.parent / "archive" / path.name)
+
+
 def _handle_review_decision(task: dict) -> bool:
     task_id = str(task.get("id") or "")
     if task_id and _control_result_path(task_id).is_file():
         return True
-    matched = _match_review_decision(task)
+    try:
+        matched = _match_review_decision(task)
+        archived_reply = matched is not None and _archived_reply(matched[0])
+    except (_ReviewsUnreadable, OSError) as exc:
+        _log(f"withheld reviews: reply {task.get('id')} could not be checked ({exc})")
+        record = getattr(exc, "record", "")
+        _queue_review_control_result(task, body=(
+            f"Your reply could not be checked: the review record `{record}` is not a readable "
+            f"review ({exc.reason}). Nothing changed. Inspect or remove that file; then please "
+            "reply again."
+            if record else
+            "Your reply could not be checked against your pending reviews right now. Nothing "
+            "changed; please reply again."))
+        return True
     if matched is None:
         return False
     path, record, answer = matched
+    if archived_reply:
+        _log(f"withheld review {path.stem}: already decided; reply {task.get('id')} "
+             "answered with the archived outcome")
+        outcome = team_result_guard.archived_outcome(record)
+        _queue_review_control_result(task, body=_resolved_review_body(record) if outcome else (
+            f"Review `{record.get('review_id') or path.stem}` was already decided, but its record "
+            "is not a recognised outcome. Nothing was changed; it is left for you to check."))
+        return True  # a later reply to a decided review: answered, never acted on
     if record.get("status") in ("kept_private", "published"):
         _queue_review_control_result(task)
         if record.get("card_resolution_pending"):
             _resolve_review_card(path, record)
         return True  # delivery retry of the same owner decision
     if answer == "yes":
-        record.update({"status": "kept_private", "resolved_at": time.time(),
-                       "decision": "sensitive", "card_resolution_pending": True})
-        team_result_guard.update_record(path, record)
-        _queue_review_control_result(task)
+        record = _claim_review_decision(task, path, {
+            "status": "kept_private", "resolved_at": time.time(),
+            "decision": "sensitive", "card_resolution_pending": True})
+        if record is None:
+            return True
         try:
             _resolve_review_card(path, record)
         except Exception as exc:  # noqa: BLE001 — durable pending state retries
@@ -1057,10 +1420,11 @@ def _handle_review_decision(task: dict) -> bool:
         return True
     # Persist release before the network call; pending retries use a stable
     # dedupe key so they cannot duplicate the disclosure.
-    record.update({"status": "publish_pending", "resolved_at": time.time(),
-                   "decision": "false_positive", "card_resolution_pending": True})
-    team_result_guard.update_record(path, record)
-    _queue_review_control_result(task)
+    record = _claim_review_decision(task, path, {
+        "status": "publish_pending", "resolved_at": time.time(),
+        "decision": "false_positive", "card_resolution_pending": True})
+    if record is None:
+        return True
     try:
         _resolve_review_card(path, record)
         if _publish_review(path, record):
@@ -1068,6 +1432,13 @@ def _handle_review_decision(task: dict) -> bool:
     except Exception as exc:  # noqa: BLE001 — durable pending state retries
         _log(f"withheld review {record.get('review_id')} publish deferred: {exc}")
     return True
+
+
+def _retry_withheld_reviews() -> None:
+    """One poll beat's durable review retries, in order."""
+    _retry_pending_publications()
+    _retry_review_card_resolutions()
+    _retry_review_control_results()
 
 
 def _retry_pending_publications() -> None:
@@ -1079,10 +1450,16 @@ def _retry_pending_publications() -> None:
                 _log(f"withheld review {record.get('review_id')} publish still pending")
         except Exception as exc:  # noqa: BLE001 — next poll retries
             _log(f"withheld review {record.get('review_id')} publish retry failed: {exc}")
+    try:
+        _settle_landed_releases()
+    except Exception as exc:  # noqa: BLE001 — next poll retries
+        _log(f"withheld release settlement deferred: {exc}")
 
 
 def _retry_review_card_resolutions() -> None:
     for path, record in _pending_review_records():
+        if _defers_to_archive(path):
+            continue
         if not record.get("card_resolution_pending"):
             _archive_resolved_review(path, record)
             continue
@@ -1103,8 +1480,11 @@ def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
     if not task_id:
         return
     path = _control_result_path(task_id)
-    if not path.is_file():
-        _atomic_private_json(path, {"id": task_id, "body": body})
+    try:
+        if not path.is_file():
+            _atomic_private_json(path, {"id": task_id, "body": body})
+    except Exception as exc:  # noqa: BLE001 — the reply is redelivered and answered then
+        _log(f"review control result {task_id} not saved: {exc}")
 
 
 def _retry_review_control_results() -> None:
@@ -1128,6 +1508,11 @@ def _is_redelivery_control(body: str) -> bool:
     """Compare on stripped text: `read_ready_result` strips, the constant ends
     in a newline, so a raw `==` never matches a body that came off disk."""
     return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
+
+
+# The one marker verdict every delivery decision here reads on the guarded body; the
+# suppression journal reads it too, so whatever the drain closes silently is recorded.
+DELIVERY_SKIP_AFTER_CHANNEL = True
 
 
 def _guarded_result_body(tid: str, body: str):
@@ -1184,7 +1569,8 @@ def _guarded_result_body(tid: str, body: str):
     verdict = materialize(
         verdict, body, _STATE, tid, context=context, agent_id=agent_id,
         now=time.time())
-    if guarded_tier(tier) and suppression_only(body):
+    if guarded_tier(tier) and suppression_only(
+            body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL):
         # Honouring a guarded close without recording it is the accountability
         # gap the guard used to answer with a refusal.
         verdict = journal_suppression(
@@ -1612,6 +1998,9 @@ def _start_results_watcher() -> "threading.Thread | None":
 
 
 HEARTBEAT_INTERVAL = 60
+# A relay without /v1/heartbeat (404/405) is retried on a doubling backoff up to this cap,
+# so a broker that deploys or restores the route is picked up without a bridge restart.
+HEARTBEAT_UNSUPPORTED_MAX_BACKOFF = 1800.0
 # When the gateway lacks /v1/tasks/<id>/ack it returns 404/405; we back off
 # instead of hammering it — but only for this cooldown, then retry. A permanent
 ACK_UNSUPPORTED_COOLDOWN = int(os.environ.get("REMOTE_ACK_RETRY_COOLDOWN") or "300")
@@ -1745,7 +2134,8 @@ def _auth_probe() -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
-_heartbeat_disabled = False
+_heartbeat_retry_at = 0.0  # 0 = enabled; else epoch before which heartbeats are skipped
+_heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
 
@@ -2514,6 +2904,23 @@ def _core_str(v) -> str | None:
     return v[:_CORE_STEP_MAX] if v else None
 
 
+def _core_status_written_at() -> float | None:
+    """When core-status.json was last written: its `ts` stamp, else the file mtime; None
+    when neither can be read. Never raises."""
+    path = _STATE / "core-status.json"
+    try:
+        with open(path) as f:
+            ts = json.load(f).get("ts")
+        if type(ts) in (int, float) and ts == ts:
+            return float(ts)
+    except Exception:  # noqa: BLE001 — fall back to the mtime
+        pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _read_core_status() -> tuple[str | None, str | None]:
     """Read this node's core-status.json → (status, step) for the presence layer.
     core-status is written by the proactive loop / task handlers (status =
@@ -2950,11 +3357,43 @@ def _maybe_pull_worker_labels(record) -> bool:
 
 # The primary app checks every 30 minutes; the fallback checks every five.
 _HEALTH_REPORT_MAX_AGE = 35 * 60
+# A self-report older than this needs a live beat to stand: a dead core leaves its last
+# "idle" behind, while an idle core rewrites nothing, so a beating core keeps it.
+_CORE_STATUS_MAX_AGE = 60 * 60
 
 
-def _reported_core_status() -> tuple[str | None, str | None]:
+def _liveness_status(alive) -> str | None:
+    """The status the core's beat alone supports: idle when it beats, offline when it
+    stopped, nothing when there is no beat to judge (a standalone sparrow, or a core
+    that has not started its heartbeat yet)."""
+    return {True: "idle", False: "offline"}.get(alive)
+
+
+def _core_stopped_at() -> float | None:
+    """mtime of this host's graceful-stop tombstone (core_heartbeat.mark_stopped), or None.
+    The next beat run deletes it, so it cannot outlive a core that came back and beat."""
+    try:
+        return (_STATE / "cores" / f"{_profile_host_id()}.stopped").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None, str | None]:
     """Overlay independent diagnostics without exporting their private details."""
     status, step = _read_core_status()
+    alive = core_health.get("alive") if isinstance(core_health, dict) else None
+    written_at = _core_status_written_at() if status is not None else None
+    stopped_at = _core_stopped_at() if core_health is not None and alive is not True else None
+    if stopped_at is not None and (written_at is None or written_at < stopped_at):
+        # A stop newer than the self-report outranks it; a later start supersedes the stop.
+        status, step = "offline", None
+    elif core_health is not None and (written_at is None or (
+            alive is not True and time.time() - written_at > _CORE_STATUS_MAX_AGE)):
+        # A stopped core deletes its beat, so a missing beat vouches for nothing; omitting the
+        # field would leave the broker's last presence status standing.
+        status, step = _liveness_status(alive), None
+        if status is None:
+            status, step = "unknown", "Core liveness unavailable"
     if status in ("error", "offline"):
         return status, step
     try:
@@ -2966,10 +3405,13 @@ def _reported_core_status() -> tuple[str | None, str | None]:
     try:
         ts, total, failures = (report[k] for k in ("checked_at", "total", "failures"))
         if (report.get("version") != 1 or type(ts) not in (int, float)
-                or not 0 <= time.time() - ts <= _HEALTH_REPORT_MAX_AGE
+                or not 0 <= time.time() - ts
                 or type(total) is not int or total <= 0
                 or type(failures) is not int or not 0 <= failures <= total):
             return "unknown", "Health check unavailable"
+        if time.time() - ts > _HEALTH_REPORT_MAX_AGE:
+            # An old report is no opinion; a host that stopped checking must not read unknown forever.
+            return status, step
         if failures:
             return "error", f"Health check: {failures} failing check(s)"
     except Exception:
@@ -2980,17 +3422,17 @@ def _reported_core_status() -> tuple[str | None, str | None]:
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
-    global _heartbeat_disabled, _last_heartbeat_at, _last_core_health
-    if _heartbeat_disabled:
-        return False
+    global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
     now = time.time()
+    if _heartbeat_retry_at and now < _heartbeat_retry_at:
+        return False
     health = _core_health(_health_snapshot())
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _status, _step = _reported_core_status()
+    _status, _step = _reported_core_status(health)
     try:
         payload = {
             "client": "sutando-gateway-client",
@@ -3011,11 +3453,14 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
-            _heartbeat_disabled = True
-            _log("gateway does not support heartbeat — continuing without")
+            _heartbeat_backoff = min(max(_heartbeat_backoff * 2, HEARTBEAT_INTERVAL),
+                                     HEARTBEAT_UNSUPPORTED_MAX_BACKOFF)
+            _heartbeat_retry_at = time.time() + _heartbeat_backoff
+            _log(f"gateway does not support heartbeat — retrying in {_heartbeat_backoff:.0f}s")
             return False
         if e.code in (401, 403):
             raise
@@ -3534,6 +3979,10 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
                 lines.append("session_scope: room")
         elif f == "source":
             lines.append(f"source: {_one_line(task.get('source') or PROVIDER)}")
+        elif f == "timestamp":
+            if task.get(f) not in (None, ""):
+                lines.append(f"timestamp: {_one_line(task[f])}")
+            lines.append(f"local_time: {local_task_protocol.local_time_value()}")
         elif f == "interaction_type":
             # Pass through when the gateway sends it; default to "message" —
             # all current gateway traffic is Matrix room messages. Whitelisted:
@@ -3889,22 +4338,164 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple
     return "ok", ""
 
 
-def _archive_result(path: Path, tid: str) -> None:
-    ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        path.rename(ARCHIVE_RESULTS_DIR / f"{tid}-{int(time.time())}.txt")
-    except OSError:
-        path.unlink(missing_ok=True)
-    # The delivered task's queue file comes along too — otherwise served tasks
-    # sit in tasks/ forever and the health-check counts them as a stuck queue.
+def _archive_result(path: Path, tid: str, generation) -> bool:
+    """Retire a sent result: the lifecycle owner moves only the publication
+    this pass read and sent, so a reply that replaced it meanwhile stays live.
+    False = the id must stay looked for; the caller keeps its bookkeeping."""
+    if not _intend_settle(tid):
+        disposal.report_once(f"intent:{tid}", _log,
+                             f"result {tid}: sent, but its settle intent could not be saved; nothing "
+                             "was moved, and the next pass tries again")
+        return False
+    done = disposal.retire_generation(RESULTS_DIR, path, generation, _log, ARCHIVE_RESULTS_DIR,
+                                      _names(f"{tid}-{int(time.time())}"))
+    if done.outcome is disposal.Retirement.REPLACEMENT_LIVE:
+        _log(f"result {tid}: the reply this pass sent was replaced at its name before it was "
+             "archived; the newer one stays live")
+        return False
+    if done.outcome is disposal.Retirement.FALLBACK:
+        disposal.report_once(f"archive:{tid}", _log,
+                             f"result {tid}: sent, but kept outside the archive: {done.cause}")
+        return False
+    if not done.retired:
+        disposal.report_once(f"archive:{tid}", _log,
+                             f"result {tid}: sent, but could not be archived ({done.cause})")
+        return False
+    if not _archive_task_file(tid):
+        _task_left_executable(tid)
+        return False
+    _settled(tid)
+    return True
+
+
+def _archive_task_file(tid: str) -> bool:
+    """Move a served task out of the queue. True once no file of it is left there;
+    a rename the core raced to first counts, one that failed does not."""
     tfile = find_task_file(TASKS_DIR, tid)
     if tfile is not None:
         archive_dir = TASKS_DIR / "archive"
-        archive_dir.mkdir(parents=True, exist_ok=True)
         try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
             tfile.rename(archive_dir / f"{tid}.txt")
         except OSError:
-            pass  # best-effort; core may have archived it concurrently
+            pass
+    return find_task_file(TASKS_DIR, tid) is None
+
+
+# Ids whose result is disposed of but whose task could not be archived yet; each
+# drain pass retries them. A restart rebuilds the set by scanning each tracked id once.
+_SETTLE_PENDING: "set[str]" = set()
+_SETTLE_SCANNED: "set[str]" = set()
+_SETTLE_LOADED = False
+_SETTLE_MUTEX = threading.RLock()
+
+
+def _settle_pending_file() -> Path:
+    return _STATE / f"remote-task-settle-pending{_INST_SUFFIX}.json"
+
+
+def _read_settle_ledger(path: Path) -> "str | None":
+    """The ledger's text, None when there is none; any other failure raises."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def _load_settle_pending() -> bool:
+    """Merge, once per process, the ids a previous process could not settle.
+    False while an existing ledger cannot be read: it must not be overwritten."""
+    global _SETTLE_LOADED
+    with _SETTLE_MUTEX:
+        if _SETTLE_LOADED:
+            return True
+        try:
+            text = _read_settle_ledger(_settle_pending_file())
+            ids = [] if text is None else json.loads(text)["ids"]
+            if not isinstance(ids, list):
+                raise ValueError("ids is not a list")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            disposal.report_once("settle-ledger", _log,
+                                 f"the settle-intent ledger could not be read ({e}); it is left as it is "
+                                 "and nothing is written over it until it can be")
+            return False
+        _SETTLE_PENDING.update(t for t in ids if isinstance(t, str) and _valid_local_tid(t))
+        _SETTLE_LOADED = True                   # published only once the read is resolved
+        return True
+
+
+def _save_settle_pending() -> bool:
+    """Load, merge and write as one transition; never over an unread ledger."""
+    with _SETTLE_MUTEX:
+        if not _load_settle_pending():
+            return False
+        return _durable_write(_settle_pending_file(), json.dumps({"ids": sorted(_SETTLE_PENDING)}))
+
+
+def _intend_settle(tid: str) -> bool:
+    """Record, before the sent result is moved, that this id was served: an
+    alias whose result then vanishes has no copy of its own to prove it."""
+    with _SETTLE_MUTEX:
+        _SETTLE_PENDING.add(tid)
+        return _save_settle_pending()
+
+
+def _settled(tid: str) -> None:
+    with _SETTLE_MUTEX:
+        if tid in _SETTLE_PENDING:
+            _SETTLE_PENDING.discard(tid)
+            _save_settle_pending()
+
+
+def _task_left_executable(tid: str) -> None:
+    """The settle intent is itself durable: after a restart an alias whose result
+    vanished has no copy of its own that would prove it disposed of."""
+    with _SETTLE_MUTEX:
+        _SETTLE_PENDING.add(tid)
+        saved = _save_settle_pending()
+    disposal.report_once(f"settle:{tid}", _log,
+                         f"result {tid}: its result is disposed of but its task could not be "
+                         "archived; it stays tracked and is retried each pass"
+                         + ("" if saved else " (the retry intent could not be saved)"))
+
+
+def _track_durably(tid: str, inflight: "set[str]") -> bool:
+    """Make the id restart-durable in flight before anything of it is removed.
+    Other threads see it only once the write holding it has committed."""
+    with _INFLIGHT_MUTEX:
+        if not _save_inflight(set(inflight) | {tid}):
+            return False
+        inflight.add(tid)
+        return True
+
+
+def _result_disposed(tid: str) -> bool:
+    """This id's own result was archived or kept, or its own delivery succeeded;
+    an alias is judged only by its own copies, never by its primary's record."""
+    if _delivered_copy_exists(tid) or undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
+        return True
+    root = getattr(_delivery_core().backend, "root", None)
+    delivery = _delivery_tid(tid)
+    return (root is not None and delivery == tid
+            and (read_item(root, _broker_tid(delivery)) or {}).get("status") == "DELIVERED")
+
+
+def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
+    """Retire the task of an id whose result is already disposed of. Nothing is
+    forgotten until its file has left the executable queue."""
+    if not _archive_task_file(tid):
+        _task_left_executable(tid)              # every caller made the id durable before this
+        return False
+    _settled(tid)
+    if inflight is not None:
+        inflight.discard(tid)
+    _forget_task_room(tid)
+    aliases = _load_dedup_aliases() or {}
+    if _delivery_tid(tid) == tid and not any(v == tid for k, v in aliases.items() if k != tid):
+        _forget_task_media(tid)
+    _forget_dedup_alias(tid)
+    _log(f"result {tid}: its result is disposed of and its task is archived; the task is retired")
+    return True
 
 
 # A legacy bare `.sending` claim carries no owner info, so recovery for those
@@ -3960,7 +4551,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          _proactive_thread_root and posts in that thread
       * bare [thread]  → task results only; stripped and ignored here
     """
-    parsed = parse_markers(body, skip_after_channel=True)
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     if any(a.kind == "skip" for a in parsed.actions):
         return ("drop", None, "")
     redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -4331,12 +4922,18 @@ def _holder_delivery_state(holder_id: str) -> str:
                                     (RESULTS_DIR / f"{holder_id}.txt").exists())
 
 
-def _dedup_plan(tid: str, holder_id: str | None):
+def _reask_id(tid: str) -> str:
+    """One re-ask per task: a pass that retries the decision reuses it."""
+    return "task-" + hashlib.sha256(f"dedup-reask\0{tid}".encode()).hexdigest()[:18]
+
+
+def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = None):
     """Shared dedup recovery, bound to this adapter's directories.
 
     A requeue carries the delivery forward: the re-ask keeps the room, stays
     in flight, and aliases back to the id the broker is waiting on. Without
-    that the re-ask is written and its answer is never looked for.
+    that the re-ask is written and its answer is never looked for. With
+    `inflight`, the re-ask is durably in flight before it is published.
     """
     room = _load_task_rooms().get(tid, "")
 
@@ -4352,12 +4949,24 @@ def _dedup_plan(tid: str, holder_id: str | None):
         rooms = _load_task_rooms()
         rooms[new_id] = room
         _save_task_rooms(rooms)
+        if inflight is not None and new_id not in inflight:
+            inflight.add(new_id)
+            if not _save_inflight(inflight):
+                inflight.discard(new_id)
+                return False
         return True
 
-    action, payload = plan_dedup_recovery(
-        RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
-        f"task-{uuid.uuid4().hex[:18]}", commit_identity=_commit,
-        channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+    # One planner at a time: the published check and the link are not atomic
+    # across a watcher that claims or archives the re-ask in between.
+    try:
+        with disposal.locked(RESULTS_DIR):
+            action, payload = plan_dedup_recovery(
+                RESULTS_DIR, TASKS_DIR, tid, holder_id, room,
+                _reask_id(tid), commit_identity=_commit,
+                channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
+    except OSError as e:
+        _log(f"dedup decision for {tid} deferred: {e}")
+        return "defer", None, room
     return action, payload, room
 
 
@@ -4377,20 +4986,33 @@ def _lease_close_body(skip) -> str:
 _DELIVERY_CORE: "DeliveryCore | None" = None
 
 
-def _delivery_core() -> DeliveryCore:
-    """Compose a persisted retry window over idempotent gateway result POSTs."""
-    global _DELIVERY_CORE
-    root = RESULTS_DIR / f".outbox{_INST_SUFFIX}"
-    if _DELIVERY_CORE is None or _DELIVERY_CORE.backend.root != root:
-        _DELIVERY_CORE = DeliveryCore(
+_WITHHELD_OUTBOX: "DeliveryCore | None" = None
+
+
+def _delivery_core(lane: str = "result") -> DeliveryCore:
+    """The one construction site of a delivery outbox: gateway results over idempotent
+    result POSTs, or an owner-released withheld result over an at-most-once room send."""
+    global _DELIVERY_CORE, _WITHHELD_OUTBOX
+    withheld = lane == "withheld"
+    root = (RESULTS_DIR / f".outbox-withheld-review{_INST_SUFFIX}" if withheld
+            else gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE))
+    current = _WITHHELD_OUTBOX if withheld else _DELIVERY_CORE
+    if current is None or current.backend.root != root:
+        # Late-bound senders, so token rotation and a test's _req double reach them mid-process.
+        provider = (AG2SpaceRoomMessageProvider(lambda *a: _post_room_message(*a),
+                                                lambda *a: _record_release_receipt(*a)) if withheld
+                    else AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)))
+        current = DeliveryCore(
             DesignAClaimBackend(root, retry_schedule=RetrySchedule(), republish_delivered=False),
-            # Late-bound so token rotation reassigning module globals (and the
-            # test harness's _req double) reach the provider mid-process.
-            AG2SpaceResultProvider(lambda *a, **k: _req(*a, **k)),
+            provider,
             policy=RetryPolicy(max_attempts=MAX_TRANSIENT_ATTEMPTS,
-                               defer_idempotent_resend=True),
-            worker="gateway-result-drain")
-    return _DELIVERY_CORE
+                               defer_idempotent_resend=not withheld),
+            worker="withheld-review-publication" if withheld else "gateway-result-drain")
+        if withheld:
+            _WITHHELD_OUTBOX = current
+        else:
+            _DELIVERY_CORE = current
+    return current
 
 
 def _read_ready_generation(rfile) -> "tuple[str | None, ResultIdentity | None]":
@@ -4441,7 +5063,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             return
         _log(f"result {tid}: {why} — quarantined to "
              f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {RESULTS_DIR / f'.outbox{_INST_SUFFIX}'} "
+             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
              f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
              f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
     except disposal.KeptQuarantined:
@@ -4756,7 +5378,7 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if body is None:
         _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
         return
-    parsed = parse_markers(body, skip_after_channel=True)
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     actions = parsed.actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
@@ -4876,6 +5498,17 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     return False
 
 
+def _settle_delivered(tid: str, item_id: str, rfile, inflight: "set[str] | None" = None) -> bool:
+    """A delivered id whose remaining reply the owner kept for a person or
+    archived has nothing left to deliver: its task is settled."""
+    root = getattr(_delivery_core().backend, "root", None)
+    if root is None or os.path.lexists(rfile):
+        return False                            # something is still live at the name: keep looking
+    if (read_item(root, item_id) or {}).get("status") != "DELIVERED":
+        return False
+    return _settle_task(tid, inflight)
+
+
 def _effective_item_id(core, broker_tid: str, no_send: bool) -> str:
     """A suppressed close for an already-delivered item rides its own record."""
     accepted = (read_item(core.backend.root, broker_tid) or {}) if no_send else {}
@@ -4962,6 +5595,7 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
 def _post_ready_results(inflight: set[str]) -> None:
     """For each in-flight task, if its result file exists, POST it + archive."""
     _recover_disposing_claims()
+    _load_settle_pending()
     changed = False
     for tid in list(inflight):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
@@ -4970,6 +5604,11 @@ def _post_ready_results(inflight: set[str]) -> None:
         rfile = RESULTS_DIR / f"{tid}.txt"
         raw, generation = _read_ready_generation(rfile)
         if raw is None:
+            # A disposed-of id whose task could not be archived earlier is retried here.
+            if not os.path.lexists(rfile):
+                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                    changed |= _settle_task(tid, inflight)
+                _SETTLE_SCANNED.add(tid)
             continue
         # Before the tier guard: a withheld review would name the shared room as its release target.
         mention = _owner_mention_disposition(tid, raw)
@@ -4985,12 +5624,12 @@ def _post_ready_results(inflight: set[str]) -> None:
             _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873); the guard has run,
         # so a skip after [channel:] is a skip here, not text posted into that room.
-        parsed = parse_markers(body, skip_after_channel=True)
+        parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
         if skip and skip.value == "deduped":
-            action, payload, room = _dedup_plan(tid, skip.extra)
+            action, payload, room = _dedup_plan(tid, skip.extra, inflight)
             if action == "wait":
                 inflight.add(payload)
                 changed = True
@@ -5017,6 +5656,7 @@ def _post_ready_results(inflight: set[str]) -> None:
                                                   "[no-send]" if mention else payload,
                                                   no_send=bool(mention), result_file=rfile,
                                                   generation=generation):
+                        changed |= _settle_delivered(tid, _broker_tid(_delivery), rfile, inflight)
                         continue
                 _holder = (skip.extra or "").strip()
                 # An out-of-grammar holder is sender-controlled; name its shape,
@@ -5024,7 +5664,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
                           else f"<malformed, {len(_holder)} chars>")
                 _log(f"dedup {action} for {tid} (holder {_shown} is not a valid delivery for this task)")
-                _archive_result(rfile, tid)
+                if not _archive_result(rfile, tid, generation):
+                    continue
                 inflight.discard(tid)
                 _forget_task_room(tid)
                 # A requeue carries the SAME delivery forward under a fresh local
@@ -5047,8 +5688,10 @@ def _post_ready_results(inflight: set[str]) -> None:
                                            _lease_close_body(skip),
                                            no_send=True, result_file=rfile,
                                            generation=generation):
+                changed |= _settle_delivered(tid, _broker_tid(_delivery), rfile, inflight)
                 continue
-            _archive_result(rfile, tid)
+            if not _archive_result(rfile, tid, generation):
+                continue
             # Retire the provenance WITH the result, never at read: this line is
             # only reached once the lease-closing POST has actually succeeded.
             _REDELIVERED.discard(tid)
@@ -5116,8 +5759,10 @@ def _post_ready_results(inflight: set[str]) -> None:
         thread_ask = redirect is None and any(a.kind == "thread-ask" for a in parsed.actions)
         if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
                                        generation=generation, thread_ask=thread_ask):
+            changed |= _settle_delivered(tid, _wire, rfile, inflight)
             continue
-        _archive_result(rfile, tid)
+        if not _archive_result(rfile, tid, generation):
+            continue
         inflight.discard(tid)
         _forget_task_room(tid)
         _forget_task_media(tid)
@@ -5296,13 +5941,18 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             if _delivery is None or raw is None:
                 continue                        # ledger unreadable or not ready: a later sweep decides
             _item = _broker_tid(_delivery)
+            if find_task_file(TASKS_DIR, tid) is not None and not _track_durably(tid, inflight):
+                _log(f"orphan sweep: {tid} could not be saved as in flight; its reply stays "
+                     "live for a later sweep")
+                continue                        # the live reply is the only restart-durable trace
             _root = getattr(_delivery_core().backend, "root", None)
             if _root is not None and delivered_body_differs(_root, _item, raw):
                 _quarantine_unsent(rfile, tid, _item, generation)
-                continue
-            if _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
-                              generation):
+            elif _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, f"{tid}-{int(now)}-late-duplicate",
+                                generation):
                 _log(f"orphan sweep: {tid} is a post-delivery duplicate — moved aside")
+            if _settle_delivered(tid, _item, rfile, inflight):
+                _save_inflight(inflight)
             continue
         # No task anywhere: nothing resolves a destination — quarantine,
         # never a labeled re-delivery (permanent sweep error otherwise).
@@ -5332,7 +5982,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         if _withheld:
             _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
-        parsed = parse_markers(body, skip_after_channel=True)
+        parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
             # for a human instead of composing a partial delivery.
@@ -5358,14 +6008,25 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         # Same outcome owner as the live drain: a 2xx {"ok": false} is a
         # refusal, and an unconfirmed close must keep its retryable result.
         _btid = _broker_tid(delivery)
+        # Delivery may move the result; the id is restart-durable before anything can.
+        if not _track_durably(tid, inflight):
+            _log(f"orphan sweep: {tid} could not be saved as in flight; its result stays "
+                 "live for a later sweep")
+            continue
         if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile,
                                    generation=generation):
-            _archive_result(rfile, tid)
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
+            if _archive_result(rfile, tid, generation):
+                inflight.discard(tid)           # settled: the in-flight entry was only a marker
+                _save_inflight(inflight)
             continue
         _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
         if _delivery_core().backend.is_terminal(_item):
-            continue                            # disposed and logged by the delivery call
+            if _settle_delivered(tid, _btid, rfile, inflight):
+                _save_inflight(inflight)        # disposed and logged by the delivery call
+            continue
+        inflight.discard(tid)                   # a retryable failure: the sweep tries again
+        _save_inflight(inflight)
         _tries = _delivery_core().backend.attempts(_item)
         _log(f"orphan sweep: {tid} close not confirmed (attempt {_tries}) — will retry")
 
@@ -5650,9 +6311,7 @@ def main() -> None:
                     _results_watcher.join(timeout=5)
                 return
             _post_heartbeat(inflight)
-            _retry_pending_publications()
-            _retry_review_card_resolutions()
-            _retry_review_control_results()
+            _retry_withheld_reviews()
             # LAST of the beat's work, on a daemon thread: two optional 15 s
             # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()

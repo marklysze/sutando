@@ -28,6 +28,13 @@ python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 ```
 
+**Trigger: any time you would write a question for the owner into terminal or summary text, file
+it instead** with `ask` (or `scripts/ask-owner.py`; add `--unless-open` to file nothing when an
+open row already has that question — it reports `already open: [<id>]`). The terminal and a compaction summary reach no one.
+This skill's `hooks/compact-carry.py` keeps owner questions out of compaction summaries and, after
+one, has the core file any never-asked question it carried; `session-state.md` shows only the
+count (`python3 src/pending_questions_reader.py summary`).
+
 - `ask` reconciles, queues the question to the owner (the task's conversation only for an
   owner-tier task in his DM; otherwise his DM), saves it to the outbox, writes the row born
   with its `**Sent:**` record, and once that exact row is confirmed complete commits the
@@ -48,6 +55,8 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
   an outage, not an empty outbox — whatever became of the one-time introduction message.
 - `reconcile` is the explicit pass: outbox replay, local close records, stale marks, the
   transitional legacy ingest, and the history backfill for rows that predate the marker.
+  Legacy ingest refuses an archive boundary hidden by damaged Markdown before creating
+  rows or marking source entries moved; it reports the affected line numbers.
   Every step commits the history marker before it releases local evidence (an outbox entry,
   a close record, a legacy file entry), and keeps that evidence when the commit fails. `ask`
   and `remind` run it; `list` does not.
