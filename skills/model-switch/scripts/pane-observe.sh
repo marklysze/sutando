@@ -30,7 +30,8 @@ case "$MODE" in
   wait) ;;
   *) echo "pane-observe: one of --count/--wait/--cancel" >&2; exit 2;;
 esac
-[ -n "$ANSWER" ] && bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Enter
+# The sender's status (1 not sent, 75 busy, 124 revoked, 125 may have applied) is the verdict, not a timeout.
+if [ -n "$ANSWER" ]; then bash "$PANE_KEYS" -S "$SOCK" -t "$SESSION" -- Enter || exit $?; fi
 # A NEW matching line (count above baseline) is the switch; the dialog means the CLI waits on a human.
 deadline=$(( $(date +%s) + TIMEOUT ))
 while :; do

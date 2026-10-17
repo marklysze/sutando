@@ -287,6 +287,122 @@ class HookedServer(unittest.TestCase):
         self.assertEqual(Path(self.bytes).read_text(), "FIRST")
 
 
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class ServerEnvironment(unittest.TestCase):
+    """The tmux server runs the claim's liveness check in its own environment, not the sender's."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        self.sock = os.path.join(self.dir, "s")
+        self.bytes = os.path.join(self.dir, "bytes")
+        subprocess.run(["tmux", "-S", self.sock, "new-session", "-d", "-s", "t", "-x", "120", "-y", "20",
+                        f"stty raw -echo; cat > {self.bytes}"], check=True,
+                       env={**os.environ, "TZ": "UTC", "LC_ALL": "C"})
+        time.sleep(0.3)
+
+    def tearDown(self):
+        subprocess.run(["tmux", "-S", self.sock, "kill-server"], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_server_in_another_zone_and_locale_still_receives_the_keys(self):
+        r = subprocess.run(["bash", str(HELPER), "-S", self.sock, "-t", "=t:0", "--", "-l", "--", "TZ-MISMATCH"],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "TZ": "America/Los_Angeles", "LC_ALL": "fr_FR.UTF-8"})
+        time.sleep(0.3)
+        self.assertEqual((r.returncode, Path(self.bytes).read_text()), (0, "TZ-MISMATCH"), r.stderr)
+        self.assertEqual(tmux_pane_keys.fence_status(self.sock), "clear")
+
+
+class GuardState(unittest.TestCase):
+    """Production writers drive the guard through the states a queued request can leave behind."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="pk", dir="/tmp")
+        self.sock = os.path.join(self.dir, "s")
+        self.guard = tmux_pane_keys.guard_path(self.sock)
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def acquire(self):
+        with tmux_pane_keys.prepare_guard(self.sock).open("ab") as mutex:
+            return tmux_pane_keys.acquire_guard(self.sock, mutex.fileno())
+
+    def generation(self):
+        work = Path(tempfile.mkdtemp(prefix="tmux-pane-keys."))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        tmux_pane_keys.prepare_guard(self.sock)
+        tmux_pane_keys.begin_guard(self.sock, work / "ticket")
+        return work
+
+    def recover(self):
+        return subprocess.run([sys.executable, str(REPO / "src" / "tmux_pane_keys.py"), "recover", self.sock],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a_late_orphan_reconciles_the_fence_it_raised(self):
+        work = self.generation()
+        (work / "ticket").rename(work / "ticket.claimed")
+        self.assertEqual(self.acquire(), tmux_pane_keys.UNCERTAIN)
+        (work / "ticket.claimed").rename(work / "ticket.orphaned")
+        self.assertEqual(tmux_pane_keys.fence_status(self.sock), "clear")
+        self.assertEqual(self.acquire(), 0)
+        self.assertFalse((self.guard / "uncertain").exists() or (self.guard / "pending.json").exists())
+        self.assertFalse(work.exists())
+
+    def test_a_claim_that_never_orphans_stays_fenced(self):
+        work = self.generation()
+        (work / "ticket").rename(work / "ticket.claimed")
+        for _ in range(2):
+            self.assertEqual(self.acquire(), tmux_pane_keys.UNCERTAIN)
+        self.assertEqual(tmux_pane_keys.fence_status(self.sock), "uncertain")
+        self.assertTrue((work / "ticket.claimed").exists())
+
+    def test_a_revoked_generation_leaves_no_work_directory(self):
+        work = self.generation()
+        self.assertEqual(self.acquire(), 0)
+        self.assertFalse(work.exists())
+
+    def test_recovery_replaces_every_unreadable_guard_shape(self):
+        def dangling():
+            self.guard.symlink_to(Path(self.dir) / "gone")
+        def plain_file():
+            self.guard.write_text("x")
+        def mutex_directory():
+            (self.guard / "mutex").mkdir(parents=True)
+        def link_to_a_file():
+            (Path(self.dir) / "f").write_text("x")
+            self.guard.symlink_to(Path(self.dir) / "f")
+        for make in (dangling, plain_file, mutex_directory, link_to_a_file):
+            with self.subTest(make.__name__):
+                make()
+                self.assertEqual(tmux_pane_keys.fence_status(self.sock), "uncertain")
+                r = self.recover()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(tmux_pane_keys.fence_status(self.sock), "clear")
+                self.assertEqual(self.acquire(), 0)
+                target = self.guard.resolve()
+                self.guard.unlink() if self.guard.is_symlink() else shutil.rmtree(self.guard)
+                shutil.rmtree(target, ignore_errors=True)
+                (Path(self.dir) / "f").unlink(missing_ok=True)
+
+    def test_recovery_refuses_an_active_holder(self):
+        work = self.generation()
+        (work / "ticket").rename(work / "ticket.claimed")
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import sys,time; sys.path.insert(0, sys.argv[2]); from file_lock import lock_fd;"
+             " f = open(sys.argv[1], 'ab'); lock_fd(f.fileno()); print('held', flush=True); time.sleep(30)",
+             str(self.guard / "mutex"), str(REPO / "src")], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            r = self.recover()
+            self.assertEqual(r.returncode, tmux_pane_keys.BUSY, r.stderr)
+            self.assertTrue((self.guard / "mutex").is_file() and (self.guard / "pending.json").exists())
+        finally:
+            holder.kill()
+            holder.wait()
+            holder.stdout.close()
+
+
 class Timeout(unittest.TestCase):
     def _interrupt_sender(self, sig, phase, claimed=False):
         with tempfile.TemporaryDirectory() as d:
@@ -403,7 +519,7 @@ echo "$*" >> '{log}'
             self.assertEqual(r.returncode, 3)
             [call] = log.read_text().splitlines()
             self.assertRegex(call, rf"^-S {re.escape(str(Path(d) / 's'))} if-shell mv '([^']+/ticket)' '\1\.claimed' && "
-                                   r'case "\$\(ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
+                                   r'case "\$\(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p \d+ 2>/dev/null\)" in ')
             self.assertIn(" copy-mode -q -t '=c:0' ; if-shell -F -t '=c:0' '#{pane_in_mode}' ", call)
             self.assertTrue(call.endswith("""'send-keys -t '"'"'=c:0'"'"' '"'"'Enter'"'"''"""), call)
         self.assertEqual(run("-S", str(Path(d) / "s"), "-t", "=c:0").returncode, 2)

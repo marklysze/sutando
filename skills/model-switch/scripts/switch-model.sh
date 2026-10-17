@@ -105,7 +105,14 @@ case "$VERDICT" in
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; CONFIRMED=true
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      case "$ANSWER_RC" in
+        0|11) CONFIRMED=true;;
+        125) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+             echo "switch-model: the confirming Enter may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 8;;
+        *) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+           echo "switch-model: the confirming Enter was not sent (rc=$ANSWER_RC); picker attribution retained, nothing recorded" >&2; exit 8;;
+      esac
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
     else

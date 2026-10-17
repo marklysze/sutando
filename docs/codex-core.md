@@ -80,7 +80,8 @@ waiting on an output pipe after the client exits. Killing a client does not with
 a request already queued with a stopped server, so the send runs inside `if-shell`
 only if tmux can claim a one-time ticket file when it executes and the sending
 guard process is still alive after the claim: same pid, same start time
-(`ps -o lstart`), not a zombie. Otherwise the claim is renamed
+(`ps -o lstart`, read with `LC_ALL=C TZ=UTC` on both sides, so a server started in
+another zone or locale still matches), not a zombie. Otherwise the claim is renamed
 `ticket.orphaned` and nothing is sent, with or without a later sender. On timeout the
 sender revokes the ticket first, so a request tmux reaches after the sender has
 returned 124 sends nothing. If the ticket was already claimed at timeout, the
@@ -92,8 +93,9 @@ process death and is not inherited by tmux. Contention returns 75 (busy), rather
 than 125 (uncertain). A successful tmux reply whose ticket was not claimed, or was orphaned, is a failed send (status 1); any other outcome after a claim, including a signal-killed client, keeps the fence (125).
 The guard stores the unique ticket path before submitting
 the command. TERM cleanup revokes an unclaimed ticket; after SIGKILL, the next
-sender revokes it under the file lock. A claimed or unreadable ticket record
-remains fenced. Normal completion clears the pending record, while the guard's
+sender revokes it under the file lock and removes that generation's work directory.
+A claimed or unreadable ticket record remains fenced. A claim later renamed
+`ticket.orphaned` proves nothing was sent, so the next sender clears the fence it raised. Normal completion clears the pending record, while the guard's
 mutex stays in place for later senders. A legacy empty fence requires recovery.
 
 An uncertain send blocks automation on every pane of that socket. To recover,
@@ -106,12 +108,13 @@ PY="$(bash scripts/sutando-config.sh python-bin)"
 ```
 
 Recovery takes the same file lock and refuses with 75 while a sender is active;
-never delete the mutex to bypass it. `health-check.py` reports a standing or
+never delete the mutex to bypass it. A guard with no lockable mutex file (a dangling
+link, a plain file, a missing or non-file mutex) has no holder, so recovery replaces it. `health-check.py` reports a standing or
 unreadable fence as a `pane-key-fence` failure, with the socket path and recovery
 instruction. Active contention is healthy. Health checks never clear a fence.
 Do not clear the lock while an old request can still run. This state is tied to
 the IPC socket and survives notifier restarts. Only an atomically revoked,
-unclaimed ticket is automatically recovered; uncertainty never expires.
+unclaimed ticket or an orphaned claim is automatically recovered; uncertainty never expires.
 Explicit typing failures with
 no staged prompt skip Enter and defer the task; an Enter failure with the prompt still staged
 also defers after the configured confirmation retries. An unobservable successful

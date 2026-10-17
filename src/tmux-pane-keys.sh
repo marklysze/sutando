@@ -47,13 +47,13 @@ bounded() {
 # tmux single-quoted word: literal; an embedded ' closes, is double-quoted, reopens.
 tmux_quote() { local sq="'\"'\"'"; printf "'%s'" "${1//\'/$sq}"; }
 
-# A request queued with a stopped server outlives its client: it sends only if it claims this one-time
-# ticket and the guard ($PPID, same start time, not a zombie) is alive after the claim; else orphaned.
+# A queued request outlives its client: it sends only if it claims this one-time ticket and the guard ($PPID,
+# same start time read in a fixed locale and zone, not a zombie) is alive after the claim; else orphaned.
 TICKET="$WORK/ticket"
-STARTED="$(ps -o lstart= -p "$PPID" 2>/dev/null)"; STARTED="${STARTED%"${STARTED##*[! ]}"}"
+STARTED="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$PPID" 2>/dev/null)"; STARTED="${STARTED%"${STARTED##*[! ]}"}"
 [ -n "$STARTED" ] || { echo "tmux-pane-keys: cannot read the guard's start time" >&2; exit 1; }
 ORPHAN="mv $(tmux_quote "$TICKET.claimed") $(tmux_quote "$TICKET.orphaned")"
-CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
+CLAIM="mv $(tmux_quote "$TICKET") $(tmux_quote "$TICKET.claimed") && case \"\$(LC_ALL=C TZ=UTC ps -o lstart=,stat= -p $PPID 2>/dev/null)\" in \"$STARTED\"*Z*) $ORPHAN; false ;; \"$STARTED\"*) true ;; *) $ORPHAN; false ;; esac"
 
 # Hooks may run between the commands of a list, so the send is withheld (and its claim orphaned)
 # when the pane is back in a mode at the moment of sending.

@@ -7,6 +7,12 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"; export TMUX_FAKE_UNWRAP="$HERE/tests/l
 mkdir -p "$T/bin" "$T/cfg" "$T/state"
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+# Hang the Nth Enter before tmux takes its ticket (the sender revokes: 124) or after (125).
+if [ "${3:-}" = if-shell ] && case "${5:-}" in *"'Enter'"*) true;; *) false;; esac; then
+  n=$(( $(grep -c -- " Enter$" "$TMUX_LOG" 2>/dev/null) + 1 ))
+  [ "${TMUX_HANG_UNCLAIMED_ENTER_N:-0}" = "$n" ] && exec sleep 60
+  [ "${TMUX_HANG_CLAIMED_ENTER_N:-0}" = "$n" ] && { sh -c "$4"; exec sleep 60; }
+fi
 . "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 [ -n "${TMUX_FAIL:-}" ] && exit 1
@@ -160,5 +166,21 @@ rc=$(run 'sonnet[1m]'); R=$(python3 -c "import json;print(json.load(open('$T/sta
 rc=$(run 'fable[1m]'); [ "$rc" = 0 ] && ok "45 fable[1m] is matched against the CLI's display name (Fable 5.1)" || fail "45" "rc=$rc $(cat "$T/err")"
 bad=""; for m in 'sonnet[2m]' 'default[1m]' 'opusx' 'sonnet[1m]; rm -rf /' 'gpt[1m]'; do rc=$(run "$m"); [ "$rc" = 2 ] && ! grep -q send-keys "$TMUX_LOG" || bad="$bad $m:$rc"; done
 [ -z "$bad" ] && ok "46 garbage around an alias (sonnet[2m], default[1m], opusx, injected suffix, gpt[1m]) is refused (rc=2), nothing sent" || fail "46" "$bad"
+# --- the confirming Enter's own send verdict
+rm -f "$GREC" "$T/state/model-switch.json"; rc=$(SUTANDO_TMUX_SOCKET="$T/confirm125.sock" TMUX_DIALOG=1 TMUX_HANG_CLAIMED_ENTER_N=2 run opus --confirm --accept-timeout 3)
+[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && grep -q 'confirming Enter may have applied (rc=125)' "$T/err" && ! grep -q 'confirmed the dialog' "$T/err" && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "47 an uncertain confirming Enter is reported as such: attribution kept, nothing recorded" || fail "47" "rc=$rc $(cat "$T/err")"
+rm -f "$GREC"; rc=$(SUTANDO_TMUX_SOCKET="$T/confirm124.sock" TMUX_DIALOG=1 TMUX_HANG_UNCLAIMED_ENTER_N=2 run opus --confirm --accept-timeout 3)
+[ "$rc" = 8 ] && [ -e "$GREC" ] && closed 5 && grep -q 'confirming Enter was not sent (rc=124)' "$T/err" && ! grep -q 'confirmed the dialog' "$T/err" && [ ! -e "$T/state/model-switch.json" ] \
+  && ok "48 a revoked confirming Enter is not reported as a confirmation" || fail "48" "rc=$rc $(cat "$T/err")"
+OBSV="$HERE/skills/model-switch/scripts/pane-observe.sh"
+: > "$TMUX_LOG"; bash "$OBSV" sutando-core --socket "$T/confirm125.sock" --model opus --wait --timeout 1 --answer-enter > "$T/out" 2> "$T/err"; rc=$?
+[ "$rc" = 125 ] && [ ! -s "$T/out" ] && ! grep -q send-keys "$TMUX_LOG" && ok "49 the observer's Enter on a fenced socket returns 125, not TIMEOUT" || fail "49" "rc=$rc $(cat "$T/out")"
+python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import tmux_pane_keys; tmux_pane_keys.prepare_guard(sys.argv[2])" "$HERE/src" "$T/busy.sock"
+python3 -c "import sys,time; sys.path.insert(0, sys.argv[1]); from file_lock import lock_fd; f=open(sys.argv[2],'ab'); lock_fd(f.fileno()); print('held', flush=True); time.sleep(30)" "$HERE/src" "$T/busy.sock.pane-keys-lock/mutex" > "$T/held" & HOLDER=$!
+for _ in $(seq 50); do grep -q held "$T/held" && break; sleep 0.1; done
+: > "$TMUX_LOG"; bash "$OBSV" sutando-core --socket "$T/busy.sock" --model opus --wait --timeout 1 --answer-enter > "$T/out" 2> "$T/err"; rc=$?
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+[ "$rc" = 75 ] && [ ! -s "$T/out" ] && ! grep -q send-keys "$TMUX_LOG" && ok "50 the observer's Enter while another sender holds the lock returns 75, not TIMEOUT" || fail "50" "rc=$rc $(cat "$T/out")"
 
-echo; [ $fails -eq 0 ] && echo "switch-model: all 46 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }
+echo; [ $fails -eq 0 ] && echo "switch-model: all 50 checks pass" || { echo "switch-model: $fails FAILED"; exit 1; }

@@ -50,21 +50,25 @@ def _pending_ticket(guard):
     return ticket
 
 
-def finish_guard(socket, completed=False):
+def finish_guard(socket, completed=False, sweep=False):
     guard = guard_path(socket)
     if completed:
         (guard / "pending.json").unlink(missing_ok=True)
         (guard / "uncertain").unlink(missing_ok=True)
         return 0
     ticket = _pending_ticket(guard)
-    if not completed and ticket is not None:
+    if ticket is not None:
         try:
             ticket.unlink()
         except FileNotFoundError:
             if not ticket.with_name("ticket.orphaned").exists():
                 (guard / "uncertain").touch()
                 return UNCERTAIN
-    if (guard / "uncertain").exists() and not completed:
+            # An orphaned claim is terminal proof that this generation sent nothing.
+            (guard / "uncertain").unlink(missing_ok=True)
+        if sweep:
+            shutil.rmtree(ticket.parent, ignore_errors=True)
+    if (guard / "uncertain").exists():
         return UNCERTAIN
     (guard / "pending.json").unlink(missing_ok=True)
     return 0
@@ -84,11 +88,7 @@ def acquire_guard(socket, fd):
     rc = _lock_fd(fd)
     if rc:
         return rc
-    guard = guard_path(socket)
-    if (guard / "uncertain").exists():
-        return UNCERTAIN
-    rc = finish_guard(socket)
-    return rc
+    return finish_guard(socket, sweep=True)
 
 
 def begin_guard(socket, ticket):
@@ -113,12 +113,29 @@ def fence_status(socket):
             if _lock_fd(stream.fileno()) == BUSY:
                 return "busy"
             ticket = _pending_ticket(guard)
-            if (guard / "uncertain").exists() or (
-                    ticket is not None and not ticket.exists() and not ticket.with_name("ticket.orphaned").exists()):
+            if ticket is not None and ticket.with_name("ticket.orphaned").exists():
+                return "clear"  # the next sender reconciles it
+            if (guard / "uncertain").exists() or (ticket is not None and not ticket.exists()):
                 return "uncertain"
             return "clear"
     except (OSError, ValueError, KeyError, TypeError):
         return "uncertain"
+
+
+def replace_unreadable_guard(socket):
+    """Recovery only: a guard with no lockable mutex file has no live holder, so its shape is replaced."""
+    guard = guard_path(socket)
+    mutex = guard / "mutex"
+    if mutex.is_file():
+        return
+    if mutex.is_dir() and not mutex.is_symlink():
+        shutil.rmtree(mutex)
+    elif mutex.is_symlink() or mutex.exists():
+        mutex.unlink()
+    if guard.is_dir():
+        mutex.touch()
+    elif guard.is_symlink() or guard.exists():
+        guard.unlink()
 
 
 def run_guarded(socket, args):
@@ -164,10 +181,7 @@ def _main():
         if action == "run":
             rc = run_guarded(socket, args)
         elif action == "recover":
-            guard = guard_path(socket)
-            if guard.is_dir() and not (guard / "mutex").exists():
-                (guard / "uncertain").touch()
-                (guard / "mutex").touch()
+            replace_unreadable_guard(socket)
             with prepare_guard(socket).open("ab") as stream:
                 rc = _lock_fd(stream.fileno())
                 if rc != BUSY:
