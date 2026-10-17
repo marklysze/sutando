@@ -164,7 +164,8 @@ def body(notice: str, req: HumanRequirement, now: float,
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
         if req.kind in SIGN_IN_KINDS:
-            return f"✓ Signed in — {tail}."
+            seat = str((req.device or {}).get("name") or "")
+            return f"✓ Signed in{f' ({seat})' if seat else ''} — {tail}."
         return f"✓ Cleared — {_headline(req)}; {tail}."
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
