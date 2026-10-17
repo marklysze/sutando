@@ -145,8 +145,8 @@ class RenotifyTests(unittest.TestCase):
         sent = self.drive()
         self.assertEqual([p["op"] for p in sent], ["edit", "message"])
         self.assertEqual(sent[0]["extra_content"][WIRE_FIELD]["status"], "resolved")
-        self.assertIn("✓ Reconnected — Claude Code needs to sign in again; resuming 3 queued tasks.",
-                      sent[1]["body"])
+        self.assertIn("✓ Signed in — resuming 3 queued tasks.", sent[1]["body"])
+        self.assertNotIn("econnect", sent[1]["body"])
         self.clock.advance(7 * HOUR)
         self.assertEqual(self.drive(), [])  # once, and no reminder after resolution
 
