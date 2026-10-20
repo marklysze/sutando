@@ -30,7 +30,7 @@ The normative op→Action map is the backend contract
 | `react` / `unreact` | `room.action.execute` | `room.message.react` / `room.message.unreact` |
 | `send` (upload) | `room.action.execute` | `room.media.upload` |
 | `fetch` | `room.action.execute` | `room.media.link` (an expiring viewer link, not a local file) |
-| `doc get` / `put` / `rm` (retiring, no MCP twin) | `room.action.read` / `room.action.execute` | Room Commons instead: pages `room.commons.pages.read` / `room.commons.pages.append`, databases `room.commons.database.*` |
+| `doc get` / `put` / `rm` (retiring, no MCP twin) | `room.action.read` / `room.action.execute` | Room Commons instead: pages `room.commons.pages.create` / `room.commons.pages.read` / `room.commons.pages.append`, databases `room.commons.databases.*` |
 | `events emit` | `room.action.execute` | `room.event.send` |
 | state read / write | `room.action.read` / `room.action.execute` | `room.state.read` / `room.state.write` |
 
@@ -212,8 +212,9 @@ layer (its CLAUDE.md equivalent) at connect time.
   but keep posts scannable: lead with the conclusion.
 
 **Durable room state (Room Commons)**
-- Durable shared state lives in Room Commons: pages (`room.commons.pages.read`
-  / `room.commons.pages.append`) and databases (`room.commons.database.*`).
+- Durable shared state lives in Room Commons: pages (`room.commons.pages.create`
+  first, then `room.commons.pages.read` / `room.commons.pages.append`) and
+  databases (`room.commons.databases.list` / `.query` / `.mutate`).
   Write documents there instead of pasting long content into chat; post the
   page's name + a 1-3 line summary in the room.
 - The room vault behind `doc get|put|rm` is being retired; don't start new
