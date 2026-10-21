@@ -102,6 +102,11 @@ the same supervisor pid; the second handoff took 12 s.
   owner's word. An untagged start is refused (exit 64) before the sentinel or anything else is
   touched: no `--role`, no `--inbox`, a role other than `session`/`standby`, or an `--inbox` naming a
   different directory than the operand. The supervisor's standby watcher is started `--role standby`. `restart.sh` no longer pattern-kills watchers.
+- **A session watcher dies with the session that started it.** A SIGKILLed core runs no Stop hook,
+  so its watcher used to stay up, holding the inbox, until its next write failed. A `--role session`
+  watcher now checks every 3 s whether its parent pid has changed since start, and if it has, TERMs
+  itself through the normal cleanup (claims settled, sentinel released, fswatch stopped). A revived
+  core's start then finds no holder. Standby watchers are not checked.
 - **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
   starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker
   session>-watcher`, parameterised with the worker's inbox, pane, identity and the pool beat), and

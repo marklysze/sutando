@@ -89,6 +89,8 @@ fi
 # The tag names the inbox when no positional does, so the two can never differ.
 [ $# -gt 0 ] || set -- "$WATCHER_INBOX_TAG"
 echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=$WATCHER_INBOX_TAG pid=$$" >&2
+WATCHER_PID=$$
+WATCHER_START_PPID=$PPID
 
 # One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
 # two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
@@ -968,6 +970,7 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # Stamped only once fswatch is confirmed up (below the launch): until then the
 # file may still name a live standby that this watcher must not displace.
 WATCHER_BEAT_PID=""
+PARENT_WATCH_PID=""
 
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
@@ -1049,6 +1052,9 @@ cleanup() {
   fi
   if [ -n "${WATCHER_BEAT_PID:-}" ]; then
     kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
+  fi
+  if [ -n "${PARENT_WATCH_PID:-}" ]; then
+    kill -TERM "$PARENT_WATCH_PID" 2>/dev/null || true
   fi
   settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
@@ -1261,6 +1267,21 @@ if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
   "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
       --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
   WATCHER_BEAT_PID=$!
+fi
+# A session watcher lives only as long as the session that started it: a SIGKILLed
+# core runs no Stop hook, and its orphan would hold the inbox until its next write.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  (
+    while sleep 3; do
+      ppid="$(ps -o ppid= -p "$WATCHER_PID" 2>/dev/null | tr -d ' ')"
+      [ -n "$ppid" ] || { kill -0 "$WATCHER_PID" 2>/dev/null || exit 0; continue; }
+      [ "$ppid" = "$WATCHER_START_PPID" ] && continue
+      echo "watch-tasks-stream: the process that started this watcher (pid $WATCHER_START_PPID) is gone; exiting" >&2
+      kill -TERM "$WATCHER_PID" 2>/dev/null
+      exit 0
+    done
+  ) 3<&- &
+  PARENT_WATCH_PID=$!
 fi
 # The standby is the supervisor's to stop (its session also hosts the supervisor,
 # the only re-arm); sweep once it is gone, but never wait on it forever.
