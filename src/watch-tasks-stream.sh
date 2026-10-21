@@ -90,7 +90,25 @@ fi
 [ $# -gt 0 ] || set -- "$WATCHER_INBOX_TAG"
 echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=$WATCHER_INBOX_TAG pid=$$" >&2
 WATCHER_PID=$$
-WATCHER_START_PPID=$PPID
+# A session watcher's owner is its nearest claude/codex ancestor, read now while the
+# chain is intact: a Monitor's shell wrapper outlives a SIGKILLed core. None found: never self-exit.
+WATCHER_OWNER_PID=""
+WATCHER_OWNER_START=""
+if [ "$WATCHER_ROLE" = "session" ]; then
+  __p="$PPID"
+  for _ in $(seq 1 32); do
+    case "$__p" in ''|0|1|*[!0-9]*) break ;; esac
+    read -r __pp __comm <<< "$(ps -o ppid=,comm= -p "$__p" 2>/dev/null)"
+    case "${__comm##*/}" in
+      claude|codex)
+        WATCHER_OWNER_START="$(ps -o lstart= -p "$__p" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+        [ -n "$WATCHER_OWNER_START" ] && WATCHER_OWNER_PID="$__p"
+        break ;;
+    esac
+    __p="$__pp"
+  done
+  unset __p __pp __comm
+fi
 
 # One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
 # two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
@@ -970,7 +988,7 @@ PID_FILE="$(sentinel_path_for "$STATE_DIR")"
 # Stamped only once fswatch is confirmed up (below the launch): until then the
 # file may still name a live standby that this watcher must not displace.
 WATCHER_BEAT_PID=""
-PARENT_WATCH_PID=""
+OWNER_WATCH_PID=""
 
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
@@ -1053,8 +1071,8 @@ cleanup() {
   if [ -n "${WATCHER_BEAT_PID:-}" ]; then
     kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
-  if [ -n "${PARENT_WATCH_PID:-}" ]; then
-    kill -TERM "$PARENT_WATCH_PID" 2>/dev/null || true
+  if [ -n "${OWNER_WATCH_PID:-}" ]; then
+    kill -TERM "$OWNER_WATCH_PID" 2>/dev/null || true
   fi
   settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
@@ -1268,20 +1286,22 @@ if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
       --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
   WATCHER_BEAT_PID=$!
 fi
-# A session watcher lives only as long as the session that started it: a SIGKILLed
-# core runs no Stop hook, and its orphan would hold the inbox until its next write.
-if [ "$WATCHER_ROLE" = "session" ]; then
+# A session watcher lives only as long as the core that owns it: a SIGKILLed core
+# runs no Stop hook, and its orphan would hold the inbox until its next write.
+if [ -n "$WATCHER_OWNER_PID" ]; then
   (
     while sleep 3; do
-      ppid="$(ps -o ppid= -p "$WATCHER_PID" 2>/dev/null | tr -d ' ')"
-      [ -n "$ppid" ] || { kill -0 "$WATCHER_PID" 2>/dev/null || exit 0; continue; }
-      [ "$ppid" = "$WATCHER_START_PPID" ] && continue
-      echo "watch-tasks-stream: the process that started this watcher (pid $WATCHER_START_PPID) is gone; exiting" >&2
+      kill -0 "$WATCHER_PID" 2>/dev/null || exit 0
+      read -r stat start <<< "$(ps -o stat=,lstart= -p "$WATCHER_OWNER_PID" 2>/dev/null)"
+      [ "${stat#Z}" = "$stat" ] && [ "$start" = "$WATCHER_OWNER_START" ] && continue
+      # An empty answer about a pid that still exists is ps failing, not the owner gone.
+      [ -z "$stat" ] && kill -0 "$WATCHER_OWNER_PID" 2>/dev/null && continue
+      echo "watch-tasks-stream: the core that owns this watcher (pid $WATCHER_OWNER_PID) is gone; exiting" >&2
       kill -TERM "$WATCHER_PID" 2>/dev/null
       exit 0
     done
-  ) 3<&- &
-  PARENT_WATCH_PID=$!
+  ) 3<&- > /dev/null &
+  OWNER_WATCH_PID=$!
 fi
 # The standby is the supervisor's to stop (its session also hosts the supervisor,
 # the only re-arm); sweep once it is gone, but never wait on it forever.

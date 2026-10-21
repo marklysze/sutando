@@ -1,80 +1,123 @@
 #!/usr/bin/env bash
-# A session watcher whose starting parent is SIGKILLed (a crashed core runs no Stop
-# hook) exits on its own within seconds and releases its sentinel; while the parent
-# lives it stays up, and a standby is not subject to the check.
+# A session watcher whose owning core (nearest claude/codex ancestor) is SIGKILLed
+# exits on its own within seconds and releases its sentinel, whether the core is its
+# direct parent or sits above a Monitor-style shell wrapper that survives the kill.
+# With no runtime ancestor it never self-exits, and a standby is never checked.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 fail=0
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-parentgone.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-ownergone.XXXXXX")"
 mkdir -p "$WORK/stubbin"
 cp "$REPO/tests/fixtures/fswatch-poll-stub.sh" "$WORK/stubbin/fswatch"; chmod +x "$WORK/stubbin/fswatch"
+# A stand-in core: bash under the name `claude`, which is what the ancestor walk reads.
+ln -s "$(command -v bash)" "$WORK/stubbin/claude"
 PIDS=()
 cleanup() {
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM -- "-$p" 2>/dev/null; [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
   sleep 0.5
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -KILL -- "-$p" 2>/dev/null; [ -n "$p" ] && kill -KILL "$p" 2>/dev/null; done
+  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -KILL "$p" 2>/dev/null; done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 check() { if [ "$2" = 0 ]; then echo "  PASS $1"; else echo "  FAIL $1${3:+ — $3}"; fail=1; fi; }
 alive() { kill -0 "$1" 2>/dev/null; }
-# start <ws> <role>: a parent shell in its own session starts the watcher and waits
-# on it, as a Monitor does; prints the parent's pid. The watcher's pid lands in <ws>/w.pid.
-start() {
-  local ws="$1" role="$2"
+# detach <ws> <cmd...>: run cmd double-forked under pid 1, so no ancestor of this test
+# (a developer's own claude session included) is in the chain the watcher walks.
+detach() {
+  local ws="$1"; shift
   env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
-      SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" W="$WATCHER" WS="$ws" ROLE="$role" \
-      python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
-      bash -c 'bash "$W" "$WS/tasks" --role "$ROLE" --inbox "$WS/tasks" > "$WS/w.out" 2> "$WS/w.err" & echo $! > "$WS/w.pid"; wait' > /dev/null 2>&1 &
-  echo $!
+      SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" W="$WATCHER" WS="$ws" \
+      python3 -c '
+import os, sys
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" > /dev/null 2>&1 < /dev/null
 }
-stamped() {  # stamped <ws>: wait for the watcher to stamp its sentinel; prints its pid
+WCMD='bash "$W" "$WS/tasks" --role "$1" --inbox "$WS/tasks" > "$WS/w.out" 2> "$WS/w.err"'
+stamped() {  # stamped <ws>: wait for a watcher to stamp its sentinel; prints its pid
   local ws="$1" i w
   for i in $(seq 1 100); do
-    w="$(cat "$ws/w.pid" 2>/dev/null)"
-    [ -n "$w" ] && [ "$(cat "$ws"/state/*.pid 2>/dev/null | head -1)" = "$w" ] && { echo "$w"; return 0; }
+    w="$(cat "$ws"/state/*.pid 2>/dev/null | head -1)"
+    [ -n "$w" ] && alive "$w" && { echo "$w"; return 0; }
     sleep 0.1
   done
-  cat "$ws/w.pid" 2>/dev/null
   return 1
 }
+waitfile() { local i; for i in $(seq 1 50); do [ -s "$1" ] && return 0; sleep 0.1; done; return 1; }
 gone_within() {  # gone_within <pid> <seconds>
   local i
   for i in $(seq 1 $(( $2 * 10 ))); do alive "$1" || return 0; sleep 0.1; done
   return 1
 }
+new_ws() { WS="$WORK/$1"; mkdir -p "$WS/tasks" "$WS/state"; }
 
-echo "watch-tasks-stream exits when its parent is gone:"
+echo "watch-tasks-stream exits when its owning core is gone:"
 
-# (a) Parent SIGKILLed: the session watcher exits, releases its sentinel, and takes fswatch with it.
-WS="$WORK/killed"; mkdir -p "$WS/tasks" "$WS/state"
-parent="$(start "$WS" session)"; PIDS+=("$parent")
-w="$(stamped "$WS")"; check "(a) the session watcher started and stamped" $? "$(tail -2 "$WS/w.err" | tr '\n' '|')"
+# (a) The core is the watcher's direct parent.
+new_ws direct
+detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; '"$WCMD"' & wait' _ session
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; check "(a) the session watcher started under the core and stamped" $? "$(tail -2 "$WS/w.err" | tr '\n' '|')"
+PIDS+=("$w")
 fsw="$(pgrep -P "$w" -f fswatch | head -1)"
-kill -KILL "$parent"
-gone_within "$w" 10; check "(a) after kill -9 of its parent the watcher exits within 10s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
-grep -q 'the process that started this watcher (pid [0-9]*) is gone; exiting' "$WS/w.err"; check "(a) ...and says why on stderr" $?
+kill -KILL "$core"
+gone_within "$w" 10; check "(a) after kill -9 of the core the watcher exits within 10s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+grep -q "the core that owns this watcher (pid $core) is gone; exiting" "$WS/w.err"; check "(a) ...and names the core on stderr" $?
 [ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ]; check "(a) ...and releases its sentinel" $?
 { [ -z "$fsw" ] || gone_within "$fsw" 3; }; check "(a) ...and its fswatch is gone" $?
 
-# (b) Parent alive: the session watcher stays up past several checks.
-WS="$WORK/alive"; mkdir -p "$WS/tasks" "$WS/state"
-parent="$(start "$WS" session)"; PIDS+=("$parent")
-w="$(stamped "$WS")"
-sleep 8
-alive "$w" && [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$w" ]; check "(b) with its parent alive the session watcher is still up after 8s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
-kill -TERM -- "-$parent" 2>/dev/null; sleep 0.3
+# (a2) A Monitor-style wrapper between core and watcher: a shell that waits on the
+#      watcher (no exec) and outlives the core, so the watcher's own ppid never changes.
+new_ws wrapper
+detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; sh -c '"'"'echo $$ > "$WS/wrap.pid"; '"$WCMD"'; true'"'"' _ session & wait'
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; PIDS+=("$w")
+waitfile "$WS/wrap.pid"; wrap="$(cat "$WS/wrap.pid")"; PIDS+=("$wrap")
+[ "$(ps -o ppid= -p "$w" | tr -d ' ')" = "$wrap" ]; check "(a2) the watcher's direct parent is the wrapper, not the core" $?
+kill -KILL "$core"
+gone_within "$w" 10; check "(a2) after kill -9 of the core the watcher exits within 10s though its wrapper lives" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+[ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ]; check "(a2) ...and releases its sentinel" $?
 
-# (c) A standby is not subject to the check: its parent dying leaves it running.
-WS="$WORK/standby"; mkdir -p "$WS/tasks" "$WS/state"
-parent="$(start "$WS" standby)"; PIDS+=("$parent")
-w="$(stamped "$WS")"
-kill -KILL "$parent"
+# (b) Core alive: the watcher stays up past several checks.
+new_ws alive
+detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; '"$WCMD"' & wait' _ session
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; PIDS+=("$w")
 sleep 8
-alive "$w"; check "(c) a standby whose parent is SIGKILLed keeps running" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
-kill -TERM -- "-$parent" 2>/dev/null; kill -TERM "$w" 2>/dev/null; sleep 0.3
+alive "$w" && [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$w" ]; check "(b) with its core alive the watcher is still up after 8s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+kill -TERM "$w" 2>/dev/null; kill -KILL "$core" 2>/dev/null; sleep 0.3
+
+# (c) No runtime ancestor, the plain-shell launcher killed: never self-exits.
+new_ws noowner
+detach "$WS" bash -c 'echo $$ > "$WS/core.pid"; '"$WCMD"' & wait' _ session
+waitfile "$WS/core.pid"; launcher="$(cat "$WS/core.pid")"; PIDS+=("$launcher")
+w="$(stamped "$WS")"; PIDS+=("$w")
+kill -KILL "$launcher"
+sleep 8
+alive "$w"; check "(c) with no claude/codex ancestor, killing its launcher leaves the watcher up" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+kill -TERM "$w" 2>/dev/null; sleep 0.3
+
+# (d) Launched directly under pid 1 (a subreaper or launchd start): never self-exits.
+new_ws pid1
+detach "$WS" bash -c "exec $WCMD" _ session
+w="$(stamped "$WS")"; PIDS+=("$w")
+[ "$(ps -o ppid= -p "$w" | tr -d ' ')" = 1 ]; check "(d) the watcher's parent is pid 1 from the start" $?
+sleep 8
+alive "$w"; check "(d) ...and it is still up after 8s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+kill -TERM "$w" 2>/dev/null; sleep 0.3
+
+# (e) A standby is never checked, even under a core that dies.
+new_ws standby
+detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; '"$WCMD"' & wait' _ standby
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; PIDS+=("$w")
+kill -KILL "$core"
+sleep 8
+alive "$w"; check "(e) a standby whose core is SIGKILLed keeps running" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+kill -TERM "$w" 2>/dev/null; sleep 0.3
 
 echo
 if [ "$fail" = 0 ]; then echo "ALL TESTS PASS"; else echo "TESTS FAILED"; exit 1; fi
