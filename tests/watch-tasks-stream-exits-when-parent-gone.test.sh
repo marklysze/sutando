@@ -30,7 +30,8 @@ detach() {
   env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
       SUTANDO_WORKSPACE_DIR="$ws" PATH="$WORK/stubbin:$PATH" W="$WATCHER" WS="$ws" \
       python3 -c '
-import os, sys
+import os, signal, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # python ignores it, and exec would pass that on
 if os.fork(): os._exit(0)
 os.setsid()
 if os.fork(): os._exit(0)
@@ -80,6 +81,20 @@ waitfile "$WS/wrap.pid"; wrap="$(cat "$WS/wrap.pid")"; PIDS+=("$wrap")
 kill -KILL "$core"
 gone_within "$w" 10; check "(a2) after kill -9 of the core the watcher exits within 10s though its wrapper lives" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
 [ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ]; check "(a2) ...and releases its sentinel" $?
+
+# (a3) As under a real Monitor, stdout and stderr are a pipe only the core reads: once
+#      the core is killed every write there raises SIGPIPE, and shutdown must still finish.
+new_ws pipe
+mkfifo "$WS/out"
+detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; sh -c '"'"'bash "$W" "$WS/tasks" --role session --inbox "$WS/tasks" > "$WS/out" 2>&1; true'"'"' & exec 4< "$WS/out"; wait'
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; check "(a3) the session watcher started with its output piped to the core" $?
+PIDS+=("$w")
+fsw="$(pgrep -P "$w" -f fswatch | head -1)"
+kill -KILL "$core"
+gone_within "$w" 10; check "(a3) after kill -9 of the core the watcher exits within 10s though its output pipe is dead" $?
+[ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ]; check "(a3) ...and releases its sentinel" $?
+{ [ -z "$fsw" ] || gone_within "$fsw" 3; }; check "(a3) ...and its fswatch is gone" $?
 
 # (b) Core alive: the watcher stays up past several checks.
 new_ws alive

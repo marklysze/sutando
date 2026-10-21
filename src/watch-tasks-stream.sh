@@ -1290,6 +1290,8 @@ fi
 # runs no Stop hook, and its orphan would hold the inbox until its next write.
 if [ -n "$WATCHER_OWNER_PID" ]; then
   (
+    # The owner was the only reader of stderr: once it is gone a log write raises SIGPIPE.
+    trap '' PIPE
     while sleep 3; do
       kill -0 "$WATCHER_PID" 2>/dev/null || exit 0
       read -r stat start <<< "$(ps -o stat=,lstart= -p "$WATCHER_OWNER_PID" 2>/dev/null)"
