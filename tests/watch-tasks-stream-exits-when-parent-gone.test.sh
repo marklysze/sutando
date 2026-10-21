@@ -94,6 +94,7 @@ fsw="$(pgrep -P "$w" -f fswatch | head -1)"
 kill -KILL "$core"
 gone_within "$w" 10; check "(a3) after kill -9 of the core the watcher exits within 10s though its output pipe is dead" $?
 [ -z "$(ls "$WS"/state/*.pid 2>/dev/null)" ]; check "(a3) ...and releases its sentinel" $?
+grep -q "the core that owns this watcher (pid $core) is gone; exiting (watcher pid $w)" "$WS/logs/watch-tasks-stream.log" 2>/dev/null; check "(a3) ...and the exit line is on disk in logs/, though stderr's reader is dead" $?
 { [ -z "$fsw" ] || gone_within "$fsw" 3; }; check "(a3) ...and its fswatch is gone" $?
 
 # (b) Core alive: the watcher stays up past several checks.

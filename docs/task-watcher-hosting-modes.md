@@ -107,7 +107,9 @@ the same supervisor pid; the second handoff took 12 s.
   watcher records its nearest `claude`/`codex` ancestor (pid + start time); the Monitor's shell wrapper
   in between survives the kill, so the direct parent is not used. Every 3 s it checks that ancestor,
   and once it is gone, a zombie, or a reused pid, the watcher TERMs itself through the normal cleanup
-  (claims settled, sentinel released, fswatch stopped). A revived core's start then finds no holder.
+  (claims settled, sentinel released, fswatch stopped), logging the exit to stderr and to
+  `<workspace>/logs/watch-tasks-stream.log` (stderr's only reader was that core). A revived core's
+  start then finds no holder.
   With no such ancestor the watcher never self-exits. Standby watchers are not checked.
 - **Workers' inboxes have the same supervisor.** `skills/worker-pool/scripts/launch-worker-session.sh`
   starts one `task-notifier-supervisor.sh` per worker beside the worker's session (in `<worker

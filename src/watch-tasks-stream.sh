@@ -1298,7 +1298,10 @@ if [ -n "$WATCHER_OWNER_PID" ]; then
       [ "${stat#Z}" = "$stat" ] && [ "$start" = "$WATCHER_OWNER_START" ] && continue
       # An empty answer about a pid that still exists is ps failing, not the owner gone.
       [ -z "$stat" ] && kill -0 "$WATCHER_OWNER_PID" 2>/dev/null && continue
-      echo "watch-tasks-stream: the core that owns this watcher (pid $WATCHER_OWNER_PID) is gone; exiting" >&2
+      msg="watch-tasks-stream: the core that owns this watcher (pid $WATCHER_OWNER_PID) is gone; exiting"
+      echo "$msg" >&2
+      # Also on disk: stderr's only reader was that core, so the line would otherwise be lost.
+      { mkdir -p "$WORKSPACE_DIR/logs" && printf '%s %s (watcher pid %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" "$WATCHER_PID" >> "$WORKSPACE_DIR/logs/watch-tasks-stream.log"; } 2>/dev/null
       kill -TERM "$WATCHER_PID" 2>/dev/null
       exit 0
     done
