@@ -420,7 +420,8 @@ to the task's line as quoted room data, and it is acked at the same generation i
 Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
 neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
 (its result unarchived, its task still queued, or its id still to retire) is left unacked until
-the broker serves it again, so the earlier attempt's settle can never retire the wake.
+the broker serves it again, so the earlier attempt's settle can never retire the wake. Every
+branch that archives a result and retires its id does both as one step under the same lock.
 
 ### `GET /v1/setup` *(optional)*
 
