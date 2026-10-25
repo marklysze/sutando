@@ -312,6 +312,30 @@ class ResultFileDecision(unittest.TestCase):
                 d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
                 self.assertEqual((d.action, d.fields), (at.SETTLE, {}))
 
+    def test_an_outcome_whose_task_the_ledger_does_not_know_is_unknown_not_terminal_or_suspended(self):
+        def unknown(turn, seq, action="room.message.send", status="done"):
+            return {"record_type": at.OUTCOME, "turn_id": turn, "seq": seq, "action": action,
+                    "operation_id": f"op_{turn}_{seq}", "operation_status": "succeeded",
+                    "requested_task_status": status, "task": None, "applied_execution_phase": None,
+                    "applied_terminal": None, "active_blocker_count": None, "blocker_id": None,
+                    "effective_task_status": "done"}
+        for action in ("room.message.send", "room.question.ask"):
+            with self.subTest(action=action):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                _journal(state, _intent(turn, 1, status="done", action=action), unknown(turn, 1, action))
+                recs = at.read_turn_records(state, turn)
+                self.assertEqual(at.classify_turn(recs).outcome, at.INCOMPLETE_OR_ERROR)
+                d = at.result_file_decision(recs, "final answer")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}),
+                                 "no skip, no waiting_input: the result file is posted")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, {**_intent(turn, 1, status="done"), "body_sha256": at.body_sha256("final answer")},
+                 unknown(turn, 1))
+        d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
+        self.assertEqual(d.fields, {"status": "completed", "no_send": True}, "the dedupe still applies")
+
     def test_suspended_no_send_and_unreadable(self):
         _journal(self.state, _intent(self.turn, 1, action="room.question.ask"),
                  _outcome(self.turn, 1, phase="waiting_input", blockers=1))
