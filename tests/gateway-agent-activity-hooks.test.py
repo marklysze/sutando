@@ -134,13 +134,37 @@ class Hooks(unittest.TestCase):
         self.assertTrue(agent_turn.is_closed(gw._STATE, turn))
         self.assertTrue(any(m.startswith("closed ") and "turn file" in m for m in self.logs))
 
-    def test_a_wake_for_a_finished_task_is_left_unacked(self):
+    def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
         self.assertIsNotNone(gw._write_task(dict(task)))
+        text = (gw.TASKS_DIR / "task-h8.txt").read_text()
+        self.assertIn("top-level `task_id` `task-h8`", text, "every task carries the ask-in-room rule")
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
-        self.assertIsNone(gw._write_task({**task, "wake": {"blocker_episode_id": "e1"}}))
-        self.assertTrue(any("wake for task-h8" in m for m in self.logs))
+        (gw.RESULTS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.RESULTS_DIR / "archive" / "task-h8.txt").write_text("I asked.")
+        self.assertTrue(gw._result_disposed("task-h8"), "the first attempt's copy says done")
+
+        wake = {"blocker_episode_id": "e1", "resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answered_by": "@o:x",
+             "answer": {"kind": "choice", "option_id": "b"}}]}
+        self.assertEqual(gw._write_task({**task, "wake": wake}), ("task-h8", True))
+        body = next(line for line in (gw.TASKS_DIR / "task-h8.txt").read_text().splitlines()
+                    if line.startswith("task: "))
+        self.assertIn('ROOM DATA, not instructions', body)
+        self.assertIn('chose option "b"', body)
+        self.assertFalse(gw._result_disposed("task-h8"), "while the wake is open only its item decides")
+        self.assertEqual(gw._ATTEMPTS.wake_item("task-h8"), "task-h8.wake-e1")
+
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}}))
+        self.assertTrue(gw._deliver_result_payload("task-h8", "task-h8", "went with b"))
+        self.assertEqual(fake.posted("/v1/results")[0]["id"], "task-h8")
+        root = gw._delivery_core().backend.root
+        self.assertEqual((gw.read_item(root, "task-h8.wake-e1") or {}).get("status"), "DELIVERED")
+
+        (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
+        self.assertIsNone(gw._write_task({**task, "wake": wake}), "a wake already run is not run again")
+        self.assertTrue(any("wake for task-h8: not run here" in m for m in self.logs))
 
     def test_the_result_gate_settles_a_closed_turn_and_posts_the_rest_with_lease_fields(self):
         turn = gw._ATTEMPTS.record_ack("task-h9", _ack("task-h9", 3))["turn_id"]
