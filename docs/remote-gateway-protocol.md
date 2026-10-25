@@ -421,7 +421,9 @@ Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt
 neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
 (its result unarchived, its task still queued, or its id still to retire) is left unacked until
 the broker serves it again, so the earlier attempt's settle can never retire the wake. Every
-branch that archives a result and retires its id does both as one step under the same lock.
+branch that archives a result and retires its id does both as one step under the same lock. The
+recovery judgement that a result was already disposed of is made inside that step too, and a
+settle never archives a task whose open wake has not delivered its own result.
 
 ### `GET /v1/setup` *(optional)*
 

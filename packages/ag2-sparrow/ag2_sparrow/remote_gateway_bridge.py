@@ -5703,6 +5703,15 @@ def _result_disposed(tid: str) -> bool:
             and (read_item(root, _broker_tid(delivery)) or {}).get("status") == "DELIVERED")
 
 
+def _open_wake_unsettled(tid: str) -> bool:
+    """A wake runs here under this id and its own result is not delivered yet."""
+    item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if not item:
+        return False
+    root = getattr(_delivery_core().backend, "root", None)
+    return root is None or (read_item(root, item) or {}).get("status") != "DELIVERED"
+
+
 def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
     """Retire the task of an id whose result is already disposed of. Nothing is
     forgotten until its file has left the executable queue."""
@@ -5711,6 +5720,10 @@ def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
 
 
 def _settle_task_locked(tid: str, inflight: "set[str] | None") -> bool:
+    if _open_wake_unsettled(tid):
+        # Whatever the caller judged before the lock, a wake opened since is not this settle's.
+        _log_backoff((tid, "wake-open"), f"result {tid}: not settled — a wake for it is running here")
+        return False
     if not _archive_task_file(tid):
         _task_left_executable(tid)              # every caller made the id durable before this
         return False
@@ -7345,8 +7358,9 @@ def _post_ready_results(inflight: set[str]) -> None:
         if raw is None:
             # A disposed-of id whose task could not be archived earlier is retried here.
             if not os.path.lexists(rfile):
-                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
-                    changed |= _settle_task(tid, inflight)
+                with _retiring(tid):  # the judgement and the settle are one step to a wake
+                    if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                        changed |= _settle_task(tid, inflight)
                 _SETTLE_SCANNED.add(tid)
             continue
         # Before the tier guard: a withheld review would name the shared room as its release target.

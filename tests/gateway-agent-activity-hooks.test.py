@@ -370,6 +370,40 @@ class Hooks(unittest.TestCase):
         gw._close_stale_turns(inflight)
         self.assertIsNotNone(agent_turn.open_turn_for_task(gw._STATE, tid), "its turn survives the sweep")
 
+    def test_a_wake_admitted_after_a_stale_disposal_judgement_is_not_settled_away(self):
+        tid = "task-stale-disposed"
+        self.assertIsNotNone(gw._write_task(_task(tid)))
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked which one.")
+        gw._ATTEMPTS.finish(tid)
+        inflight, seen = {tid}, {}
+        wake = _task(tid, wake={"blocker_episode_id": "e1", "resolved_blockers": [
+            {"outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]})
+        real = gw._result_disposed
+
+        def judge_then_admit(t):
+            seen["disposed"] = real(t)
+            seen["wake"] = gw._take_served_task(dict(wake), inflight, [])
+            return seen["disposed"]
+        with mock.patch.object(gw, "_result_disposed", judge_then_admit):
+            gw._post_ready_results(inflight)
+        self.assertEqual(seen, {"disposed": True, "wake": False}, "the wake waits for the judgement's settle")
+        self.assertEqual(gw._write_task(dict(wake)), (tid, True), "served again, it runs")
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists())
+
+    def test_a_settle_never_archives_a_wake_that_opened_before_it_took_the_lock(self):
+        tid = "task-open-wake"
+        wake = _task(tid, wake={"blocker_episode_id": "e5", "resolved_blockers": []})
+        self.assertEqual(gw._write_task(dict(wake)), (tid, True))
+        inflight = {tid}
+        self.assertFalse(gw._settle_task(tid, inflight), "a stale caller's settle is refused")
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists())
+        self.assertIn(tid, inflight)
+        with mock.patch.object(gw, "read_item", lambda _root, _item: {"status": "DELIVERED"}):
+            self.assertTrue(gw._settle_task(tid, inflight), "once the wake's own result is delivered it settles")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists())
+        self.assertNotIn(tid, inflight)
+
     def test_settling_an_earlier_attempt_never_finishes_a_later_one(self):
         gw._ATTEMPTS.record_ack("task-moved", _ack("task-moved", 1))
         earlier = gw._ATTEMPTS.get("task-moved")
