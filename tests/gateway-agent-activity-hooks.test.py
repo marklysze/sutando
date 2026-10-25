@@ -164,7 +164,20 @@ class Hooks(unittest.TestCase):
 
         (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
         self.assertIsNone(gw._write_task({**task, "wake": wake}), "a wake already run is not run again")
-        self.assertTrue(any("wake for task-h8: not run here" in m for m in self.logs))
+        self.assertIsNone(gw._write_task({**task, "wake": wake}))
+        self.assertEqual(sum("wake for task-h8: not run here" in m for m in self.logs), 1,
+                         "logged once per episode, not per re-serve")
+
+    def test_an_ack_first_wake_is_left_unacked_and_logged_once(self):
+        task = {"id": "task-h11", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.assertIsNotNone(gw._write_task(dict(task)))
+        (gw.TASKS_DIR / "task-h11.txt").rename(gw.TASKS_DIR / "archive" / "task-h11.txt")
+        woken = {**task, "ack_first": True, "wake": {"blocker_episode_id": "e9"}}
+        self.assertIsNone(gw._write_task(dict(woken), hold=True))
+        self.assertIsNone(gw._write_task(dict(woken), hold=True))
+        lines = [m for m in self.logs if "wake for task-h11" in m]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("an ack_first wake is not run", lines[0])
 
     def test_the_result_gate_settles_a_closed_turn_and_posts_the_rest_with_lease_fields(self):
         turn = gw._ATTEMPTS.record_ack("task-h9", _ack("task-h9", 3))["turn_id"]

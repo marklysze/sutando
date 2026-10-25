@@ -4310,6 +4310,10 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
                      name=f"on-task-{tid}", daemon=True).start()
 
 
+# (task id, episode) pairs already logged as left unacked: a wake re-serves for a day.
+_WAKES_LEFT_UNACKED: "set[tuple]" = set()
+
+
 def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
@@ -4352,7 +4356,11 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
             _log(f"wake for {tid}: episode {woken} queued as a new turn")
     if task.get("wake") is not None and not woken and (task_archived or _delivered_copy_exists(tid)):
         # A woken ask is not a redelivery; closing it as one would answer it with no-send.
-        _log(f"wake for {tid}: not run here (already run, or not supported) — left unacked")
+        episode = (task["wake"] or {}).get("blocker_episode_id") if isinstance(task["wake"], dict) else None
+        if (tid, episode) not in _WAKES_LEFT_UNACKED:
+            _WAKES_LEFT_UNACKED.add((tid, episode))
+            why = "an ack_first wake is not run" if hold else "already run, or turn context is off"
+            _log(f"wake for {tid}: not run here ({why}) — left unacked; logged once per episode")
         return None
     if not woken and (task_archived or _delivered_copy_exists(tid)):
         rfile = RESULTS_DIR / f"{tid}.txt"

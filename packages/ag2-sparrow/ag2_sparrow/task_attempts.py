@@ -387,6 +387,8 @@ def render_wake(text: str, wake: dict) -> str:
         answer = b.get("answer") if isinstance(b.get("answer"), dict) else None
         if b.get("outcome") == "expired" or answer is None:
             said = "no answer: the question expired unanswered"
+        elif answer.get("kind") == "choice" and answer.get("label"):
+            said = f"chose {_quoted(answer['label'])} (option {_quoted(answer.get('option_id'))})"
         elif answer.get("kind") == "choice":
             said = f"chose option {_quoted(answer.get('option_id'))}"
         else:

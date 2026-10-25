@@ -232,6 +232,10 @@ class Attempts(unittest.TestCase):
                       "expired unanswered", text)
         self.assertIn('answered "line1\\nline2 \\"quoted\\""', text)
         self.assertIn("no resolved question was included", task_attempts.render_wake("x", {}))
+        labelled = task_attempts.render_wake("x", {"resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answered_by": "@o:x",
+             "answer": {"kind": "choice", "option_id": "opt_b", "label": "Ship it \"now\""}}]})
+        self.assertIn('chose "Ship it \\"now\\"" (option "opt_b")', labelled)
 
     def test_the_ask_in_room_rule_names_the_task(self):
         rule = task_attempts.ask_in_room_rule("tsk_A")
