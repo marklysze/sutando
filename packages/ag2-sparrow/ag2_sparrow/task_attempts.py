@@ -437,12 +437,14 @@ class TaskAttempts:
         return None
 
     def compare_with_server(self, local_wire_tids, server_tasks: list) -> dict:
-        """Local attempts the server no longer lists, and server tasks this node does not hold."""
+        """Local attempts the server no longer lists, and server tasks this node does not hold. An
+        attempt is aged from its ack, or from its first publication when no ack ever answered."""
         listed = {t["task_id"]: t for t in server_tasks}
         data = self._load()
         now = self.now()
         closed = sorted(t for t in local_wire_tids if t not in listed and t in data
-                        and now - float(data[t].get("acked_at", now)) > RECONCILE_GRACE_S
+                        and now - float(data[t].get("acked_at", data[t].get("published_at", now)))
+                        > RECONCILE_GRACE_S
                         and not data[t].get("fenced"))
         missing = [listed[t] for t in sorted(listed) if t not in set(local_wire_tids)]
         return {"closed_on_server": closed, "missing_locally": missing}

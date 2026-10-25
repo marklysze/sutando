@@ -169,6 +169,22 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload("task-cap", "task-cap", "answer"), "a fence ends the wait")
         self.assertEqual(fake.posted("/v1/results"), [])
 
+    def test_a_held_result_whose_task_the_server_closed_is_settled_by_the_reconcile(self):
+        gw._ATTEMPTS.record_ack("task-v2seen2", _ack("task-v2seen2", 1))
+        tid = "task-held-closed"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        later = time.time() + 10_000
+        fake = self.use(FakeGateway(**{"/v1/tasks/active": {"tasks": [], "next_cursor": None},
+                                       "/v1/results": {"ok": True}}))
+        mock.patch.object(gw._ATTEMPTS, "now", lambda: later).start()
+        self.assertFalse(gw._deliver_result_payload(tid, tid, "answer"), "held: its ack never answered")
+        mock.patch.object(gw, "_last_ledger_reconcile", 0.0).start()
+        gw._reconcile_ledger({tid})
+        self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "task_already_terminal")
+        self.assertEqual(len(self.controls(tid)), 1, "the core is stopped")
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "answer"), "settled")
+        self.assertEqual(fake.posted("/v1/results"), [], "never sent ungated")
+
     def test_on_a_broker_never_seen_to_name_leases_the_fallback_is_still_gated(self):
         cases = {"none": {}, "send": {"status": "completed", "no_send": True},
                  "terminal": None, "blocker": {"status": "waiting_input", "no_send": True}}

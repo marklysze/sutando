@@ -193,6 +193,25 @@ class Attempts(unittest.TestCase):
         self.assertEqual(found["closed_on_server"], ["tsk_old"], "a just-acked attempt waits")
         self.assertEqual([t["task_id"] for t in found["missing_locally"]], ["tsk_server_only"])
 
+    def test_a_task_whose_ack_never_answered_ages_into_reconciliation(self):
+        clock = [1000.0]
+        a = self.mk(now=lambda: clock[0])
+        a.record_ack("tsk_known", _ack(1))
+        self.assertTrue(a.broker_names_leases())
+        a.remember_task("tsk_unacked", {"source_room_id": "!r:x"})
+        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [])["closed_on_server"], [],
+                         "within the grace it is not judged yet")
+        clock[0] += max(task_attempts.ACK_HOLD_MAX_S, task_attempts.RECONCILE_GRACE_S) + 1
+        self.assertIsNotNone(a.result_hold("tsk_unacked"), "held: this broker names leases")
+        found = a.compare_with_server({"tsk_unacked"}, [])
+        self.assertEqual(found["closed_on_server"], ["tsk_unacked"], "aged from its publication")
+        a.fence("tsk_unacked", {"error_code": "task_already_terminal"})
+        self.assertIsNone(a.result_hold("tsk_unacked"), "the fence ends the hold")
+        self.assertEqual(a.result_decision("tsk_unacked", "x", False).action, agent_turn.SETTLE,
+                         "and the result is settled, never sent ungated")
+        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [{"task_id": "tsk_unacked"}])["closed_on_server"],
+                         [], "a task the server still lists is never closed")
+
     def test_an_incomplete_listing_skips_reconciliation(self):
         a = self.mk()
         for ans in (_http(503, {"error_code": "task_api_unavailable"}), {"tasks": "x"}):
