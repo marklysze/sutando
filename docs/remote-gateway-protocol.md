@@ -386,8 +386,11 @@ Sutando checkout around it sends neither field.
   (`source: relay-control`, whose result is retired locally and never posted), and a cancel is
   confirmed on `POST /v1/tasks/<id>/cancel-ack`. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
-  without a post. A result written before its task's ack named the lease waits for it, at most
-  120 s, after which it is posted without the lease fields. A result answered `409 task_already_terminal | stale_execution_generation |
+  without a post. A result written before its task's ack named the lease waits for it. On a broker that has
+  ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
+  the attempt is fenced, or the server closes the task; on one never seen to, it waits 120 s and
+  is then posted without lease fields, still gated on the journal records that name the task. A
+  task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
   task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
 - **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
   the server no longer lists (acked more than 120 s ago) is fenced and its core work cancelled;
