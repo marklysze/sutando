@@ -269,6 +269,39 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(gw._write_task(_task("task-rerun", wake={**wake, "blocker_episode_id": "e4"})),
                           "a different episode waits while this one is queued")
 
+    def test_a_wake_admitted_between_the_old_archive_and_its_retirement_waits(self):
+        tid = "task-retire-race"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        first = gw._ATTEMPTS.get(tid)["turn_id"]
+        with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+            fh.write(json.dumps({"record_type": "dispatch_outcome", "turn_id": first, "seq": 1,
+                                 "operation_id": f"op_{first}_9", "operation_status": "succeeded",
+                                 "applied_execution_phase": "waiting_input", "active_blocker_count": 1,
+                                 "applied_terminal": False, "ts": time.time()}) + "\n")
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text("I asked which one.")
+        wake = _task(tid, wake={"blocker_episode_id": "e1", "resolved_blockers": [
+            {"outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]})
+        inflight, admitted = {tid}, {}
+        real_archive = gw._archive_result
+
+        def archive_then_admit(*a, **k):
+            done = real_archive(*a, **k)
+            if done:
+                admitted["wake"] = gw._take_served_task(dict(wake), inflight, [])
+            return done
+        with mock.patch.object(gw, "_archive_result", archive_then_admit):
+            gw._post_ready_results(inflight)
+        self.assertEqual(admitted, {"wake": False}, "admitted mid-retirement, the wake waits")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "and is not published")
+        self.assertNotIn(tid, inflight)
+        self.assertTrue(gw._take_served_task(dict(wake), inflight, []), "served again, it runs and is tracked")
+        self.assertIn(tid, inflight)
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        gw._close_stale_turns(inflight)
+        self.assertIsNotNone(agent_turn.open_turn_for_task(gw._STATE, tid), "its turn survives the sweep")
+
     def test_settling_an_earlier_attempt_never_finishes_a_later_one(self):
         gw._ATTEMPTS.record_ack("task-moved", _ack("task-moved", 1))
         earlier = gw._ATTEMPTS.get("task-moved")

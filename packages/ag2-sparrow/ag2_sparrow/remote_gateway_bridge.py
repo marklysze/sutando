@@ -4346,8 +4346,20 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
 
 # (task id, episode) pairs already logged as left unacked: a wake re-serves for a day.
 _WAKES_LEFT_UNACKED: "set[tuple]" = set()
-# Held across opening a wake and across settling a task, so a wake never opens mid-settle.
+# Held across opening a wake and across retiring an id, so a wake never opens mid-retirement;
+# _RETIRING also stops a wake admitted on the retiring thread itself.
 _WAKE_HANDOFF = threading.RLock()
+_RETIRING: "set[str]" = set()
+
+
+@contextlib.contextmanager
+def _retiring(tid: str):
+    with _WAKE_HANDOFF:
+        _RETIRING.add(tid)
+        try:
+            yield
+        finally:
+            _RETIRING.discard(tid)
 
 
 def _earlier_attempt_settling(tid: str, wake) -> bool:
@@ -4356,7 +4368,7 @@ def _earlier_attempt_settling(tid: str, wake) -> bool:
     episode = wake.get("blocker_episode_id") if isinstance(wake, dict) else None
     if _ATTEMPTS.get(_broker_tid(tid)).get("wake_episode") == episode and episode:
         return False
-    return (os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _task_pending(tid)
+    return (tid in _RETIRING or os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _task_pending(tid)
             or tid in _SETTLE_PENDING)
 
 
@@ -5694,7 +5706,7 @@ def _result_disposed(tid: str) -> bool:
 def _settle_task(tid: str, inflight: "set[str] | None" = None) -> bool:
     """Retire the task of an id whose result is already disposed of. Nothing is
     forgotten until its file has left the executable queue."""
-    with _WAKE_HANDOFF:
+    with _retiring(tid):
         return _settle_task_locked(tid, inflight)
 
 
@@ -7391,21 +7403,22 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _shown = (_holder if local_task_protocol.valid_archive_lookup_id(_holder)
                           else f"<malformed, {len(_holder)} chars>")
                 _log(f"dedup {action} for {tid} (holder {_shown} is not a valid delivery for this task)")
-                if not _archive_result(rfile, tid, generation):
-                    continue
-                inflight.discard(tid)
-                _forget_task_room(tid)
-                # A requeue carries the SAME delivery forward under a fresh local
-                # id, so only a retired delivery gives up its media mode.
-                if action != "requeue":
-                    _forget_task_media(tid)
-                if action == "report":
-                    _forget_ack_first(_broker_tid(_delivery))
-                    _forget_relay_counts(_broker_tid(_delivery), tid)
-                _forget_dedup_alias(tid)
-                if action == "requeue":
-                    inflight.add(payload)
-                changed = True
+                with _retiring(tid):  # the archive and the id's retirement are one step to a wake
+                    if not _archive_result(rfile, tid, generation):
+                        continue
+                    inflight.discard(tid)
+                    _forget_task_room(tid)
+                    # A requeue carries the SAME delivery forward under a fresh local
+                    # id, so only a retired delivery gives up its media mode.
+                    if action != "requeue":
+                        _forget_task_media(tid)
+                    if action == "report":
+                        _forget_ack_first(_broker_tid(_delivery))
+                        _forget_relay_counts(_broker_tid(_delivery), tid)
+                    _forget_dedup_alias(tid)
+                    if action == "requeue":
+                        inflight.add(payload)
+                    changed = True
                 continue
         if skip:
             # Skip markers still POST: only add_result closes the server lease;
@@ -7425,18 +7438,19 @@ def _post_ready_results(inflight: set[str]) -> None:
                                            result_file=rfile, generation=generation):
                 changed |= _settle_delivered(tid, _wire, rfile, inflight)
                 continue
-            if not _archive_result(rfile, tid, generation):
-                continue
-            # Retire the provenance WITH the result, never at read: this line is
-            # only reached once the lease-closing POST has actually succeeded.
-            _REDELIVERED.discard(tid)
-            inflight.discard(tid)
-            _forget_task_room(tid)
-            _forget_task_media(tid)
-            # After the archive, so a re-run of an accepted fold still names its holder.
-            _forget_ack_first(_wire)
-            _forget_relay_counts(_wire, tid)
-            changed = True
+            with _retiring(tid):  # the archive and the id's retirement are one step to a wake
+                if not _archive_result(rfile, tid, generation):
+                    continue
+                # Retire the provenance WITH the result, never at read: this line is
+                # only reached once the lease-closing POST has actually succeeded.
+                _REDELIVERED.discard(tid)
+                inflight.discard(tid)
+                _forget_task_room(tid)
+                _forget_task_media(tid)
+                # After the archive, so a re-run of an accepted fold still names its holder.
+                _forget_ack_first(_wire)
+                _forget_relay_counts(_wire, tid)
+                changed = True
             _log(f"archived {tid} (marker {skip.value}, lease closed, not sent"
                  + (f", folded into {_folded})" if _folded else ")"))
             continue
@@ -7501,15 +7515,16 @@ def _post_ready_results(inflight: set[str]) -> None:
                                        dm_only=_dm_only(parsed)):
             changed |= _settle_delivered(tid, _wire, rfile, inflight)
             continue
-        if not _archive_result(rfile, tid, generation):
-            continue
-        inflight.discard(tid)
-        _forget_task_room(tid)
-        _forget_task_media(tid)
-        _forget_ack_first(_wire)
-        _forget_relay_counts(_wire, tid)
-        _forget_dedup_alias(tid)
-        changed = True
+        with _retiring(tid):  # the archive and the id's retirement are one step to a wake
+            if not _archive_result(rfile, tid, generation):
+                continue
+            inflight.discard(tid)
+            _forget_task_room(tid)
+            _forget_task_media(tid)
+            _forget_ack_first(_wire)
+            _forget_relay_counts(_wire, tid)
+            _forget_dedup_alias(tid)
+            changed = True
         _log(f"archived result for {tid}")
     if changed:
         _save_inflight(inflight)
@@ -7802,11 +7817,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile,
                                    generation=generation, dm_only=_dm_only(parsed)):
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
-            if _archive_result(rfile, tid, generation):
-                inflight.discard(tid)           # settled: the in-flight entry was only a marker
-                _save_inflight(inflight)
-                _forget_ack_first(_btid)
-            continue
+            with _retiring(tid):  # the archive and the id's retirement are one step to a wake
+                if _archive_result(rfile, tid, generation):
+                    inflight.discard(tid)           # settled: the in-flight entry was only a marker
+                    _save_inflight(inflight)
+                    _forget_ack_first(_btid)
+                continue
         _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
         if _delivery_core().backend.is_terminal(_item):
             if _settle_delivered(tid, _btid, rfile, inflight):
