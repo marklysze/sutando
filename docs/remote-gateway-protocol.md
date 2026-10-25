@@ -393,7 +393,8 @@ Sutando checkout around it sends neither field.
   task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
   task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
 - **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
-  the server no longer lists (acked more than 120 s ago) is fenced and its core work cancelled;
+  the server no longer lists (acked, or first published when no ack ever answered, more than
+  120 s ago) is fenced and its core work cancelled;
   server tasks this node does not hold are written to `state/relay-outstanding-tasks.json`.
 - A served task carrying `wake` is left unacked, whether or not this node saw its first
   attempt: running it without its answer, or closing it as a redelivery, would lose the answer.
