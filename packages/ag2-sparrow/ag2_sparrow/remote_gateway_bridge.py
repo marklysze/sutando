@@ -4344,11 +4344,17 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         # (see src/task-bridge.ts). Glob one level of month subdirs for this
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
-    if task.get("wake") is not None and (task_archived or _delivered_copy_exists(tid)):
+    woken = None
+    if task.get("wake") is not None and TURN_CONTEXT and not hold:
+        woken = _ATTEMPTS.open_wake(broker_tid, task["wake"])
+        if woken:
+            task = {**task, "task": task_attempts.render_wake(str(task.get("task") or ""), task["wake"])}
+            _log(f"wake for {tid}: episode {woken} queued as a new turn")
+    if task.get("wake") is not None and not woken and (task_archived or _delivered_copy_exists(tid)):
         # A woken ask is not a redelivery; closing it as one would answer it with no-send.
-        _log(f"wake for {tid}: not handled by this client yet — left unacked for redelivery")
+        _log(f"wake for {tid}: not run here (already run, or not supported) — left unacked")
         return None
-    if task_archived or _delivered_copy_exists(tid):
+    if not woken and (task_archived or _delivered_copy_exists(tid)):
         rfile = RESULTS_DIR / f"{tid}.txt"
         if rfile.exists():
             # A reply the local core wrote with a plain write_text: this process
@@ -4485,6 +4491,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # Guest keeps the read-only Codex path. Team carries its guardrail IN-BAND:
     # closing the Team session route removed the only thing that used to deliver it.
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
+    if TURN_CONTEXT:
+        lines.append(task_attempts.ask_in_room_rule(broker_tid))
     # A relay-stamped Signal task may attach from ITS OWN output directory only;
     # name it here (absolute) so the marker written is the one the guard confines.
     if sender_tier == "team" and isinstance(task.get("signal"), dict):
@@ -5606,6 +5614,11 @@ def _track_durably(tid: str, inflight: "set[str]") -> bool:
 def _result_disposed(tid: str) -> bool:
     """This id's own result was archived or kept, or its own delivery succeeded;
     an alias is judged only by its own copies, never by its primary's record."""
+    woken_item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if woken_item:
+        # The first attempt's copies are archived under this id; only the woken item decides.
+        root = getattr(_delivery_core().backend, "root", None)
+        return root is not None and (read_item(root, woken_item) or {}).get("status") == "DELIVERED"
     if _delivered_copy_exists(tid) or undelivered_quarantine.find_quarantined(RESULTS_DIR, tid):
         return True
     root = getattr(_delivery_core().backend, "root", None)
@@ -6980,7 +6993,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     # A fold posts nothing either, so it closes an already-accepted id the same way.
-    item_id = _effective_item_id(core, broker_tid, no_send or bool(consolidated_into))
+    woken_item = _ATTEMPTS.wake_item(broker_tid) if _ATTEMPTS is not None else None
+    item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
     # The task's own result item only: a close of an id already accepted keeps today's policy.
     relay = relay and item_id == broker_tid
     if relay:

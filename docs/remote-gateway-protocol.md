@@ -386,8 +386,8 @@ Sutando checkout around it sends neither field.
 - **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
   the server no longer lists (acked more than 120 s ago) is fenced and its core work cancelled;
   server tasks this node does not hold are written to `state/relay-outstanding-tasks.json`.
-- A served task carrying `wake` whose earlier attempt this node already finished is left unacked,
-  never closed as a redelivery.
+- A served task carrying `wake` is never closed as a redelivery. Without turn context, or for an
+  episode already run here, it is left unacked.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
@@ -397,6 +397,14 @@ then decided by the turn's journal: skipped when a room action already closed th
 `status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
 `room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as
 `status: completed`.
+
+Each task file then carries one writer-owned line telling the agent to ask a question that blocks
+it with `room.question.ask` on its exact `task_id`. A wake (the same task re-served with
+`wake.resolved_blockers` after the answer) runs once per `blocker_episode_id`
+(`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
+to the task's line as quoted room data, and it is acked at the same generation into a new turn.
+Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
+neither blocks nor stands in for it.
 
 ### `GET /v1/setup` *(optional)*
 
