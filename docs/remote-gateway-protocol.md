@@ -396,7 +396,8 @@ actions to and journals in `state/room-actions.jsonl`. When the result settles t
 then decided by the turn's journal: skipped when a room action already closed the task; posted as
 `status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
 `room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as
-`status: completed`.
+`status: completed`. An outcome whose `applied_*` fields are null (a task the ledger does not know) is
+unknown: neither terminal nor suspended, so only the same-text check applies to it.
 
 Each task file then carries one writer-owned line telling the agent to ask a question that blocks
 it with `room.question.ask` on its exact `task_id`. A wake (the same task re-served with
