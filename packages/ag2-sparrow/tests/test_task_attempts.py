@@ -1,0 +1,236 @@
+"""Relay task attempts (`ag2_sparrow/task_attempts.py`): lease generation, beats, cancel, turns.
+
+Run:
+    python3 packages/ag2-sparrow/tests/test_task_attempts.py
+"""
+import io
+import json
+import stat
+import sys
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+
+PKG_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PKG_ROOT))
+
+from ag2_sparrow import agent_turn, task_attempts  # noqa: E402
+from ag2_sparrow.delivery_core import contract, provider_ag2space
+
+DeliveryOutcome, AG2SpaceResultProvider = contract.DeliveryOutcome, provider_ag2space.AG2SpaceResultProvider
+
+
+def _http(code, body):
+    return urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(json.dumps(body).encode()))
+
+
+class Gateway:
+    """Records requests; answers each path from a queue (a callable or a value)."""
+    def __init__(self, **answers):
+        self.calls, self.answers = [], answers
+
+    def __call__(self, method, path, payload=None, timeout=None):
+        self.calls.append((method, path, payload))
+        key = path.split("?")[0]
+        ans = self.answers.get(key)
+        if isinstance(ans, BaseException):
+            raise ans
+        return ans(payload) if callable(ans) else (ans or {})
+
+
+def _ack(gen=1):
+    return {"ok": True, "task_id": "tsk_A", "execution_generation": gen, "attempt": gen,
+            "lease_expires_at": 1761354125.0}
+
+
+class Attempts(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.gw = Gateway()
+        self.logs = []
+
+    def mk(self, turn_context=False, now=lambda: 1000.0):
+        return task_attempts.TaskAttempts(self.state, self.gw, turn_context=turn_context,
+                                          log=self.logs.append, now=now)
+
+    def test_ack_records_generation_and_one_worker_id_rides_every_call(self):
+        a = self.mk()
+        wid = a.ack_fields()["worker_id"]
+        self.assertRegex(wid, r"^[0-9a-f]{32}$")
+        self.assertEqual(a.ack_fields(), {"worker_id": wid, "protocol_version": 2})
+        self.assertEqual(self.mk().worker_id(), wid, "stable across restarts")
+        a.record_ack("tsk_A", _ack(2))
+        self.assertEqual(a.result_fields("tsk_A"), {"execution_generation": 2, "worker_id": wid})
+        a.post_task_beats({"tsk_A"})
+        _, path, body = self.gw.calls[-1]
+        self.assertEqual(path, task_attempts.TASK_HEARTBEAT_PATH)
+        self.assertEqual(body, {"worker_id": wid, "tasks": [
+            {"task_id": "tsk_A", "worker_id": wid, "execution_generation": 2}]})
+
+    def test_an_ack_without_a_generation_records_nothing(self):
+        a = self.mk()
+        for resp in ({}, {"execution_generation": 0}, {"execution_generation": "2"}, None):
+            self.assertIsNone(a.record_ack("tsk_A", resp))
+        self.assertEqual(a.result_fields("tsk_A"), {})
+        a.post_task_beats({"tsk_A"})
+        self.assertEqual(self.gw.calls, [], "no beat for an attempt with no generation")
+
+    def test_heartbeat_409_aborts_turn(self):
+        self.gw.answers[task_attempts.TASK_HEARTBEAT_PATH] = {"ok": True, "task_errors": [
+            {"task_id": "tsk_A", "error_code": "task_cancelled",
+             "cancel_requested_generation": 2, "cancel_requested_attempt": 2}]}
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(2))
+        errors = a.post_task_beats({"tsk_A"})
+        self.assertEqual(len(errors), 1)
+        verdict = a.fence("tsk_A", errors[0])
+        self.assertEqual(verdict, {"new": True, "cancel": True}, "the caller stops the core")
+        self.assertEqual(a.fence("tsk_A", errors[0])["new"], False, "one stop per fence")
+        self.assertEqual(a.result_decision("tsk_A", "late reply", False).action, agent_turn.SETTLE,
+                         "the fenced attempt's result is dropped, never posted")
+        self.assertTrue(a.cancel_ack("tsk_A"))
+        self.assertEqual(self.gw.calls[-1][1:], ("/v1/tasks/tsk_A/cancel-ack", {
+            "worker_id": a.worker_id(), "cancel_requested_generation": 2,
+            "cancel_requested_attempt": 2}))
+        self.assertFalse(a.cancel_ack("tsk_A"), "acked once")
+        before = len(self.gw.calls)
+        a.post_task_beats({"tsk_A"})
+        self.assertEqual(len(self.gw.calls), before, "a fenced attempt sends no more beats")
+
+    def test_stale_generation_stops_the_core_without_a_cancel_ack(self):
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(1))
+        v = a.fence("tsk_A", {"task_id": "tsk_A", "error_code": "stale_execution_generation"})
+        self.assertEqual(v, {"new": True, "cancel": True})
+        self.assertFalse(a.cancel_ack("tsk_A"))
+        self.assertEqual(self.gw.calls, [])
+
+    def test_cancel_ack_retries_on_failure_and_accepts_a_settled_answer(self):
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(2))
+        a.fence("tsk_A", {"error_code": "task_cancelled", "cancel_requested_generation": 2,
+                          "cancel_requested_attempt": 2})
+        self.gw.answers["/v1/tasks/tsk_A/cancel-ack"] = _http(503, {"error": "x"})
+        self.assertFalse(a.cancel_ack("tsk_A"))
+        self.gw.answers["/v1/tasks/tsk_A/cancel-ack"] = _http(409, {"error_code": "no_cancel_pending"})
+        self.assertTrue(a.cancel_ack("tsk_A"))
+
+    def test_a_broker_without_per_task_beats_is_left_alone(self):
+        self.gw.answers[task_attempts.TASK_HEARTBEAT_PATH] = _http(404, {})
+        a = self.mk()
+        a.record_ack("tsk_A", _ack())
+        a.post_task_beats({"tsk_A"})
+        a.post_task_beats({"tsk_A"})
+        self.assertEqual(len(self.gw.calls), 1)
+
+    def test_turn_file_is_written_on_ack_and_closed_on_finish(self):
+        a = self.mk(turn_context=True)
+        a.remember_task("tsk_A", {"source_room_id": "!r:ag2.space", "thread_root": "$root"})
+        rec = a.record_ack("tsk_A", _ack(1), agent_mxid="@agent:ag2.space")
+        path = agent_turn.turns_dir(self.state) / f"{rec['turn_id']}.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+        ctx = agent_turn.read_turn_context(path)
+        self.assertEqual((ctx["task_id"], ctx["room_id"], ctx["thread_root_id"], ctx["agent_mxid"],
+                          ctx["worker_id"]),
+                         ("tsk_A", "!r:ag2.space", "$root", "@agent:ag2.space", a.worker_id()))
+        self.assertEqual(a.record_ack("tsk_A", _ack(1))["turn_id"], rec["turn_id"], "a re-ack keeps it")
+        a.finish("tsk_A")
+        self.assertTrue(agent_turn.is_closed(self.state, rec["turn_id"]))
+        self.assertFalse(path.exists())
+        self.assertEqual(a.get("tsk_A"), {})
+
+    def test_a_new_generation_closes_the_old_turn(self):
+        a = self.mk(turn_context=True)
+        first = a.record_ack("tsk_A", _ack(1))["turn_id"]
+        second = a.record_ack("tsk_A", _ack(2))["turn_id"]
+        self.assertNotEqual(first, second)
+        self.assertTrue(agent_turn.is_closed(self.state, first))
+        self.assertEqual(agent_turn.open_turn_for_task(self.state, "tsk_A").stem, second)
+
+    def test_no_turn_files_while_turn_context_is_off(self):
+        a = self.mk(turn_context=False)
+        a.record_ack("tsk_A", _ack(1))
+        self.assertFalse(agent_turn.turns_dir(self.state).exists())
+        self.assertIsNone(a.result_decision("tsk_A", "reply", False), "today's posting applies")
+
+    def test_result_decision_reads_the_turns_journal(self):
+        a = self.mk(turn_context=True)
+        turn = a.record_ack("tsk_A", _ack(1))["turn_id"]
+        self.assertEqual(a.result_decision("tsk_A", "final", False).fields, {"status": "completed"})
+        with open(agent_turn.room_actions_path(self.state), "a") as fh:
+            fh.write(json.dumps({"record_type": "dispatch_intent", "turn_id": turn, "seq": 1,
+                                 "ts": 2e9, "operation_id": f"op_{turn}_1", "action": "room.message.send",
+                                 "body_sha256": agent_turn.body_sha256("final")}) + "\n")
+        self.assertEqual(a.result_decision("tsk_A", "final", False).fields,
+                         {"status": "completed", "no_send": True})
+
+    def test_startup_sweep_closes_orphaned_turns_only(self):
+        a = self.mk(turn_context=True)
+        live = a.record_ack("tsk_A", _ack(1))["turn_id"]
+        dead = a.record_ack("tsk_B", {**_ack(1), "task_id": "tsk_B"})["turn_id"]
+        self.assertEqual(a.sweep({"tsk_A"}), 1)
+        self.assertTrue(agent_turn.is_closed(self.state, dead))
+        self.assertFalse(agent_turn.is_closed(self.state, live))
+        self.assertEqual(a.get("tsk_B"), {})
+
+    def test_tasks_md_server_reconciliation(self):
+        clock = [1000.0]
+        a = self.mk(now=lambda: clock[0])
+        for t in ("tsk_old", "tsk_new", "tsk_live"):
+            a.record_ack(t, {**_ack(1), "task_id": t})
+        clock[0] += 60
+        a.record_ack("tsk_new", {**_ack(2), "task_id": "tsk_new"})
+        clock[0] += task_attempts.RECONCILE_GRACE_S
+        pages = iter([{"tasks": [{"task_id": "tsk_live"}], "next_cursor": "c1"},
+                      {"tasks": [{"task_id": "tsk_server_only", "execution_phase": "working"}],
+                       "next_cursor": None}])
+        self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = lambda _: next(pages)
+        server = a.active_tasks()
+        self.assertEqual([t["task_id"] for t in server], ["tsk_live", "tsk_server_only"])
+        self.assertIn("cursor=c1", self.gw.calls[-1][1])
+        found = a.reconcile({"tsk_old", "tsk_new", "tsk_live"}, server)
+        self.assertEqual(found["closed_on_server"], ["tsk_old"], "a just-acked attempt waits")
+        self.assertEqual([t["task_id"] for t in found["missing_locally"]], ["tsk_server_only"])
+
+    def test_an_incomplete_listing_skips_reconciliation(self):
+        a = self.mk()
+        for ans in (_http(503, {"error_code": "task_api_unavailable"}), {"tasks": "x"}):
+            self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = ans
+            self.assertIsNone(a.active_tasks())
+        self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = {"tasks": [], "next_cursor": "again"}
+        self.assertIsNone(a.active_tasks(max_pages=3), "a listing that never ends is not complete")
+
+    def test_cancel_task_text_is_the_cores_cancel_signal(self):
+        text = task_attempts.cancel_task_text("task-x", "task-ctl-1", "2026-10-26T00:00:00Z",
+                                              "task_cancelled")
+        lines = text.splitlines()
+        self.assertTrue(lines[-1].startswith("task: CANCEL_INSTRUCTION: stop processing task-x "))
+        self.assertIn(f"source: {task_attempts.CONTROL_SOURCE}", lines)
+
+
+class SettledResults(unittest.TestCase):
+    def test_a_409_that_ends_the_task_settles_the_result(self):
+        for status, code in ((409, "task_already_terminal"), (409, "stale_execution_generation"),
+                             (409, "task_cancelled"), (400, "waiting_input_without_blocker")):
+            with self.subTest(code=code):
+                def req(*_a, status=status, code=code):
+                    raise _http(status, {"error": "x", "error_code": code})
+                r = AG2SpaceResultProvider(req, read_back=False).deliver(
+                    "tsk_A", json.dumps({"id": "tsk_A", "body": "b"}).encode(), "k")
+                self.assertEqual((r.outcome, r.provider_ref), (DeliveryOutcome.CONFIRMED, f"settled:{code}"))
+
+    def test_any_other_answer_is_still_a_refusal(self):
+        for status, code in ((409, "revision_conflict"), (400, "use_cancel_ack"),
+                             (400, "task_already_terminal")):
+            with self.subTest(code=code):
+                def req(*_a, status=status, code=code):
+                    raise _http(status, {"error_code": code})
+                with self.assertRaises(Exception) as cm:
+                    AG2SpaceResultProvider(req, read_back=False).deliver(
+                        "tsk_A", json.dumps({"id": "tsk_A", "body": "b"}).encode(), "k")
+                self.assertIn(str(status), str(cm.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

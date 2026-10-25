@@ -51,6 +51,11 @@ Config (env / .env):
   REMOTE_HEALTH_COMMAND optional command printing the core's health row (JSON) for
                         the heartbeat; see health_command.py
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
+  REMOTE_TASK_LIFECYCLE_V2  "1" sends the lease worker_id and execution_generation on
+                        ack/results, per-task beats to /v1/tasks/heartbeat, honours a
+                        broker cancel, and reconciles with /v1/tasks/active (default off)
+  REMOTE_TASK_TURN_CONTEXT  "1" (with the above) writes each attempt's turn file and
+                        gates its result on the turn's room actions (default off)
 
 Stdlib only (urllib) — no new dependencies.
 """
@@ -347,6 +352,7 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
                              stage_text as _stage_text)
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
+from . import task_attempts
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
@@ -439,6 +445,12 @@ def _task_pending(tid: str) -> bool:
 # Persist the in-flight set (tasks pulled from the gateway, awaiting result-POST)
 # so a client restart between pull and POST doesn't strand the result. Scoped to
 INFLIGHT_FILE = _STATE / f"remote-task-inflight{_INST_SUFFIX}.json"
+LIFECYCLE_V2 = os.environ.get("REMOTE_TASK_LIFECYCLE_V2") == "1"
+TURN_CONTEXT = LIFECYCLE_V2 and os.environ.get("REMOTE_TASK_TURN_CONTEXT") == "1"
+# The request is looked up per call so a test's patched `_req` is the one used.
+_ATTEMPTS = (task_attempts.TaskAttempts(_STATE, lambda *a, **k: _req(*a, **k), suffix=_INST_SUFFIX,
+                                        turn_context=TURN_CONTEXT, log=lambda m: _log(m))
+             if LIFECYCLE_V2 else None)
 # Sidecar map {task id → origin room id}, recorded at queue time. Outbound
 # file-attach needs the room because media uploads go to the room-scoped
 TASK_ROOMS_FILE = _STATE / f"remote-task-rooms{_INST_SUFFIX}.json"
@@ -3021,9 +3033,11 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
+        if _ATTEMPTS is not None:
+            body.update(_ATTEMPTS.ack_fields())
         bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
         try:
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            doc = _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         except _NETWORK_ERRORS as e:
             if not _connection_dropped(e) or (dropped is None and not retry_inline):
                 raise
@@ -3033,11 +3047,18 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
-            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+            doc = _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
+        _record_attempt(wire_tid, doc)
         return True
     except urllib.error.HTTPError as e:
+        if e.code == 409 and _ATTEMPTS is not None:
+            code, err = task_attempts.http_error_code(e)
+            if code == "task_cancelled":
+                _fence_attempt(_broker_tid(tid), err)
+                _forget_pending_ack(tid, lease_id)
+                return False
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
@@ -3089,10 +3110,18 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     body = {"id": wire_tid, "durable": True}
     if lease_id:
         body["lease_id"] = lease_id
+    if _ATTEMPTS is not None:
+        body.update(_ATTEMPTS.ack_fields())
     try:
-        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
+        doc = _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
+        _record_attempt(wire_tid, doc)
         return "accepted"
     except urllib.error.HTTPError as e:
+        if e.code == 409 and _ATTEMPTS is not None:
+            code, err = task_attempts.http_error_code(e)
+            if code == "task_cancelled":
+                _fence_attempt(wire_tid, err, notify_core=False)   # staged: the core never saw it
+                return "stale"
         reason = _http_error_body(e).lower() if e.code == 404 else ""
         if "not leased" in reason:
             return "stale" if "stale lease generation" in reason else "gone"
@@ -3665,6 +3694,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
+    _post_task_beats(inflight)
     # An injected row is not the core's beat: presence status stays the core-status file's.
     _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
     try:
@@ -3706,6 +3736,66 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {diagnostics.describe(e)} — continuing")
         return False
+
+
+def _record_attempt(wire_tid: str, doc) -> None:
+    if _ATTEMPTS is not None:
+        _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None)
+
+
+def _queue_cancel_instruction(tid: str, reason: str) -> None:
+    """Stop the core's work on a fenced attempt through its own cancel signal."""
+    now = time.time()
+    ctl = f"task-ctl-{int(now * 1000)}{_INST_SUFFIX.replace('.', '-')}"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    if not _durable_write(TASKS_DIR / f"{ctl}.txt",
+                          task_attempts.cancel_task_text(tid, ctl, stamp, reason)):
+        _log(f"task {tid}: cancel instruction not written — the core may finish a fenced attempt")
+
+
+def _fence_attempt(wire_tid: str, error: dict, notify_core: bool = True) -> None:
+    verdict = _ATTEMPTS.fence(wire_tid, error)
+    if verdict["new"] and verdict["cancel"] and notify_core:
+        _queue_cancel_instruction(_local_tid(wire_tid), str(error.get("error_code")))
+    _ATTEMPTS.cancel_ack(wire_tid)
+
+
+def _post_task_beats(inflight: "set[str]") -> None:
+    if _ATTEMPTS is None:
+        return
+    wire = {_broker_tid(t) for t in inflight}
+    for wire_tid in wire:
+        _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
+    for err in _ATTEMPTS.post_task_beats(wire):
+        if err.get("task_id") in wire:
+            _fence_attempt(err["task_id"], err)
+
+
+_LEDGER_RECONCILE_EVERY_S = 300.0
+_last_ledger_reconcile = 0.0
+OUTSTANDING_TASKS_FILE = _STATE / f"relay-outstanding-tasks{_INST_SUFFIX}.json"
+
+
+def _reconcile_ledger(inflight: "set[str]") -> None:
+    """Close local attempts the server has closed; list server tasks this node does not hold."""
+    global _last_ledger_reconcile
+    if _ATTEMPTS is None or time.time() - _last_ledger_reconcile < _LEDGER_RECONCILE_EVERY_S:
+        return
+    _last_ledger_reconcile = time.time()
+    server = _ATTEMPTS.active_tasks()
+    if server is None:
+        return
+    wire = {_broker_tid(t) for t in inflight}
+    found = _ATTEMPTS.reconcile(wire, server)
+    for wire_tid in found["closed_on_server"]:
+        _fence_attempt(wire_tid, {"error_code": "task_already_terminal"})
+        _queue_cancel_instruction(_local_tid(wire_tid), "closed on server")
+    _durable_write(OUTSTANDING_TASKS_FILE, json.dumps(
+        {"checked_at": _last_ledger_reconcile, "tasks": found["missing_locally"]}, sort_keys=True))
+    if found["missing_locally"]:
+        _log(f"ledger: {len(found['missing_locally'])} outstanding server task(s) not held here "
+             f"— listed in {OUTSTANDING_TASKS_FILE.name}")
 
 
 def _record_setup_hint(reply) -> None:
@@ -4230,6 +4320,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if _ATTEMPTS is not None:
+        _ATTEMPTS.remember_task(broker_tid, task)
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived —
     # but a pre-S1 queue file still has to earn its durability before the ack.
@@ -4245,6 +4337,10 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         # (see src/task-bridge.ts). Glob one level of month subdirs for this
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
+    if task.get("wake") is not None and (task_archived or _delivered_copy_exists(tid)):
+        # A woken ask is not a redelivery; closing it as one would answer it with no-send.
+        _log(f"wake for {tid}: not handled by this client yet — left unacked for redelivery")
+        return None
     if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
         if rfile.exists():
@@ -6833,9 +6929,21 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     relay = _relay_result(tid, broker_tid)
     if relay is None:
         return False
+    decision = _ATTEMPTS.result_decision(broker_tid, body, no_send) if _ATTEMPTS else None
+    if decision is not None and decision.action == task_attempts.agent_turn.SETTLE:
+        _log(f"result {tid}: settled without a post ({decision.reason})")
+        _ATTEMPTS.finish(broker_tid)
+        return True
+    if decision is not None:
+        _log(f"result {tid}: {decision.reason} -> {decision.fields}")
+        no_send = no_send or bool(decision.fields.get("no_send"))
     # `no_send` is the broker's STRUCTURED suppression field: the lease must
     # close without a user-facing send. It rides the payload, not the body.
     doc = {"id": broker_tid, "body": body}
+    if _ATTEMPTS is not None:
+        doc.update(_ATTEMPTS.result_fields(broker_tid))
+    if decision is not None and decision.fields.get("status"):
+        doc["status"] = decision.fields["status"]
     if no_send:
         doc["no_send"] = True
     if consolidated_into:
@@ -6886,6 +6994,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
+            if _ATTEMPTS is not None:
+                _ATTEMPTS.finish(broker_tid)
             return True
         if relay:
             _reopen_relay_result(core, item_id, tid, record, result_file, generation)
@@ -6923,6 +7033,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
+        if _ATTEMPTS is not None:
+            _ATTEMPTS.finish(broker_tid)
         return True
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
@@ -7486,6 +7598,12 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             # Leave their delivery and retirement to the local consumers.
             if headers.get("source") == "cron":
                 continue
+            if headers.get("source") == task_attempts.CONTROL_SOURCE:
+                try:
+                    _retire_orphan(rfile, ARCHIVE_RESULTS_DIR, tid, identity_of(rfile)[1])
+                except OSError:
+                    pass
+                continue
         # One open decides every arm below, and only that generation is retired.
         try:
             data, generation = identity_of(rfile)
@@ -7868,6 +7986,10 @@ def main() -> None:
     _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
+    if _ATTEMPTS is not None:
+        closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
+        if closed:
+            _log(f"closed {closed} turn file(s) whose task is no longer in flight")
     for sweep in (_retire_delivered_marks, _sweep_held_dir):
         try:
             sweep()
@@ -7969,6 +8091,7 @@ def main() -> None:
             if _keep_relay_results_in_flight(inflight):
                 wake_outbound()
             _reconcile_orphan_results(inflight)
+            _reconcile_ledger(inflight)
             _post_heartbeat(inflight)
             # The pool's advertisement rides the same beat: push-on-change, never
             # raising, so a broker without the endpoints costs one deferred log.

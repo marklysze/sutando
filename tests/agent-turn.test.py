@@ -95,6 +95,15 @@ class TurnContext(unittest.TestCase):
         self.assertTrue(old.exists() and other.exists())
         self.assertEqual(at.open_turn_for_task(self.state, "tsk_A"), old)
         self.assertIsNone(at.open_turn_for_task(self.state, "../etc"))
+        self.assertEqual(sorted(at.open_turns(self.state)), sorted([old, other]))
+
+    def test_newest_open_turn_is_by_created_at_not_name(self):
+        def mk(gen, ms):
+            return at.write_turn_context(self.state, at.build_turn_context(
+                task_id="tsk_N", execution_generation=gen, state_dir=self.state, now_ms=ms))
+        mk(9, 2000)
+        g10 = mk(10, 3000)
+        self.assertEqual(at.open_turn_for_task(self.state, "tsk_N"), g10, "g10 sorts before g9 by name")
 
 
 class TurnGate(unittest.TestCase):
@@ -197,6 +206,77 @@ class TurnGate(unittest.TestCase):
                   "operation_id": f"op_{self.turn}_1", "operation_status": "succeeded",
                   "effective_task_status": "done"})
         self.assertEqual(self._verdict().outcome, at.TERMINAL_CONFIRMED)
+
+
+
+class ResultFileDecision(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.turn = _ctx(self.state)["turn_id"]
+
+    def _decide(self, body="final answer", **kw):
+        return at.result_file_decision(at.read_turn_records(self.state, self.turn), body, **kw)
+
+    def test_a_deliberate_result_after_progress_messages_is_posted(self):
+        _journal(self.state, {**_intent(self.turn, 1), "body_sha256": at.body_sha256("on it")},
+                 _outcome(self.turn, 1))
+        d = self._decide()
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_a_result_already_sent_as_a_room_message_is_not_resent(self):
+        for outcome in ([_outcome(self.turn, 1)], [_outcome(self.turn, 1, op_status="dispatched_unknown")], []):
+            with self.subTest(outcome=outcome):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                _journal(state, {**_intent(turn, 1), "body_sha256": at.body_sha256(" final answer\n")},
+                         *[{**o, "turn_id": turn, "operation_id": f"op_{turn}_1"} for o in outcome])
+                d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
+                self.assertEqual(d.fields, {"status": "completed", "no_send": True})
+
+    def test_terminal_turn_or_closed_task_settles_without_posting(self):
+        _journal(self.state, _intent(self.turn, 1, status="done"),
+                 _outcome(self.turn, 1, phase="responded", terminal=True, requested="done"))
+        self.assertEqual(self._decide().action, at.SETTLE)
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        d = at.result_file_decision(at.read_turn_records(state, turn), "x",
+                                    server_state={"terminal": True, "execution_phase": "cancelled"})
+        self.assertEqual(d.action, at.SETTLE)
+
+    def test_a_suspended_turn_is_never_posted_as_completed(self):
+        cases = [dict(phase="waiting_input", blockers=1), dict(phase="input_ready", blockers=0),
+                 dict(phase="working", blockers=2), dict(phase="waiting_input", blockers=0)]
+        for case in cases:
+            with self.subTest(**case):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                _journal(state, _intent(turn, 1, action="room.question.ask"), _outcome(turn, 1, **case))
+                for body, no_send in (("I asked the owner", False), ("", True)):
+                    d = at.result_file_decision(at.read_turn_records(state, turn), body, no_send=no_send)
+                    self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
+
+    def test_a_turn_closed_terminally_through_mcp_skips_the_result_file(self):
+        for phase in ("responded", "suppressed", "consolidated"):
+            with self.subTest(phase=phase):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                _journal(state, _intent(turn, 1, status="done"),
+                         _outcome(turn, 1, phase=phase, terminal=True, requested="done"))
+                d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
+                self.assertEqual((d.action, d.fields), (at.SETTLE, {}))
+
+    def test_suspended_no_send_and_unreadable(self):
+        _journal(self.state, _intent(self.turn, 1, action="room.question.ask"),
+                 _outcome(self.turn, 1, phase="waiting_input", blockers=1))
+        self.assertEqual(self._decide().fields, {"status": "waiting_input", "no_send": True})
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        recs = at.read_turn_records(state, turn)
+        self.assertEqual(at.result_file_decision(recs, "", no_send=True).fields,
+                         {"status": "no_action_needed"})
+        at.room_actions_path(state).mkdir()
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "x").fields,
+                         {"status": "failed", "no_send": True})
 
 
 if __name__ == "__main__":

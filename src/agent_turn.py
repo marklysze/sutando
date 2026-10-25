@@ -8,17 +8,22 @@ before the HTTP request and a `dispatch_outcome` after it.
 
 At turn exit `classify_turn` reads those records and decides:
   terminal_confirmed   — a succeeded operation applied a terminal task state;
-  durably_suspended    — the latest applied state is an open HITL blocker, or a
-                         terminal-intent operation is still running (202);
+  durably_suspended    — the latest applied state is waiting_input or input_ready, or
+                         has an open blocker, or a terminal-intent operation is still
+                         running (202);
   incomplete_or_error  — anything else. The plain-text answer may be sent as the
                          reply ONLY when the journal is readable, holds no intent for
                          the turn nor any unbound intent since it began, and core-api
                          confirms zero operations for the turn.
 
+`result_file_decision` applies the gate to Sutando's result file, which the agent writes
+on purpose: it is posted unless the task is already closed or its text was already sent.
+
 Stdlib only, so the ag2-sparrow package can vendor it byte-identical.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -46,6 +51,7 @@ TERMINAL_PHASES = frozenset({"responded", "suppressed", "consolidated", "complet
 TERMINAL_STATUSES = frozenset({"done", "no_action", "consolidated", "failed", "cancelled"})
 TERMINAL_INTENT_STATUSES = frozenset({"done", "no_action"})
 ASYNC_STATUSES = frozenset({"accepted", "running"})
+SUSPENDED_PHASES = frozenset({"waiting_input", "input_ready"})
 
 _ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _TURN_RE = re.compile(r"[A-Za-z0-9._-]{1,160}")
@@ -158,18 +164,27 @@ def is_closed(state_dir: Path, turn_id: str) -> bool:
 
 
 def open_turn_for_task(state_dir: Path, task_id: str) -> Path | None:
-    """The newest unclosed turn file for a task — how a long-lived proxy finds its turn."""
+    """The unclosed turn file for a task with the largest `created_at_ms`, as the proxy picks it."""
     if not _ID_RE.fullmatch(str(task_id)):
         return None
     best: tuple[int, str, Path] | None = None
     for p in turns_dir(state_dir).glob(f"{task_id}_g*_*.json"):
-        m = re.fullmatch(re.escape(task_id) + r"_g(\d+)_([0-9A-Z]{26})", p.stem)
-        if not m or is_closed(state_dir, p.stem):
+        if not re.fullmatch(re.escape(task_id) + r"_g\d+_[0-9A-Z]{26}", p.stem) \
+                or is_closed(state_dir, p.stem):
             continue
-        key = (int(m.group(1)), m.group(2), p)
+        ctx = read_turn_context(p)
+        if not ctx or ctx.get("task_id") != task_id or not isinstance(ctx.get("created_at_ms"), int):
+            continue
+        key = (ctx["created_at_ms"], p.stem, p)
         if best is None or key[:2] > best[:2]:
             best = key
     return best[2] if best else None
+
+
+def open_turns(state_dir: Path) -> list:
+    """Every turn file without a `.closed` sibling."""
+    return [p for p in turns_dir(state_dir).glob("*.json")
+            if _TURN_RE.fullmatch(p.stem) and not is_closed(state_dir, p.stem)]
 
 
 def close_turn(state_dir: Path, turn_id: str) -> None:
@@ -283,7 +298,7 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
     else:
         terminal, phase = _applied_terminal(latest), latest.get("applied_execution_phase")
         blockers = latest.get("active_blocker_count")
-    if not terminal and phase == "waiting_input" and int(blockers or 0) > 0:
+    if not terminal and (phase in SUSPENDED_PHASES or int(blockers or 0) > 0):
         return TurnVerdict(DURABLY_SUSPENDED, False, "open HITL blocker", n)
 
     terminal_intents = [o for o in outcomes
@@ -304,3 +319,41 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
     if not stdout.strip():
         return TurnVerdict(INCOMPLETE_OR_ERROR, False, "no output", n)
     return TurnVerdict(INCOMPLETE_OR_ERROR, True, "text-only turn", n)
+
+
+SETTLE = "settle"
+POST = "post"
+
+
+@dataclass(frozen=True)
+class ResultDecision:
+    action: str
+    fields: dict
+    reason: str
+
+
+def body_sha256(body: str) -> str:
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
+
+
+def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = False,
+                         reconciled: Iterable[dict] = (),
+                         server_state: dict | None = None) -> ResultDecision:
+    """What to do with a result file the agent wrote on purpose (not inferred stdout):
+    post it unless the task is already closed or the same text was sent as a room message."""
+    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state)
+    if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
+        return ResultDecision(SETTLE, {}, verdict.reason if verdict.outcome == TERMINAL_CONFIRMED
+                              else "task already closed on server")
+    if verdict.outcome == DURABLY_SUSPENDED:
+        return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
+    if no_send:
+        return ResultDecision(POST, {"status": "no_action_needed"}, "result marked no-send")
+    if not records.readable:
+        return ResultDecision(POST, {"status": "failed", "no_send": True}, "journal unreadable")
+    digest = body_sha256(body) if body.strip() else None
+    if digest and any(i.get("action") == "room.message.send" and i.get("body_sha256") == digest
+                      for i in (*records.intents, *records.unbound_intents)):
+        return ResultDecision(POST, {"status": "completed", "no_send": True},
+                              "the same text was already sent as a room message")
+    return ResultDecision(POST, {"status": "completed"}, "deliberate result file")
