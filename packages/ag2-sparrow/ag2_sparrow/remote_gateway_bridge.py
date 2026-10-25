@@ -3787,7 +3787,7 @@ def _reconcile_ledger(inflight: "set[str]") -> None:
     if server is None:
         return
     wire = {_broker_tid(t) for t in inflight}
-    found = _ATTEMPTS.reconcile(wire, server)
+    found = _ATTEMPTS.compare_with_server(wire, server)
     for wire_tid in found["closed_on_server"]:
         _fence_attempt(wire_tid, {"error_code": "task_already_terminal"})
         _queue_cancel_instruction(_local_tid(wire_tid), "closed on server")

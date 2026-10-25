@@ -189,7 +189,7 @@ class Attempts(unittest.TestCase):
         server = a.active_tasks()
         self.assertEqual([t["task_id"] for t in server], ["tsk_live", "tsk_server_only"])
         self.assertIn("cursor=c1", self.gw.calls[-1][1])
-        found = a.reconcile({"tsk_old", "tsk_new", "tsk_live"}, server)
+        found = a.compare_with_server({"tsk_old", "tsk_new", "tsk_live"}, server)
         self.assertEqual(found["closed_on_server"], ["tsk_old"], "a just-acked attempt waits")
         self.assertEqual([t["task_id"] for t in found["missing_locally"]], ["tsk_server_only"])
 

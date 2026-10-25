@@ -311,7 +311,7 @@ class TaskAttempts:
                 return tasks
         return None
 
-    def reconcile(self, local_wire_tids, server_tasks: list) -> dict:
+    def compare_with_server(self, local_wire_tids, server_tasks: list) -> dict:
         """Local attempts the server no longer lists, and server tasks this node does not hold."""
         listed = {t["task_id"]: t for t in server_tasks}
         data = self._load()
