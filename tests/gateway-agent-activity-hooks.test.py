@@ -45,6 +45,11 @@ class FakeGateway:
         return [p for _m, path, p in self.calls if path.endswith(suffix)]
 
 
+def _task(tid, **extra):
+    return {"id": tid, "task": "reply", "source": "ag2space", "user_id": "@o:x", "access_tier": "owner",
+            **extra}
+
+
 def _ack(tid, gen=1):
     return {"ok": True, "durable": True, "task_id": tid, "execution_generation": gen, "attempt": gen,
             "lease_expires_at": 1761354125.0}
@@ -64,6 +69,7 @@ class Hooks(unittest.TestCase):
         return [p for p in gw.TASKS_DIR.glob("task-ctl-*.txt") if f"stop processing {tid} " in p.read_text()]
 
     def test_the_ack_carries_the_lease_holder_and_records_the_generation(self):
+        self.assertIsNotNone(gw._write_task(_task("task-h1")))
         fake = self.use(FakeGateway(**{"/v1/tasks/task-h1/ack": _ack("task-h1", 4)}))
         self.assertTrue(gw._post_task_ack("task-h1", durable=True))
         body = fake.posted("/ack")[0]
@@ -105,6 +111,116 @@ class Hooks(unittest.TestCase):
             gw._queue_cancel_instruction("task-h5a", "task_cancelled")
             gw._queue_cancel_instruction("task-h5b", "task_cancelled")
         self.assertEqual((len(self.controls("task-h5a")), len(self.controls("task-h5b"))), (1, 1))
+
+    def test_a_result_written_before_the_ack_waits_for_the_lease(self):
+        self.assertTrue(gw._take_served_task(_task("task-race"), set(), []))
+        fake = self.use(FakeGateway(**{"/v1/tasks/task-race/ack": _ack("task-race", 3),
+                                       "/v1/results": {"ok": True}}))
+        self.assertFalse(gw._deliver_result_payload("task-race", "task-race", "fast answer"))
+        self.assertEqual(fake.posted("/v1/results"), [], "nothing goes before the ack names the lease")
+        self.assertTrue(gw._post_task_ack("task-race", durable=True))
+        turn = agent_turn.open_turn_for_task(gw._STATE, "task-race").stem
+        self.assertTrue(gw._deliver_result_payload("task-race", "task-race", "fast answer"))
+        sent = fake.posted("/v1/results")[0]
+        self.assertEqual((sent["execution_generation"], sent["status"]), (3, "completed"))
+        self.assertTrue(agent_turn.is_closed(gw._STATE, turn))
+
+    def test_room_actions_before_the_ack_still_gate_the_result(self):
+        self.assertTrue(gw._take_served_task(_task("task-early"), set(), []))
+        with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+            fh.write(json.dumps({"record_type": "dispatch_intent", "turn_id": None, "task_id": "task-early",
+                                 "ts": time.time(), "action": "room.message.send",
+                                 "body_sha256": agent_turn.body_sha256("the answer")}) + "\n")
+        fake = self.use(FakeGateway(**{"/v1/tasks/task-early/ack": _ack("task-early", 1),
+                                       "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack("task-early", durable=True))
+        self.assertTrue(gw._deliver_result_payload("task-early", "task-early", "the answer"))
+        self.assertEqual(fake.posted("/v1/results")[0].get("no_send"), True, "the early send is not repeated")
+
+    def test_an_ack_that_never_names_the_lease_holds_the_result_only_so_long(self):
+        self.assertTrue(gw._take_served_task(_task("task-noack"), set(), []))
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}}))
+        self.assertFalse(gw._deliver_result_payload("task-noack", "task-noack", "x"))
+        later = time.time() + gw.task_attempts.ACK_HOLD_MAX_S + 1
+        with mock.patch.object(gw._ATTEMPTS, "now", lambda: later):
+            self.assertTrue(gw._deliver_result_payload("task-noack", "task-noack", "x"))
+        self.assertNotIn("execution_generation", fake.posted("/v1/results")[0])
+        self.assertTrue(any("no ack named its lease" in m for m in self.logs))
+
+    def test_a_late_ack_for_a_finished_task_opens_no_turn(self):
+        gw._ATTEMPTS.remember_task("task-late", _task("task-late"))
+        self.use(FakeGateway(**{"/v1/tasks/task-late/ack": _ack("task-late", 1)}))
+        self.assertTrue(gw._post_task_ack("task-late", durable=True))
+        self.assertIsNone(agent_turn.open_turn_for_task(gw._STATE, "task-late"))
+        self.assertEqual(gw._ATTEMPTS.get("task-late")["execution_generation"], 1)
+
+    def test_every_fencing_ack_answer_fences_retires_and_stops_the_core(self):
+        cases = [(409, "stale_execution_generation"), (404, "stale_execution_generation"),
+                 (409, "task_not_found"), (409, "task_already_terminal")]
+        for status, code in cases:
+            with self.subTest(status=status, code=code):
+                tid = f"task-fence-{status}-{code}"
+                inflight, pending = set(), []
+                self.assertTrue(gw._take_served_task(_task(tid), inflight, pending))
+                self.assertTrue(gw._record_pending_acks(pending))
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(status, {
+                    "error": "not leased to you", "reason": "stale lease generation", "error_code": code}),
+                    "/v1/results": {"ok": True}}))
+                self.assertFalse(gw._post_task_ack(tid, durable=True))
+                self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], code)
+                self.assertNotIn(tid, gw._load_pending_acks(), "its pending ack is retired")
+                self.assertEqual(len(self.controls(tid)), 1, "the core is stopped")
+                self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
+                self.assertEqual(fake.posted("/v1/results"), [], "its result is settled, never posted")
+
+    def test_a_stale_older_lease_with_a_newer_serve_here_is_left_to_the_newer_ack(self):
+        tid = "task-reserved"
+        self.assertTrue(gw._take_served_task(_task(tid, lease_id="L2"), set(), []))
+        self.assertTrue(gw._record_pending_acks([(tid, True, "L2")]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(404, {"error_code": "stale_execution_generation"})}))
+        self.assertFalse(gw._post_task_ack(tid, durable=True, lease_id="L1"))
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("fenced"))
+        self.assertEqual(self.controls(tid), [])
+        self.assertIn(tid, gw._load_pending_acks(), "the newer serve's ack is still due")
+
+    def test_a_fenced_ack_first_task_is_refused_without_reaching_the_core(self):
+        tid = "task-af-stale"
+        gw._ATTEMPTS.remember_task(tid, _task(tid))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(404, {"error_code": "stale_execution_generation"})}))
+        self.assertEqual(gw._post_ack_first(tid, None), "stale")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "stale_execution_generation")
+        self.assertEqual(self.controls(tid), [])
+
+    def test_a_wake_is_never_run_without_support_even_as_the_first_sight_of_its_id(self):
+        wake = {"blocker_episode_id": "ep1", "resolved_blockers": [
+            {"outcome": "answered", "answer": {"kind": "text", "text": "blue"}}]}
+        self.assertIsNone(gw._write_task(_task("task-fresh-wake", wake=wake)))
+        self.assertFalse((gw.TASKS_DIR / "task-fresh-wake.txt").exists())
+        self.assertIsNone(gw._write_task(_task("task-fresh-wake", ack_first=True, wake=wake), hold=True))
+
+    def test_a_legacy_not_leased_refusal_releases_the_result_without_fencing(self):
+        tid = "task-legacy"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        refusal = _http(404, {"error": "not leased to you"})
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": refusal}))
+        self.assertFalse(gw._post_task_ack(tid, durable=True))
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec.get("fenced"), rec.get("awaiting_ack")), (None, False))
+        self.assertIsNone(gw._ATTEMPTS.result_hold(tid), "nothing left to wait for")
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(404, {"error": "not leased to you"})}))
+        self.assertEqual(gw._post_ack_first(tid, None), "gone")
+
+    def test_a_journal_line_still_being_written_defers_the_result(self):
+        self.assertTrue(gw._take_served_task(_task("task-defer"), set(), []))
+        fake = self.use(FakeGateway(**{"/v1/tasks/task-defer/ack": _ack("task-defer", 1),
+                                       "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack("task-defer", durable=True))
+        with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+            fh.write('{"record_type": "dispatch_intent", "turn_id": nul')
+        self.addCleanup(lambda: agent_turn.room_actions_path(gw._STATE).write_text(""))
+        self.assertFalse(gw._deliver_result_payload("task-defer", "task-defer", "x"))
+        self.assertEqual(fake.posted("/v1/results"), [])
+        self.assertTrue(any("still being written" in m for m in self.logs))
 
     def test_a_cancel_instruction_that_cannot_be_written_is_reported(self):
         with mock.patch.object(gw, "_durable_write", return_value=False):

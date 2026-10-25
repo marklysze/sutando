@@ -3067,20 +3067,19 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             doc = _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
-        _record_attempt(wire_tid, doc)
+        _record_attempt(wire_tid, doc, open_turn=_task_pending(tid))
         return True
     except urllib.error.HTTPError as e:
-        if e.code == 409 and _ATTEMPTS is not None:
-            code, err = task_attempts.http_error_code(e)
-            if code == "task_cancelled":
-                _fence_attempt(_broker_tid(tid), err)
-                _forget_pending_ack(tid, lease_id)
-                return False
+        raw = _http_error_body(e) if e.code in (404, 409) else ""
+        if _ack_fenced(tid, lease_id, raw, published=True):
+            return False
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
-            reason = _http_error_body(e).lower() if e.code == 404 else ""
+            reason = raw.lower()
             if "not leased" in reason:
+                if _ATTEMPTS is not None:
+                    _ATTEMPTS.ack_settled(_broker_tid(tid))
                 if "stale lease generation" in reason:
                     _log(f"task ack for {tid} named a superseded lease generation "
                          "— the broker re-serves it; not retrying")
@@ -3134,12 +3133,10 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         _record_attempt(wire_tid, doc)
         return "accepted"
     except urllib.error.HTTPError as e:
-        if e.code == 409 and _ATTEMPTS is not None:
-            code, err = task_attempts.http_error_code(e)
-            if code == "task_cancelled":
-                _fence_attempt(wire_tid, err, notify_core=False)   # staged: the core never saw it
-                return "stale"
-        reason = _http_error_body(e).lower() if e.code == 404 else ""
+        raw = _http_error_body(e) if e.code in (404, 409) else ""
+        if _ack_fenced(tid, lease_id, raw, published=False):
+            return "stale"
+        reason = raw.lower() if e.code == 404 else ""
         if "not leased" in reason:
             return "stale" if "stale lease generation" in reason else "gone"
         _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack answered HTTP {e.code} "
@@ -3755,9 +3752,29 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
-def _record_attempt(wire_tid: str, doc) -> None:
+def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> None:
     if _ATTEMPTS is not None:
-        _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None)
+        _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
+
+
+def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> bool:
+    """An ack refused with a fencing code: the attempt is fenced, its pending ack retired and,
+    when the task was published, the core stopped. False for any other answer."""
+    if _ATTEMPTS is None:
+        return False
+    code, err = task_attempts.error_code_of(raw)
+    if code not in task_attempts.FENCING_CODES:
+        return False
+    newer = _load_pending_leases().get(tid) not in (None, lease_id)
+    _forget_pending_ack(tid, lease_id)
+    if code == "stale_execution_generation" and newer:
+        _log(f"task ack for {tid}: an older lease was refused; the newer serve here is acked instead")
+        return True
+    wire_tid = _broker_tid(tid)
+    if _ATTEMPTS.fence(wire_tid, {**err, "error_code": code})["new"] and published:
+        _queue_cancel_instruction(tid, code)
+    _ATTEMPTS.cancel_ack(wire_tid)
+    return True
 
 
 def _queue_cancel_instruction(tid: str, reason: str) -> None:
@@ -3771,9 +3788,9 @@ def _queue_cancel_instruction(tid: str, reason: str) -> None:
         _log(f"task {tid}: cancel instruction not written — the core may finish a fenced attempt")
 
 
-def _fence_attempt(wire_tid: str, error: dict, notify_core: bool = True) -> None:
+def _fence_attempt(wire_tid: str, error: dict) -> None:
     verdict = _ATTEMPTS.fence(wire_tid, error)
-    if verdict["new"] and verdict["cancel"] and notify_core:
+    if verdict["new"] and verdict["cancel"]:
         _queue_cancel_instruction(_local_tid(wire_tid), str(error.get("error_code")))
     _ATTEMPTS.cancel_ack(wire_tid)
 
@@ -4344,6 +4361,10 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
+    if task.get("wake") is not None:
+        # Running a wake without its answer, or closing it as a redelivery, would lose the answer.
+        _log_backoff((tid, "wake"), f"wake for {tid}: not handled by this client yet — left unacked")
+        return None
     if _ATTEMPTS is not None:
         _ATTEMPTS.remember_task(broker_tid, task)
     dest = TASKS_DIR / f"{tid}.txt"
@@ -4361,10 +4382,6 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         # (see src/task-bridge.ts). Glob one level of month subdirs for this
         or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
     )
-    if task.get("wake") is not None and (task_archived or _delivered_copy_exists(tid)):
-        # A woken ask is not a redelivery; closing it as one would answer it with no-send.
-        _log(f"wake for {tid}: not handled by this client yet — left unacked for redelivery")
-        return None
     if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
         if rfile.exists():
@@ -6953,7 +6970,14 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     relay = _relay_result(tid, broker_tid)
     if relay is None:
         return False
+    hold = _ATTEMPTS.result_hold(broker_tid) if _ATTEMPTS is not None else None
+    if hold:
+        _log_backoff((tid, "ack-hold"), f"result {tid}: held — {hold}")
+        return False
     decision = _ATTEMPTS.result_decision(broker_tid, body, no_send) if _ATTEMPTS else None
+    if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
+        _log_backoff((tid, "journal-defer"), f"result {tid}: held — {decision.reason}")
+        return False
     if decision is not None and decision.action == task_attempts.agent_turn.SETTLE:
         _log(f"result {tid}: settled without a post ({decision.reason})")
         _ATTEMPTS.finish(broker_tid)

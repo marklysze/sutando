@@ -225,6 +225,19 @@ class FailurePaths(unittest.TestCase):
             e = urllib.error.HTTPError("u", 409, "x", {}, io.BytesIO(raw))
             self.assertEqual(task_attempts.http_error_code(e)[0], "")
 
+        class Unreadable(io.BytesIO):
+            def read(self, *_a):
+                raise OSError("reset")
+        self.assertEqual(task_attempts.http_error_code(
+            urllib.error.HTTPError("u", 409, "x", {}, Unreadable())), ("", {}))
+
+    def test_an_ack_without_a_generation_ends_the_wait(self):
+        a = self.mk(Gateway())
+        a.remember_task("tsk_W", {})
+        self.assertIsNotNone(a.result_hold("tsk_W"))
+        a.record_ack("tsk_W", {"ok": True})
+        self.assertIsNone(a.result_hold("tsk_W"))
+
     def test_an_unwritable_state_dir_degrades_without_raising(self):
         blocked = self.root / "file"
         blocked.write_text("not a directory")

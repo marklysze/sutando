@@ -205,40 +205,57 @@ class TurnRecords:
     outcomes: list
     readable: bool
     unbound_intents: tuple = ()
+    partial: bool = False
 
 
-def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = None) -> TurnRecords:
-    """Both record types for one turn across the rotated and live journal, plus any
-    intent the proxy could not bind to a turn since `issued_at` (None: all of them)."""
+# An unterminated last line younger than this is an append in progress, not corruption.
+PARTIAL_LINE_GRACE_S = 30.0
+
+
+def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = None,
+                      task_id: str | None = None) -> TurnRecords:
+    """Both record types for one turn across the rotated and live journal. Records the proxy
+    could not bind, written since `issued_at` (None: all), count as this turn's when they name
+    `task_id`; other unbound intents are kept apart. A line that does not parse makes the
+    journal unreadable, except a fresh unterminated last line, which marks it `partial`."""
     path = room_actions_path(state_dir)
-    intents, outcomes, unbound, readable = [], [], [], True
+    intents, outcomes, unbound, readable, partial = [], [], [], True, False
     for p in (path.with_name(path.name + ".1"), path):
         try:
             text = p.read_text()
+            age = time.time() - p.stat().st_mtime
         except FileNotFoundError:
             continue
         except OSError:
             readable = False
             continue
-        for line in text.splitlines():
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
             try:
                 rec = json.loads(line)
             except ValueError:
-                continue
+                rec = None
             if not isinstance(rec, dict):
+                in_progress = p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S
+                partial, readable = (True, readable) if in_progress else (partial, False)
                 continue
-            if rec.get("turn_id") is None and rec.get("record_type") == INTENT:
+            if rec.get("turn_id") is None:
                 ts = rec.get("ts")
-                if issued_at is None or not isinstance(ts, (int, float)) or ts >= issued_at:
-                    unbound.append(rec)
-                continue
-            if rec.get("turn_id") != turn_id:
+                if issued_at is not None and isinstance(ts, (int, float)) and ts < issued_at:
+                    continue
+                if task_id is None or rec.get("task_id") != task_id:
+                    if rec.get("record_type") == INTENT:
+                        unbound.append(rec)
+                    continue
+            elif rec.get("turn_id") != turn_id:
                 continue
             if rec.get("record_type") == INTENT:
                 intents.append(rec)
             elif rec.get("record_type") == OUTCOME:
                 outcomes.append(rec)
-    return TurnRecords(intents, outcomes, readable, tuple(unbound))
+    return TurnRecords(intents, outcomes, readable, tuple(unbound), partial)
 
 
 def unmatched_intents(records: TurnRecords) -> list:
@@ -308,7 +325,7 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
 
     if terminal and server_state is not None:
         return TurnVerdict(INCOMPLETE_OR_ERROR, False, "task already closed on server", n)
-    if not records.readable:
+    if not records.readable or records.partial:
         return TurnVerdict(INCOMPLETE_OR_ERROR, False, "journal unreadable", n)
     if n:
         return TurnVerdict(INCOMPLETE_OR_ERROR, False, "room actions attempted without a terminal", n)
@@ -323,6 +340,7 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
 
 SETTLE = "settle"
 POST = "post"
+DEFER = "defer"
 
 
 @dataclass(frozen=True)
@@ -345,6 +363,8 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
     if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
         return ResultDecision(SETTLE, {}, verdict.reason if verdict.outcome == TERMINAL_CONFIRMED
                               else "task already closed on server")
+    if records.partial:
+        return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
     if no_send:
