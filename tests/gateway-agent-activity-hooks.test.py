@@ -137,15 +137,83 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload("task-early", "task-early", "the answer"))
         self.assertEqual(fake.posted("/v1/results")[0].get("no_send"), True, "the early send is not repeated")
 
-    def test_an_ack_that_never_names_the_lease_holds_the_result_only_so_long(self):
-        self.assertTrue(gw._take_served_task(_task("task-noack"), set(), []))
+    def early(self, tid, kind):
+        """A room action the proxy journalled unbound, naming the task, before any ack."""
+        rec = {"turn_id": None, "task_id": tid, "ts": time.time(), "seq": 1, "operation_id": f"op_{tid}"}
+        if kind == "send":
+            rec.update(record_type="dispatch_intent", action="room.message.send",
+                       body_sha256=agent_turn.body_sha256("answer"))
+        elif kind == "terminal":
+            rec.update(record_type="dispatch_outcome", operation_status="succeeded",
+                       applied_execution_phase="responded", applied_terminal=True)
+        else:
+            rec.update(record_type="dispatch_outcome", operation_status="succeeded",
+                       applied_execution_phase="waiting_input", applied_terminal=False,
+                       active_blocker_count=1)
+        with open(agent_turn.room_actions_path(gw._STATE), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def test_on_a_broker_that_names_leases_an_unanswered_ack_never_releases_the_result(self):
+        gw._ATTEMPTS.record_ack("task-v2seen", _ack("task-v2seen", 1))
+        self.assertTrue(gw._ATTEMPTS.broker_names_leases())
+        self.assertTrue(gw._take_served_task(_task("task-cap"), set(), []))
+        self.early("task-cap", "send")
         fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}}))
-        self.assertFalse(gw._deliver_result_payload("task-noack", "task-noack", "x"))
         later = time.time() + gw.task_attempts.ACK_HOLD_MAX_S + 1
         with mock.patch.object(gw._ATTEMPTS, "now", lambda: later):
-            self.assertTrue(gw._deliver_result_payload("task-noack", "task-noack", "x"))
-        self.assertNotIn("execution_generation", fake.posted("/v1/results")[0])
-        self.assertTrue(any("no ack named its lease" in m for m in self.logs))
+            self.assertFalse(gw._deliver_result_payload("task-cap", "task-cap", "answer"))
+            self.assertFalse(gw._deliver_result_payload("task-cap", "task-cap", "answer"))
+        self.assertEqual(fake.posted("/v1/results"), [], "never posted ungated")
+        self.assertEqual(sum("waits for the ack or a fence" in m for m in self.logs), 1, "said once")
+        gw._ATTEMPTS.fence("task-cap", {"error_code": "task_already_terminal"})
+        self.assertTrue(gw._deliver_result_payload("task-cap", "task-cap", "answer"), "a fence ends the wait")
+        self.assertEqual(fake.posted("/v1/results"), [])
+
+    def test_on_a_broker_never_seen_to_name_leases_the_fallback_is_still_gated(self):
+        cases = {"none": {}, "send": {"status": "completed", "no_send": True},
+                 "terminal": None, "blocker": {"status": "waiting_input", "no_send": True}}
+        with mock.patch.object(gw._ATTEMPTS, "broker_names_leases", lambda: False):
+            for kind, want in cases.items():
+                with self.subTest(kind=kind):
+                    tid = f"task-legacy-{kind}"
+                    self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+                    if kind != "none":
+                        self.early(tid, kind)
+                    fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}}))
+                    self.assertFalse(gw._deliver_result_payload(tid, tid, "answer"), "waits first")
+                    later = time.time() + gw.task_attempts.ACK_HOLD_MAX_S + 1
+                    with mock.patch.object(gw._ATTEMPTS, "now", lambda: later):
+                        self.assertTrue(gw._deliver_result_payload(tid, tid, "answer"))
+                    posted = fake.posted("/v1/results")
+                    if want is None:
+                        self.assertEqual(posted, [], "closed through MCP: settled, not posted")
+                        continue
+                    sent = posted[0]
+                    self.assertNotIn("execution_generation", sent)
+                    self.assertEqual({k: sent[k] for k in want}, want)
+                    if kind == "none":
+                        self.assertNotIn("status", sent, "no journal record: today's post")
+
+    def test_a_redelivery_before_the_ack_keeps_the_first_publication_boundary(self):
+        for kind, want in (("send", {"status": "completed", "no_send": True}), ("terminal", None),
+                           ("blocker", {"status": "waiting_input", "no_send": True})):
+            with self.subTest(kind=kind):
+                tid = f"task-redeliver-{kind}"
+                self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+                first = gw._ATTEMPTS.get(tid)["published_at"]
+                self.early(tid, kind)
+                with mock.patch.object(gw._ATTEMPTS, "now", lambda: first + 5):
+                    self.assertEqual(gw._write_task(_task(tid)), (tid, True), "served again before the ack")
+                self.assertEqual(gw._ATTEMPTS.get(tid)["published_at"], first, "the boundary does not move")
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
+                with mock.patch.object(agent_turn.time, "time", lambda: first + 10):
+                    self.assertTrue(gw._post_task_ack(tid, durable=True))
+                self.assertTrue(gw._deliver_result_payload(tid, tid, "answer"))
+                posted = fake.posted("/v1/results")
+                if want is None:
+                    self.assertEqual(posted, [])
+                else:
+                    self.assertEqual({k: posted[0][k] for k in want}, want)
 
     def test_a_late_ack_for_a_finished_task_opens_no_turn(self):
         gw._ATTEMPTS.remember_task("task-late", _task("task-late"))

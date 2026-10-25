@@ -36,7 +36,8 @@ FENCING_CODES = frozenset({"stale_execution_generation", "task_cancelled",
                            "task_not_found", "task_already_terminal"})
 # A task acked this recently may not be listed by the server yet.
 RECONCILE_GRACE_S = 120.0
-# A result waits this long for its ack to name the lease; past it, it is posted without one.
+# On a broker never seen to name a lease, a result waits this long for its ack, then is gated
+# on the task's own journal records and posted without lease fields.
 ACK_HOLD_MAX_S = 120.0
 
 _MUTEX = threading.Lock()
@@ -73,6 +74,7 @@ class TaskAttempts:
         self.now = now
         self.path = self.state_dir / f"relay-task-attempts{suffix}.json"
         self._worker_path = self.state_dir / f"relay-lease-worker-id{suffix}"
+        self._contract_path = self.state_dir / f"relay-broker-contract{suffix}.json"
         self._task_beat_disabled = False
 
     # ── storage ──────────────────────────────────────────────────────────
@@ -84,17 +86,20 @@ class TaskAttempts:
         return data if isinstance(data, dict) else {}
 
     def _save(self, data: dict) -> bool:
+        return self._save_json(self.path, data)
+
+    def _save_json(self, path: Path, data: dict) -> bool:
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
             with os.fdopen(fd, "w") as fh:
                 json.dump(data, fh, sort_keys=True)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            os.replace(tmp, path)
             return True
         except OSError as e:
-            self.log(f"task attempts: could not save ({e})")
+            self.log(f"task attempts: could not save {path.name} ({e})")
             return False
 
     def _update(self, wire_tid: str, **fields) -> dict:
@@ -141,7 +146,8 @@ class TaskAttempts:
                      thread_root_id=s("thread_root"),
                      source_event_id=s("source_event_id", "source_message_id", "event_id"),
                      source_kind=s("source_kind", "interaction_type"),
-                     published_at=self.now(), awaiting_ack=True)
+                     awaiting_ack=True,
+                     published_at=self.get(wire_tid).get("published_at") or self.now())
 
     def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None,
                    open_turn: bool = True) -> dict | None:
@@ -166,7 +172,16 @@ class TaskAttempts:
                   "awaiting_ack": False}
         if self.turn_context and open_turn:
             fields.update(self._open_turn(wire_tid, gen, rec, agent_mxid))
+        if not self.broker_names_leases():
+            self._save_json(self._contract_path, {"names_lease_generation": True})
         return self._update(wire_tid, **fields)
+
+    def broker_names_leases(self) -> bool:
+        """Whether this broker has ever answered an ack with a lease generation (kept on disk)."""
+        try:
+            return json.loads(self._contract_path.read_text()).get("names_lease_generation") is True
+        except (OSError, ValueError, AttributeError):
+            return False
 
     def _open_turn(self, wire_tid: str, gen: int, rec: dict, agent_mxid: str | None) -> dict:
         try:
@@ -270,16 +285,24 @@ class TaskAttempts:
             self._update(wire_tid, awaiting_ack=False)
 
     def result_hold(self, wire_tid: str) -> "str | None":
-        """Why this result must wait for its ack, or None when it may go now."""
+        """Why this result must wait for its ack, or None when it may go now. A broker known to
+        name leases is never assumed legacy because one ack went unanswered: the result waits
+        until the ack lands, the attempt is fenced, or the server closes the task."""
         rec = self.get(wire_tid)
         if not rec.get("awaiting_ack") or rec.get("fenced"):
             return None
-        if self.now() - float(rec.get("published_at", 0)) >= ACK_HOLD_MAX_S:
-            self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s "
-                     "— its result goes without one")
-            self._update(wire_tid, awaiting_ack=False)
-            return None
-        return "its ack has not named the lease yet"
+        if self.now() - float(rec.get("published_at", 0)) < ACK_HOLD_MAX_S:
+            return "its ack has not named the lease yet"
+        if self.broker_names_leases():
+            if not rec.get("hold_reported"):
+                self._update(wire_tid, hold_reported=True)
+                self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s on a "
+                         "broker that names leases — its result waits for the ack or a fence")
+            return "its ack has not named the lease, and this broker names leases"
+        self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s — its result "
+                 "is gated on its own journal records and goes without lease fields")
+        self._update(wire_tid, awaiting_ack=False)
+        return None
 
     def result_decision(self, wire_tid: str, body: str, no_send: bool):
         """The turn gate's ruling on this result, or None when the attempt has no turn."""
@@ -287,8 +310,17 @@ class TaskAttempts:
         if rec.get("fenced") in ("task_cancelled", "cancel_confirmed", "stale_execution_generation",
                                  "task_already_terminal", "task_not_found"):
             return agent_turn.ResultDecision(agent_turn.SETTLE, {}, f"attempt fenced ({rec['fenced']})")
-        if not (self.turn_context and rec.get("turn_id")):
+        if not self.turn_context:
             return None
+        if not rec.get("turn_id"):
+            # No turn: only the records naming this task since it was published can rule.
+            if rec.get("published_at") is None:
+                return None
+            records = agent_turn.read_turn_records(self.state_dir, None, rec["published_at"],
+                                                   task_id=wire_tid)
+            if not (records.intents or records.outcomes or records.partial or not records.readable):
+                return None
+            return agent_turn.result_file_decision(records, body, no_send=no_send)
         since = min(t for t in (rec.get("issued_at"), rec.get("published_at")) if t is not None)
         records = agent_turn.read_turn_records(self.state_dir, rec["turn_id"], since, task_id=wire_tid)
         return agent_turn.result_file_decision(records, body, no_send=no_send)
