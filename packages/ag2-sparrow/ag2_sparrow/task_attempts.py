@@ -37,6 +37,8 @@ FENCING_CODES = frozenset({"stale_execution_generation", "task_cancelled",
                            "task_not_found", "task_already_terminal"})
 # A task acked this recently may not be listed by the server yet.
 RECONCILE_GRACE_S = 120.0
+# A result waits this long for its ack to name the lease; past it, it is posted without one.
+ACK_HOLD_MAX_S = 120.0
 WAKE_EPISODES_KEPT = 20
 _EPISODE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Kept in one place so its wording and placement can change together.
@@ -53,8 +55,17 @@ _MUTEX = threading.Lock()
 def http_error_code(e: urllib.error.HTTPError) -> "tuple[str, dict]":
     """The `error_code` of an HTTP error body and the parsed body ({} when unreadable)."""
     try:
-        body = json.loads((e.read() or b"").decode("utf-8", "replace") or "{}")
-    except (OSError, ValueError):
+        raw = (e.read() or b"").decode("utf-8", "replace")
+    except OSError:
+        return "", {}
+    return error_code_of(raw)
+
+
+def error_code_of(raw: str) -> "tuple[str, dict]":
+    """The `error_code` of an error body already read, and the parsed body."""
+    try:
+        body = json.loads(raw or "{}")
+    except ValueError:
         return "", {}
     if not isinstance(body, dict):
         return "", {}
@@ -139,7 +150,8 @@ class TaskAttempts:
         return {"worker_id": self.worker_id(), "protocol_version": PROTOCOL_VERSION}
 
     def remember_task(self, wire_tid: str, task: dict) -> None:
-        """Room context for the turn file, kept until the ack names the generation."""
+        """Room context for the turn file, and the moment the task was published: until the ack
+        names the generation, the task's result waits and its room actions are unbound."""
         def s(*keys):
             for k in keys:
                 v = task.get(k)
@@ -149,24 +161,31 @@ class TaskAttempts:
         self._update(wire_tid, room_id=s("source_room_id", "channel_id"),
                      thread_root_id=s("thread_root"),
                      source_event_id=s("source_event_id", "source_message_id", "event_id"),
-                     source_kind=s("source_kind", "interaction_type"))
+                     source_kind=s("source_kind", "interaction_type"),
+                     published_at=self.now(), awaiting_ack=True)
 
-    def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None) -> dict | None:
-        """Store the generation the ack reported; publish the turn file when turn context is on."""
+    def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None,
+                   open_turn: bool = True) -> dict | None:
+        """Store the generation the ack reported; publish the turn file when turn context is on
+        and `open_turn` (the task can still run)."""
         if not isinstance(response, dict):
+            self.ack_settled(wire_tid)
             return None
         gen = response.get("execution_generation")
         if type(gen) is not int or gen < 1:
+            self.ack_settled(wire_tid)
             return None
         rec = self.get(wire_tid)
-        if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.turn_context):
-            return rec
+        if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.turn_context
+                                                       or not open_turn):
+            return self._update(wire_tid, awaiting_ack=False)
         if rec.get("turn_id") and rec.get("execution_generation") != gen:
             self._close_turn(rec["turn_id"])
         fields = {"execution_generation": gen, "attempt": response.get("attempt"),
                   "lease_expires_at": response.get("lease_expires_at"),
-                  "acked_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None}
-        if self.turn_context:
+                  "acked_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
+                  "awaiting_ack": False}
+        if self.turn_context and open_turn:
             fields.update(self._open_turn(wire_tid, gen, rec, agent_mxid))
         return self._update(wire_tid, **fields)
 
@@ -232,7 +251,7 @@ class TaskAttempts:
         rec = self.get(wire_tid)
         if rec.get("fenced") == code:
             return {"new": False, "cancel": False}
-        self._update(wire_tid, fenced=code,
+        self._update(wire_tid, fenced=code, awaiting_ack=False,
                      cancel_requested_generation=error.get("cancel_requested_generation"),
                      cancel_requested_attempt=error.get("cancel_requested_attempt"))
         self.log(f"task {wire_tid}: attempt fenced by the broker ({code})")
@@ -266,6 +285,23 @@ class TaskAttempts:
         return ({"execution_generation": gen, "worker_id": self.worker_id()}
                 if type(gen) is int else {})
 
+    def ack_settled(self, wire_tid: str) -> None:
+        """The ack is answered without a generation (a legacy broker): nothing to wait for."""
+        if self.get(wire_tid).get("awaiting_ack"):
+            self._update(wire_tid, awaiting_ack=False)
+
+    def result_hold(self, wire_tid: str) -> "str | None":
+        """Why this result must wait for its ack, or None when it may go now."""
+        rec = self.get(wire_tid)
+        if not rec.get("awaiting_ack") or rec.get("fenced"):
+            return None
+        if self.now() - float(rec.get("published_at", 0)) >= ACK_HOLD_MAX_S:
+            self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s "
+                     "— its result goes without one")
+            self._update(wire_tid, awaiting_ack=False)
+            return None
+        return "its ack has not named the lease yet"
+
     def result_decision(self, wire_tid: str, body: str, no_send: bool):
         """The turn gate's ruling on this result, or None when the attempt has no turn."""
         rec = self.get(wire_tid)
@@ -274,14 +310,23 @@ class TaskAttempts:
             return agent_turn.ResultDecision(agent_turn.SETTLE, {}, f"attempt fenced ({rec['fenced']})")
         if not (self.turn_context and rec.get("turn_id")):
             return None
-        records = agent_turn.read_turn_records(self.state_dir, rec["turn_id"], rec.get("issued_at"))
+        since = min(t for t in (rec.get("issued_at"), rec.get("published_at")) if t is not None)
+        records = agent_turn.read_turn_records(self.state_dir, rec["turn_id"], since, task_id=wire_tid)
         return agent_turn.result_file_decision(records, body, no_send=no_send)
 
-    def finish(self, wire_tid: str) -> None:
-        """The result is settled: close the attempt's turn and forget the attempt."""
+    def finish(self, wire_tid: str, attempt: "dict | None" = None) -> bool:
+        """The result is settled: close the attempt's turn and forget the attempt. With `attempt`
+        (the record read before the result was posted), a record that has moved on to another
+        turn or wake since is kept; only the settled attempt's own turn is closed."""
         with _MUTEX:
             data = self._load()
-            rec = data.pop(wire_tid, None) or {}
+            rec = data.get(wire_tid) or {}
+            if attempt is not None and any(rec.get(k) != attempt.get(k)
+                                           for k in ("turn_id", "wake_episode")):
+                if attempt.get("turn_id"):
+                    self._close_turn(attempt["turn_id"])
+                return False
+            data.pop(wire_tid, None)
             self._save(data)
             if rec.get("wake_episode"):
                 wakes = self._load_wakes()
@@ -290,6 +335,7 @@ class TaskAttempts:
                 self._save_json(self._wakes_path, wakes)
         if rec.get("turn_id"):
             self._close_turn(rec["turn_id"])
+        return True
 
     # ── wake after a human answered ──────────────────────────────────────
     def open_wake(self, wire_tid: str, wake) -> "str | None":
@@ -300,7 +346,13 @@ class TaskAttempts:
             return None
         if episode in self._load_wakes().get(wire_tid, []):
             return None
-        self._update(wire_tid, wake_episode=episode)
+        rec = self.get(wire_tid)
+        if rec.get("wake_episode") != episode:
+            # A new wake is a new turn: nothing of an earlier attempt's lease or turn carries over.
+            if rec.get("turn_id"):
+                self._close_turn(rec["turn_id"])
+            self._update(wire_tid, wake_episode=episode, turn_id=None, issued_at=None,
+                         execution_generation=None, fenced=None)
         return episode
 
     def wake_item(self, wire_tid: str) -> "str | None":

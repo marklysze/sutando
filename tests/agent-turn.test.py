@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -335,6 +336,45 @@ class ResultFileDecision(unittest.TestCase):
                  unknown(turn, 1))
         d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
         self.assertEqual(d.fields, {"status": "completed", "no_send": True}, "the dedupe still applies")
+
+    def test_a_corrupt_journal_line_is_unreadable_not_absent(self):
+        valid = {**_intent(self.turn, 1), "body_sha256": at.body_sha256("final answer")}
+        line = json.dumps({"ts": 1.0, **valid})
+        path = at.room_actions_path(self.state)
+        path.write_text(line + "\n")
+        self.assertEqual(self._decide().fields, {"status": "completed", "no_send": True})
+        path.write_text(line[:-2] + "\n")
+        d = self._decide()
+        self.assertEqual(d.fields, {"status": "failed", "no_send": True}, "never read as no send")
+        path.write_text(line[:-2] + "\n" + json.dumps({"ts": 1.0, **_intent("other_g1_X", 1)}) + "\n")
+        self.assertEqual(self._decide().fields, {"status": "failed", "no_send": True}, "mid-file too")
+
+    def test_an_append_in_progress_defers_and_a_stale_one_is_corruption(self):
+        path = at.room_actions_path(self.state)
+        path.write_text(json.dumps({"ts": 1.0, **_intent(self.turn, 1)})[:-2])
+        d = self._decide()
+        self.assertEqual((d.action, d.fields), (at.DEFER, {}), "the proxy may still be writing it")
+        self.assertFalse(at.classify_turn(at.read_turn_records(self.state, self.turn), stdout="x",
+                                          server_operation_count=0).may_send_stdout)
+        old = time.time() - at.PARTIAL_LINE_GRACE_S - 5
+        os.utime(path, (old, old))
+        self.assertEqual(self._decide().fields, {"status": "failed", "no_send": True})
+
+    def test_unbound_records_naming_the_task_belong_to_its_turn(self):
+        def unbound(rec, ts=300.0):
+            return {**rec, "turn_id": None, "task_id": "tsk_A", "ts": ts}
+        _journal(self.state, unbound({**_intent(self.turn, 1), "body_sha256": at.body_sha256("final answer")}))
+        recs = at.read_turn_records(self.state, self.turn, issued_at=200.0, task_id="tsk_A")
+        self.assertEqual((len(recs.intents), recs.unbound_intents), (1, ()))
+        self.assertEqual(at.result_file_decision(recs, "final answer").fields,
+                         {"status": "completed", "no_send": True})
+        _journal(self.state, unbound(_outcome(self.turn, 1, phase="responded", terminal=True, requested="done")))
+        recs = at.read_turn_records(self.state, self.turn, issued_at=200.0, task_id="tsk_A")
+        self.assertEqual(at.result_file_decision(recs, "final answer").action, at.SETTLE)
+        self.assertEqual(at.read_turn_records(self.state, self.turn, issued_at=400.0, task_id="tsk_A").intents,
+                         [], "records from before the window are not this turn's")
+        other = at.read_turn_records(self.state, self.turn, issued_at=200.0, task_id="tsk_B")
+        self.assertEqual((other.intents, len(other.unbound_intents)), ([], 1))
 
     def test_suspended_no_send_and_unreadable(self):
         _journal(self.state, _intent(self.turn, 1, action="room.question.ask"),

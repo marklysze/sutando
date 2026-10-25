@@ -374,8 +374,11 @@ Sutando checkout around it sends neither field.
 ### Task lifecycle *(opt-in: `REMOTE_TASK_LIFECYCLE_V2=1`)*
 
 - **Ack** adds `worker_id` (one lease-holder id per install, `state/relay-lease-worker-id`) and
-  `protocol_version: 2`, and records the `execution_generation` its 200 reports. A
-  `409 task_cancelled` stops the attempt (below).
+  `protocol_version: 2`, and records the `execution_generation` its 200 reports. An answer on
+  either ack path carrying a fencing `error_code` (`stale_execution_generation`, `task_cancelled`,
+  `task_not_found`, `task_already_terminal`, on a 404 or a 409) fences the attempt, retires its
+  pending ack and, for a published task, stops the core (below) — except a stale older lease
+  when a newer serve of the same task is pending here, which that serve's ack decides.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
   rides the client heartbeat's cadence for every attempt with a generation. A `task_errors` entry
   (`stale_execution_generation`, `task_cancelled`, `task_not_found`, `task_already_terminal`)
@@ -383,13 +386,15 @@ Sutando checkout around it sends neither field.
   (`source: relay-control`, whose result is retired locally and never posted), and a cancel is
   confirmed on `POST /v1/tasks/<id>/cancel-ack`. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
-  without a post. A result answered `409 task_already_terminal | stale_execution_generation |
+  without a post. A result written before its task's ack named the lease waits for it, at most
+  120 s, after which it is posted without the lease fields. A result answered `409 task_already_terminal | stale_execution_generation |
   task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
 - **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
   the server no longer lists (acked more than 120 s ago) is fenced and its core work cancelled;
   server tasks this node does not hold are written to `state/relay-outstanding-tasks.json`.
-- A served task carrying `wake` is never closed as a redelivery. Without turn context, or for an
-  episode already run here, it is left unacked.
+- A served task carrying `wake` is never closed as a redelivery, and never run without its
+  answer. Without turn context, for an `ack_first` wake, or for an episode already run here, it
+  is left unacked, whether or not this node saw its first attempt.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
@@ -399,7 +404,10 @@ then decided by the turn's journal: skipped when a room action already closed th
 `status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
 `room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as
 `status: completed`. An outcome whose `applied_*` fields are null (a task the ledger does not know) is
-unknown: neither terminal nor suspended, so only the same-text check applies to it.
+unknown: neither terminal nor suspended, so only the same-text check applies to it. Records the
+proxy could not bind but that name the task, written since it was published, count as the turn's.
+A journal line that does not parse makes the journal unreadable (`failed` + `no_send`), except an
+unterminated last line younger than 30 s, an append in progress, which defers the result.
 
 Each task file then carries one writer-owned line telling the agent to ask a question that blocks
 it with `room.question.ask` on its exact `task_id`. A wake (the same task re-served with
@@ -407,7 +415,9 @@ it with `room.question.ask` on its exact `task_id`. A wake (the same task re-ser
 (`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
 to the task's line as quoted room data, and it is acked at the same generation into a new turn.
 Its result rides its own outbox item `<id>.wake-<episode>`, so the first attempt's delivered record
-neither blocks nor stands in for it.
+neither blocks nor stands in for it. A wake served while an earlier attempt of the same id is still settling here
+(its result unarchived, its task still queued, or its id still to retire) is left unacked until
+the broker serves it again, so the earlier attempt's settle can never retire the wake.
 
 ### `GET /v1/setup` *(optional)*
 
