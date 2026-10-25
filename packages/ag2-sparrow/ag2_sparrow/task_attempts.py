@@ -317,7 +317,7 @@ class TaskAttempts:
         data = self._load()
         now = self.now()
         closed = sorted(t for t in local_wire_tids if t not in listed and t in data
-                        and now - float(data[t].get("acked_at") or now) > RECONCILE_GRACE_S
+                        and now - float(data[t].get("acked_at", now)) > RECONCILE_GRACE_S
                         and not data[t].get("fenced"))
         missing = [listed[t] for t in sorted(listed) if t not in set(local_wire_tids)]
         return {"closed_on_server": closed, "missing_locally": missing}

@@ -3746,7 +3746,7 @@ def _record_attempt(wire_tid: str, doc) -> None:
 def _queue_cancel_instruction(tid: str, reason: str) -> None:
     """Stop the core's work on a fenced attempt through its own cancel signal."""
     now = time.time()
-    ctl = f"task-ctl-{int(now * 1000)}{_INST_SUFFIX.replace('.', '-')}"
+    ctl = f"task-ctl-{int(now * 1000)}-{uuid.uuid4().hex[:6]}{_INST_SUFFIX.replace('.', '-')}"
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     if not _durable_write(TASKS_DIR / f"{ctl}.txt",
@@ -3770,6 +3770,13 @@ def _post_task_beats(inflight: "set[str]") -> None:
     for err in _ATTEMPTS.post_task_beats(wire):
         if err.get("task_id") in wire:
             _fence_attempt(err["task_id"], err)
+
+
+def _close_stale_turns(inflight: "set[str]") -> None:
+    if _ATTEMPTS is not None:
+        closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
+        if closed:
+            _log(f"closed {closed} turn file(s) whose task is no longer in flight")
 
 
 _LEDGER_RECONCILE_EVERY_S = 300.0
@@ -7986,10 +7993,7 @@ def main() -> None:
     _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
-    if _ATTEMPTS is not None:
-        closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
-        if closed:
-            _log(f"closed {closed} turn file(s) whose task is no longer in flight")
+    _close_stale_turns(inflight)
     for sweep in (_retire_delivered_marks, _sweep_held_dir):
         try:
             sweep()

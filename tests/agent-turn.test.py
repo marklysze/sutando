@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import agent_turn as at  # noqa: E402
@@ -104,6 +105,52 @@ class TurnContext(unittest.TestCase):
         mk(9, 2000)
         g10 = mk(10, 3000)
         self.assertEqual(at.open_turn_for_task(self.state, "tsk_N"), g10, "g10 sorts before g9 by name")
+
+
+class Edges(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def test_turn_paths_refuse_a_traversal(self):
+        with self.assertRaises(ValueError):
+            at.is_closed(self.state, "../x")
+
+    def test_a_vanished_temp_file_or_an_unsyncable_directory_does_not_fail_the_write(self):
+        real_unlink = os.unlink
+
+        def unlink(path, *a, **k):
+            if ".tsk_A_g1_" in str(path):
+                real_unlink(path)
+                raise FileNotFoundError(path)
+            return real_unlink(path, *a, **k)
+        with mock.patch.object(at.os, "unlink", unlink):
+            self.assertTrue(at.write_turn_context(self.state, _ctx(self.state)).exists())
+        at._fsync_dir(self.state / "missing")
+        with mock.patch.object(at.os, "fsync", side_effect=OSError("no")):
+            at._fsync_dir(self.state)
+
+    def test_unreadable_closed_and_foreign_turn_files_are_never_bound(self):
+        self.assertIsNone(at.read_turn_context(self.state / "nope.json"))
+        ctx = _ctx(self.state)
+        path = at.write_turn_context(self.state, ctx)
+        (self.state / "turns" / f"{ctx['turn_id']}.closed").touch()
+        self.assertIsNone(at.open_turn_for_task(self.state, "tsk_A"), "closed but not yet unlinked")
+        forged = self.state / "turns" / f"tsk_A_g2_{'A' * 26}.json"
+        forged.write_text(json.dumps({"turn_id": forged.stem, "task_id": "tsk_B", "created_at_ms": 9}))
+        self.assertIsNone(at.open_turn_for_task(self.state, "tsk_A"), "names task A, says task B")
+        at.close_turn(self.state, ctx["turn_id"])
+        at.close_turn(self.state, ctx["turn_id"])
+        self.assertFalse(path.exists())
+
+    def test_odd_journal_lines_and_outcome_shapes(self):
+        turn = _ctx(self.state)["turn_id"]
+        at.room_actions_path(self.state).write_text(
+            "[1, 2]\n" + json.dumps({**_intent(turn, "x", status="done")}) + "\n"
+            + json.dumps({"record_type": at.OUTCOME, "turn_id": turn, "seq": "x",
+                          "operation_id": f"op_{turn}_x", "operation_status": "succeeded",
+                          "applied_execution_phase": "responded"}) + "\n")
+        v = at.classify_turn(at.read_turn_records(self.state, turn))
+        self.assertEqual(v.outcome, at.TERMINAL_CONFIRMED, "a phase alone says terminal")
 
 
 class TurnGate(unittest.TestCase):

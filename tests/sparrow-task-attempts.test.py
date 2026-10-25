@@ -1,7 +1,7 @@
 """Relay task attempts (`ag2_sparrow/task_attempts.py`): lease generation, beats, cancel, turns.
 
 Run:
-    python3 packages/ag2-sparrow/tests/test_task_attempts.py
+    python3 tests/sparrow-task-attempts.test.py
 """
 import io
 import json
@@ -12,7 +12,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parents[1]
+PKG_ROOT = Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG_ROOT))
 
 from ag2_sparrow import agent_turn, task_attempts  # noqa: E402
@@ -209,6 +209,59 @@ class Attempts(unittest.TestCase):
         self.assertIn(f"source: {task_attempts.CONTROL_SOURCE}", lines)
 
 
+class FailurePaths(unittest.TestCase):
+    """Every failure costs one pass and a log line; none raises into the bridge."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.logs = []
+
+    def mk(self, gw, state=None, turn_context=False):
+        return task_attempts.TaskAttempts(state or self.root, gw, turn_context=turn_context,
+                                          log=self.logs.append)
+
+    def test_error_bodies_that_are_not_json_objects_have_no_code(self):
+        for raw in (b"not json", b"[1]", b""):
+            e = urllib.error.HTTPError("u", 409, "x", {}, io.BytesIO(raw))
+            self.assertEqual(task_attempts.http_error_code(e)[0], "")
+
+    def test_an_unwritable_state_dir_degrades_without_raising(self):
+        blocked = self.root / "file"
+        blocked.write_text("not a directory")
+        a = self.mk(Gateway(), state=blocked, turn_context=True)
+        self.assertRegex(a.worker_id(), r"^[0-9a-f]{32}$", "an id even when it cannot be kept")
+        self.assertIsNone(a.record_ack("tsk_A", _ack(1))["turn_id"], "no turn file, still recorded")
+        a._close_turn("../bad")
+        self.assertTrue(any("could not save" in m for m in self.logs))
+        self.assertTrue(any("turn file not written" in m for m in self.logs))
+        self.assertTrue(any("could not close" in m for m in self.logs))
+
+    def test_beats_carry_phase_and_a_bounded_step_and_survive_errors(self):
+        gw = Gateway()
+        a = self.mk(gw)
+        a.record_ack("tsk_A", _ack(1))
+        a.post_task_beats({"tsk_A"}, phase="working", step_summary="x" * 500)
+        item = gw.calls[-1][2]["tasks"][0]
+        self.assertEqual((item["phase"], len(item["step_summary"])), ("working", 140))
+        for err in (_http(500, {}), OSError("down")):
+            gw.answers[task_attempts.TASK_HEARTBEAT_PATH] = err
+            self.assertEqual(a.post_task_beats({"tsk_A"}), [])
+        gw.answers[task_attempts.TASK_HEARTBEAT_PATH] = {"task_errors": [{"task_id": "tsk_A",
+                                                                          "error_code": "other"}, "x"]}
+        self.assertEqual(a.post_task_beats({"tsk_A"}), [], "only fencing codes come back")
+
+    def test_cancel_ack_and_listing_survive_a_network_error(self):
+        gw = Gateway(**{"/v1/tasks/tsk_A/cancel-ack": OSError("down"),
+                        task_attempts.ACTIVE_TASKS_PATH: OSError("down")})
+        a = self.mk(gw)
+        a.record_ack("tsk_A", _ack(1))
+        a.fence("tsk_A", {"error_code": "task_cancelled"})
+        self.assertFalse(a.cancel_ack("tsk_A"))
+        self.assertIsNone(a.active_tasks())
+        gw.answers[task_attempts.ACTIVE_TASKS_PATH] = _http(404, {})
+        self.assertIsNone(a.active_tasks(), "a broker without the route skips quietly")
+
+
 class SettledResults(unittest.TestCase):
     def test_a_409_that_ends_the_task_settles_the_result(self):
         for status, code in ((409, "task_already_terminal"), (409, "stale_execution_generation"),
@@ -219,6 +272,14 @@ class SettledResults(unittest.TestCase):
                 r = AG2SpaceResultProvider(req, read_back=False).deliver(
                     "tsk_A", json.dumps({"id": "tsk_A", "body": "b"}).encode(), "k")
                 self.assertEqual((r.outcome, r.provider_ref), (DeliveryOutcome.CONFIRMED, f"settled:{code}"))
+
+    def test_an_unreadable_409_body_is_still_a_refusal(self):
+        for raw in (b"not json", b"[1]"):
+            def req(*_a, raw=raw):
+                raise urllib.error.HTTPError("u", 409, "x", {}, io.BytesIO(raw))
+            with self.assertRaises(Exception):
+                AG2SpaceResultProvider(req, read_back=False).deliver(
+                    "tsk_A", json.dumps({"id": "tsk_A", "body": "b"}).encode(), "k")
 
     def test_any_other_answer_is_still_a_refusal(self):
         for status, code in ((409, "revision_conflict"), (400, "use_cancel_ack"),
