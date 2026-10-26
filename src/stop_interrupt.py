@@ -20,10 +20,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from activity_rows import append as append_row  # noqa: E402
-from activity_rows import task_from_file  # noqa: E402
-from delivery.task_dispatch import worker_holds  # noqa: E402
+from activity_rows import append as append_row
+from activity_rows import task_from_file
+from delivery.task_dispatch import worker_holds
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
 FRESH_S = 1800.0
