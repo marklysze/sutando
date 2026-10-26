@@ -97,6 +97,13 @@ class LifecycleTransition:
 
 
 @dataclass(frozen=True)
+class StopRequest:
+    """A Stop the owner asked for: the room sees it at once, the phase waits for the confirmed stop."""
+    task_id: str
+    ts: float | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeEvent:
     task_id: str
     activity_session_id: str
@@ -164,11 +171,19 @@ _PHASE_ROW = {
 }
 
 
-def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -> tuple[TaskActivityState, list[dict]]:
+def reduce(state: TaskActivityState, item: "LifecycleTransition | RuntimeEvent | StopRequest"
+           ) -> tuple[TaskActivityState, list[dict]]:
     """Pure: returns the next state and the rows that project this step. Duplicates and
     out-of-order items change nothing; a terminal phase never regresses."""
     now = item.ts if item.ts is not None else time.time()
     rows: list[dict] = []
+    if isinstance(item, StopRequest):
+        if state.phase in TERMINAL or "stop_requested" in state.applied:
+            return state, rows
+        state.applied.append("stop_requested")
+        rows.append(_row(state, "notice", "stop requested", now,
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
+        return state, rows
     if isinstance(item, LifecycleTransition):
         key = item.key(state)
         if key in state.applied:
@@ -251,7 +266,8 @@ CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-
 
 
 def cancel_target(task_text: str | None) -> str | None:
-    """The task a CANCEL_INSTRUCTION names, else None: the scheduler marks it CANCELLED on arrival."""
+    """The task a CANCEL_INSTRUCTION names, else None: a stop is requested on arrival, and the task
+    is CANCELLED only once the core has handled the instruction without answering it."""
     m = CANCEL_RE.search(task_text or "")
     return m.group(1) if m else None
 
@@ -370,6 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--task-file"); t.add_argument("--task-id"); t.add_argument("--reason", default="")
     t.add_argument("--into-task"); t.add_argument("--worker"); t.add_argument("--workspace")
     t.add_argument("--ts", type=float, default=None, help="when this transition happened (epoch); default now")
+    s = sub.add_parser("stop-requested"); s.add_argument("--task-id", required=True); s.add_argument("--workspace")
     e = sub.add_parser("event"); e.add_argument("task_id"); e.add_argument("kind", choices=EVENT_KINDS)
     e.add_argument("--session", required=True); e.add_argument("--seq", type=int, required=True)
     e.add_argument("--text", default=""); e.add_argument("--workspace")
@@ -386,6 +403,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 return 0
             state = store.apply(item)
+        elif a.cmd == "stop-requested":
+            state = store.apply(StopRequest(a.task_id))
         else:
             state = store.apply(RuntimeEvent(a.task_id, a.session, a.seq, a.kind, text=a.text))
         print(json.dumps({"task_id": state.task_id, "phase": state.phase, "generation": state.generation, "seq": state.seq}))
@@ -427,7 +446,7 @@ class ActivityStore:
         tmp.write_text(json.dumps(asdict(state), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
 
-    def apply(self, item: LifecycleTransition | RuntimeEvent) -> TaskActivityState:
+    def apply(self, item: "LifecycleTransition | RuntimeEvent | StopRequest") -> TaskActivityState:
         """Load → drain → reduce → save (rows pending) → project → save (drained), all under one lock
         per task, so two emitters serialize their rows as well as their transitions. A projection
         that fails leaves its rows pending in the snapshot; the next apply on that task drains them

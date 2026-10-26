@@ -7,6 +7,9 @@ The task is "current" when the newest row the session's own hooks wrote names it
 the pane is mid-turn when it shows Claude Code's `esc to interrupt`. A task a pool worker holds
 is interrupted only by that worker's own watcher. One Escape per cancelled task, ever; each
 decision is logged to the watcher's stderr and as an owner row in the activity log.
+
+The stop is then confirmed: once the core has answered the control task, a stopped task with no
+result, or only a no-send or empty one, is CANCELLED; a task the core finished is left to delivery.
 """
 from __future__ import annotations
 
@@ -20,14 +23,19 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from activity_bus import ActivityStore, LifecycleTransition
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from delivery.task_dispatch import worker_holds
+from local_task_protocol import find_archived_result
+from result_markers import parse_markers
 from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
 FRESH_S = 1800.0
 TAIL_BYTES = 256 * 1024
+CONFIRM_POLL_S = 2.0
+CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
 
 
@@ -144,11 +152,50 @@ def _log_row(workspace: Path, tasks_dir: Path, target: str, line: str, now: floa
         pass
 
 
+def _result_body(results_dir: Path, task_id: str) -> "str | None":
+    path = results_dir / f"{task_id}.txt"
+    if not path.exists():
+        path = find_archived_result(results_dir, task_id)
+    try:
+        return path.read_text(encoding="utf-8", errors="replace") if path else None
+    except OSError:
+        return None
+
+
+def _stopped(body: "str | None") -> bool:
+    """No result, or one with nothing to deliver: the core stopped rather than finished."""
+    if body is None or not body.strip():
+        return True
+    parsed = parse_markers(body)
+    return any(a.kind == "skip" and a.value == "no-send" for a in parsed.actions) and not parsed.body.strip()
+
+
+def confirm_stop(target: str, control_id: str, *, workspace: Path, sleep: Callable = time.sleep,
+                 clock: Callable = time.monotonic, max_s: float = CONFIRM_MAX_S,
+                 log: Callable[[str], None] = lambda m: print(m, file=sys.stderr)) -> "str | None":
+    """Wait for the core to answer the control task, then rule: "cancelled" (and CANCELLED on the
+    bus) or "finished" (left to delivery). None when it never answered within max_s."""
+    results = workspace / "results"
+    deadline = clock() + max_s
+    while _result_body(results, control_id) is None:
+        if clock() >= deadline:
+            log(f"stop-interrupt: {target}: the control task {control_id} was not answered; no ruling")
+            return None
+        sleep(CONFIRM_POLL_S)
+    if not _stopped(_result_body(results, target)):
+        log(f"stop-interrupt: {target}: the core finished it despite the Stop")
+        return "finished"
+    ActivityStore(workspace).apply(LifecycleTransition(target, "CANCELLED", reason="stopped"))
+    log(f"stop-interrupt: {target}: stop confirmed")
+    return "cancelled"
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="stop_interrupt.py")
     ap.add_argument("target")
     ap.add_argument("--tasks-dir", required=True)
     ap.add_argument("--workspace")
+    ap.add_argument("--control-file", help="the CANCEL_INSTRUCTION task: its answer confirms the stop")
     a = ap.parse_args(argv)
     tasks_dir = Path(a.tasks_dir)
     workspace = Path(a.workspace) if a.workspace else resolve_workspace()
@@ -156,6 +203,12 @@ def main(argv: list[str] | None = None) -> int:
         interrupt(a.target, workspace=workspace, tasks_dir=tasks_dir)
     except Exception as e:                  # advisory: a Stop still completes cooperatively
         print(f"stop-interrupt: {a.target}: skipped ({e})", file=sys.stderr)
+    if a.control_file:
+        try:
+            control_id = task_from_file(Path(a.control_file))[0]["id"]
+            confirm_stop(a.target, control_id, workspace=workspace)
+        except Exception as e:
+            print(f"stop-interrupt: {a.target}: stop not confirmed ({e})", file=sys.stderr)
     return 0
 
 

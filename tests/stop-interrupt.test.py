@@ -17,6 +17,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
+import activity_bus  # noqa: E402
 import stop_interrupt as si  # noqa: E402
 
 TARGET = "task-ag2space_dlocal~task-0e542ed29e181e5510"
@@ -216,13 +217,94 @@ class StopInterrupt(unittest.TestCase):
         subprocess.run(["bash", "-c", f'source "{REPO}/src/task-emit.sh"; activity_cancel_target "{ctl.name}"; wait'],
                        env={**os.environ, "SUTANDO_PY_BIN": str(stub), "TASKS_DIR": str(self.tasks)}, check=True)
         for _ in range(50):
-            if record.exists() and "stop_interrupt.py" in record.read_text():
+            if record.exists() and "stop_interrupt.py" in record.read_text() and "stop-requested" in record.read_text():
                 break
             time.sleep(0.05)
-        calls = record.read_text().splitlines()
-        self.assertIn(f"stop_interrupt.py {TARGET} --tasks-dir {self.tasks}",
-                      [c.split("/src/", 1)[-1] for c in calls])
+        calls = [c.split("/src/", 1)[-1] for c in record.read_text().splitlines()]
+        self.assertIn(f"stop_interrupt.py {TARGET} --tasks-dir {self.tasks} --control-file {ctl}", calls)
+        self.assertIn(f"activity_bus.py stop-requested --task-id {TARGET}", calls)
+        self.assertFalse([c for c in calls if "CANCELLED" in c], "nothing is cancelled before the stop is confirmed")
 
+
+
+class ConfirmStop(unittest.TestCase):
+    """CANCELLED only once the core answered the control task without answering the stopped one."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "results").mkdir()
+        (self.ws / "state").mkdir()
+        self.logs = []
+        self.store = si.ActivityStore(self.ws)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def running(self, tid):
+        self.store.apply(si.LifecycleTransition(tid, "RUNNING", room="!r:x"))
+
+    def phase(self, tid):
+        return json.loads(self.store.path(tid).read_text())["phase"]
+
+    def confirm(self, tid, ctl, **kw):
+        return si.confirm_stop(tid, ctl, workspace=self.ws, sleep=lambda s: None, log=self.logs.append, **kw)
+
+    def test_a_stop_request_is_seen_at_once_and_does_not_end_the_task(self):
+        self.running(TARGET)
+        self.store.apply(activity_bus.StopRequest(TARGET))
+        self.store.apply(activity_bus.StopRequest(TARGET))
+        self.assertEqual(self.phase(TARGET), "RUNNING")
+        rows = [json.loads(l) for l in (self.ws / "state" / "agent-activity.jsonl").read_text().splitlines()]
+        stop = [r for r in rows if r["line"] == "stop requested"]
+        self.assertEqual(len(stop), 1, "once per task")
+        self.assertEqual((stop[0]["kind"], stop[0]["projection"], stop[0].get("done", False)), ("notice", "TASK_STATUS", False))
+
+    def test_handled_control_and_no_result_confirms_the_stop(self):
+        self.running(TARGET)
+        (self.ws / "results" / "task-ctl-1.txt").write_text("[no-send] stopped it")
+        self.assertEqual(self.confirm(TARGET, "task-ctl-1"), "cancelled")
+        self.assertEqual(self.phase(TARGET), "CANCELLED")
+
+    def test_a_no_send_or_empty_result_is_a_stop_and_a_reply_is_a_finish(self):
+        for body, want in (("[no-send] stopped", "cancelled"), ("  ", "cancelled"), ("DONE", "finished")):
+            with self.subTest(body=body):
+                tid = f"task-t{len(body)}"
+                self.running(tid)
+                (self.ws / "results" / f"{tid}.txt").write_text(body)
+                (self.ws / "results" / f"task-ctl-{tid}.txt").write_text("ok")
+                self.assertEqual(self.confirm(tid, f"task-ctl-{tid}"), want)
+                self.assertEqual(self.phase(tid), "CANCELLED" if want == "cancelled" else "RUNNING")
+
+    def test_an_archived_control_answer_counts_and_an_unanswered_one_never_rules(self):
+        self.running(TARGET)
+        (self.ws / "results" / "archive").mkdir()
+        (self.ws / "results" / "archive" / "task-ctl-2-1793057500.txt").write_text("[no-send]")
+        self.assertEqual(self.confirm(TARGET, "task-ctl-2"), "cancelled")
+        t = [0.0]
+        def clock():
+            t[0] += 1000
+            return t[0]
+        self.running("task-other")
+        self.assertIsNone(self.confirm("task-other", "task-ctl-none", clock=clock, max_s=1500))
+        self.assertEqual(self.phase("task-other"), "RUNNING")
+        self.assertIn("was not answered", self.logs[-1])
+
+    def test_the_voice_cancel_path_still_reaches_cancelled_on_a_confirmed_stop(self):
+        voice, ctl = "task-1793057400000", "task-1793057459000"
+        self.running(voice)
+        (self.ws / "tasks").mkdir()
+        cancel = self.ws / "tasks" / f"{ctl}.txt"
+        cancel.write_text(f"id: {ctl}\nsource: voice-local\ntask: CANCEL_INSTRUCTION: stop processing {voice} "
+                          "if still in flight. If already completed, no-op. Reply briefly confirming.\n")
+        self.assertEqual(activity_bus.cancel_target(cancel.read_text()), voice)
+        self.store.apply(activity_bus.StopRequest(voice))
+        self.assertEqual(self.phase(voice), "RUNNING", "the request alone does not cancel it")
+        (self.ws / "results" / f"{ctl}.txt").write_text("Cancelled task-1793057400000 (was in progress)")
+        with mock.patch.object(si, "interrupt"):
+            self.assertEqual(si.main([voice, "--tasks-dir", str(self.ws / "tasks"), "--workspace", str(self.ws),
+                                      "--control-file", str(cancel)]), 0)
+        self.assertEqual(self.phase(voice), "CANCELLED")
 
 if __name__ == "__main__":
     unittest.main()
