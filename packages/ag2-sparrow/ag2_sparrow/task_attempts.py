@@ -31,6 +31,9 @@ from . import agent_turn
 TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
 # How soon a Stop on a running task is heard; the client heartbeat keeps its own cadence.
 TASK_HEARTBEAT_INTERVAL_S = 15
+# An attempt whose task file left the queue unanswered, with no turn activity this long, is failed.
+DISPATCH_LOST_S = 600
+ACTIVITY_TAIL_BYTES = 256 * 1024
 ACTIVE_TASKS_PATH = "/v1/tasks/active"
 PROTOCOL_VERSION = 2
 STEP_SUMMARY_MAX = 140
@@ -259,6 +262,25 @@ class TaskAttempts:
         errors = resp.get("task_errors") if isinstance(resp, dict) else None
         return [e for e in errors or [] if isinstance(e, dict) and e.get("error_code") in FENCING_CODES]
 
+    def dispatch_lost_due(self, wire_tid: str, live: bool, last_activity: "float | None") -> bool:
+        """True once this attempt has had no live dispatch (no task file, result or claim) and no
+        turn activity for DISPATCH_LOST_S: the core will never answer it, so beats must not hold it."""
+        rec = self.get(wire_tid)
+        if not _beats(rec):
+            return False
+        if live:
+            if rec.get("missing_since") is not None:
+                self._update(wire_tid, missing_since=None)
+            return False
+        since = rec.get("missing_since")
+        if since is None:
+            self._update(wire_tid, missing_since=self.now())
+            return False
+        return self.now() - max(float(since), last_activity or 0.0) >= DISPATCH_LOST_S
+
+    def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> None:
+        self._update(wire_tid, dispatch_lost=lost)
+
     def beating(self, wire_tids) -> bool:
         """Whether any of these attempts is due per-task beats."""
         if self._task_beat_disabled:
@@ -370,6 +392,9 @@ class TaskAttempts:
         if rec.get("fenced") in ("task_cancelled", "cancel_confirmed", "stale_execution_generation",
                                  "task_already_terminal", "task_not_found"):
             return agent_turn.ResultDecision(agent_turn.SETTLE, {}, f"attempt fenced ({rec['fenced']})")
+        if rec.get("dispatch_lost"):
+            return agent_turn.ResultDecision(agent_turn.POST, {"status": "failed", "no_send": True},
+                                             "the task left the queue unanswered")
         if not self.turn_context:
             return None
         if not rec.get("turn_id"):
@@ -532,4 +557,30 @@ def ask_in_room_rule(task_id: str) -> str:
 
 
 def _beats(rec: dict) -> bool:
-    return type(rec.get("execution_generation")) is int and not rec.get("fenced")
+    return (type(rec.get("execution_generation")) is int and not rec.get("fenced")
+            and not rec.get("dispatch_lost"))
+
+
+def last_activity(state_dir: Path, task_id: str) -> "float | None":
+    """When the session's own hooks last wrote a row naming this task, from the activity log's tail."""
+    try:
+        with open(Path(state_dir) / "agent-activity.jsonl", "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - ACTIVITY_TAIL_BYTES))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    newest = None
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
+        if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+            continue
+        task, ts = rec.get("task"), rec.get("ts")
+        if isinstance(task, dict) and task.get("id") == task_id and isinstance(ts, (int, float)) \
+                and not isinstance(ts, bool):
+            newest = ts if newest is None else max(newest, ts)
+    return newest
