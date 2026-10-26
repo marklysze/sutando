@@ -380,8 +380,9 @@ Sutando checkout around it sends neither field.
   pending ack and, for a published task, stops the core (below) — except a stale older lease
   when a newer serve of the same task is pending here, which that serve's ack decides.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
-  is sent every 60 s for every attempt with a generation, for as long as the bridge holds it, even
-  while the client heartbeat is backing off: it is the only way a Stop reaches a running task. A
+  is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
+  while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
+  task. While one is held, the task long poll returns when the next beat is due. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
   also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one

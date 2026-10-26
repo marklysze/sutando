@@ -386,10 +386,31 @@ class Hooks(unittest.TestCase):
         mock.patch.object(gw, "_last_task_beat_at", 0.0).start()
         for _ in range(3):
             gw._post_heartbeat({tid})
-            clock[0] += gw.HEARTBEAT_INTERVAL
+            clock[0] += gw.task_attempts.TASK_HEARTBEAT_INTERVAL_S
         beats = [b for b in fake.posted("/v1/tasks/heartbeat") if any(t["task_id"] == tid for t in b["tasks"])]
         self.assertEqual(len(beats), 3, "one per interval through a long turn")
         self.assertEqual(fake.posted("/v1/heartbeat"), [], "the client beat stayed in its backoff")
+
+    def test_a_held_task_beats_every_15_s_and_the_poll_returns_when_the_beat_is_due(self):
+        self.assertEqual(gw.task_attempts.TASK_HEARTBEAT_INTERVAL_S, 15)
+        self.assertEqual(gw.HEARTBEAT_INTERVAL, 60, "the client heartbeat keeps its cadence")
+        tid = "task-beat-cadence"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        self.assertEqual(gw._poll_wait({tid}), gw.POLL_WAIT, "no generation yet: no beat to wait for")
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        clock = [time.time()]
+        mock.patch.object(gw.time, "time", lambda: clock[0]).start()
+        mock.patch.object(gw, "_last_task_beat_at", 0.0).start()
+        gw._post_task_beats({tid})
+        self.assertEqual(gw._poll_wait({tid}), 15)
+        clock[0] += 14
+        gw._post_task_beats({tid})
+        self.assertEqual(gw._poll_wait({tid}), 1, "the poll returns as the next beat falls due")
+        clock[0] += 1
+        gw._post_task_beats({tid})
+        self.assertEqual(len(fake.posted("/v1/tasks/heartbeat")), 2, "one beat per 15 s, none sooner")
+        self.assertEqual(gw._poll_wait(set()), gw.POLL_WAIT, "nothing held: the full long poll")
 
     def test_a_cancel_instruction_that_cannot_be_written_is_reported(self):
         with mock.patch.object(gw, "_durable_write", return_value=False):
