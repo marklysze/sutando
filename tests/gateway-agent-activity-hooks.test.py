@@ -352,6 +352,29 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload(tid, tid, "late"), "a later result settles")
         self.assertEqual(fake.posted("/v1/results"), [], "and is never posted")
 
+    def test_stop_then_a_no_send_result_confirms_the_stop_instead_of_no_action_needed(self):
+        for i, (body, no_send) in enumerate([("[no-send]", True), ("  \n", False)]):
+            tid = f"task-stop-nosend-{i}"
+            fake, ctl = self.stopped_by_a_beat(tid)
+            (gw.RESULTS_DIR / f"{tid}.txt").write_text(body)
+            (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+            gw._post_task_beats({tid}, force=True)
+            self.assertEqual(fake.posted("/cancel-ack"), [], "an undelivered result is ruled by delivery")
+            self.assertTrue(gw._deliver_result_payload(tid, tid, body, no_send=no_send))
+            self.assertEqual(fake.posted("/v1/results"), [], "never posted as no_action_needed")
+            self.assertEqual(fake.posted("/cancel-ack")[0]["cancel_requested_generation"], 1)
+            (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+
+    def test_a_stop_confirmed_by_a_result_is_retried_until_its_cancel_ack_lands(self):
+        tid = "task-stop-nosend-retry"
+        fake, _ = self.stopped_by_a_beat(tid)
+        fake.answers[f"/v1/tasks/{tid}/cancel-ack"] = _http(503, {})
+        self.assertFalse(gw._deliver_result_payload(tid, tid, "", no_send=True), "held, not settled")
+        fake.answers[f"/v1/tasks/{tid}/cancel-ack"] = {"ok": True}
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "", no_send=True))
+        self.assertEqual(fake.posted("/v1/results"), [])
+        self.assertEqual(len(fake.posted("/cancel-ack")), 2)
+
     def test_every_held_task_beats_each_interval_even_while_the_client_heartbeat_backs_off(self):
         tid = "task-long-turn"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))

@@ -387,8 +387,9 @@ Sutando checkout around it sends neither field.
   also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
-  for the task is posted normally and no cancel-ack is sent; with no result, the stop is confirmed
-  on `POST /v1/tasks/<id>/cancel-ack` and a later result is settled. A `task_cancelled` on the ack
+  for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
+  deliver (`no_send` or an empty body), the stop is confirmed on `POST /v1/tasks/<id>/cancel-ack`
+  and that result, or any later one, is settled, never posted (not as `no_action_needed` either). A `task_cancelled` on the ack
   means the task is not started and is cancel-acked at once. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
   without a post. A result written before its task's ack named the lease waits for it. On a broker that has
