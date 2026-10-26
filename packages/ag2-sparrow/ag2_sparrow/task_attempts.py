@@ -291,6 +291,17 @@ class TaskAttempts:
             self._update(wire_tid, stop_requested=False)
             self.log(f"task {wire_tid}: the core finished despite the Stop — no cancel-ack")
 
+    def stop_by_result(self, wire_tid: str, body: str, no_send: bool) -> "bool | None":
+        """A result with nothing to deliver while a Stop is pending confirms the Stop: None when it
+        does not apply, else whether the cancel-ack landed (False is retried by the next pass)."""
+        rec = self.get(wire_tid)
+        if not (rec.get("stop_requested") or rec.get("stop_confirmed")) or (body.strip() and not no_send):
+            return None
+        if rec.get("stop_requested"):
+            self._update(wire_tid, stop_requested=False, stop_confirmed=True)
+            self.log(f"task {wire_tid}: the core answered the Stop with nothing to deliver — stopped")
+        return self.cancel_ack(wire_tid)
+
     def cancel_ack(self, wire_tid: str) -> bool:
         rec = self.get(wire_tid)
         if rec.get("fenced") != "task_cancelled" and not rec.get("stop_confirmed"):

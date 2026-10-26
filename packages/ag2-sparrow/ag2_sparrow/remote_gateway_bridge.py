@@ -3832,8 +3832,9 @@ def _resolve_stop(wire_tid: str) -> None:
     if not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
         return                                  # the core has not reached the control task yet
     tid = _local_tid(wire_tid)
-    finished = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid)
-    _ATTEMPTS.stop_outcome(wire_tid, stopped=not finished)
+    if os.path.lexists(RESULTS_DIR / f"{tid}.txt"):
+        return                                  # delivery rules: a reply posts, nothing to send stops
+    _ATTEMPTS.stop_outcome(wire_tid, stopped=not _delivered_copy_exists(tid))
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
@@ -7078,6 +7079,14 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if hold:
         _log_backoff((tid, "ack-hold"), f"result {tid}: held — {hold}")
         return False
+    stopped = _ATTEMPTS.stop_by_result(broker_tid, body, no_send) if _ATTEMPTS is not None else None
+    if stopped is False:
+        _log_backoff((tid, "stop-ack"), f"result {tid}: held — the Stop it confirms awaits its cancel-ack")
+        return False
+    if stopped:
+        _log(f"result {tid}: settled without a post (the Stop is confirmed)")
+        _ATTEMPTS.finish(broker_tid)
+        return True
     decision = _ATTEMPTS.result_decision(broker_tid, body, no_send) if _ATTEMPTS else None
     if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
         _log_backoff((tid, "journal-defer"), f"result {tid}: held — {decision.reason}")
