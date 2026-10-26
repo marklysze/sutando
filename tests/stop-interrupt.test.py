@@ -81,6 +81,31 @@ class StopInterrupt(unittest.TestCase):
         self.assertIn("interrupted the running turn", self.owner_rows()[-1]["line"])
         self.assertEqual(self.owner_rows()[-1]["room"], "!room:x")
 
+    def live_rows(self, with_hook_rows):
+        """The rig's rows for a Stop at +31 s on a `sleep 90` task: only the bus's TASK_STATUS rows
+        existed live, because the hook could not bind an id carrying `~`."""
+        base = {"room": "!r:x", "task": {"id": TARGET}}
+        self.row(TARGET, age=42, **{**base, "kind": "notice", "line": "queued", "audience": "room",
+                                    "projection": "TASK_STATUS"})
+        self.row(TARGET, age=42, **{**base, "kind": "processing", "line": "picked up", "audience": "room",
+                                    "projection": "TASK_STATUS"})
+        if with_hook_rows:
+            self.row(TARGET, age=40, **{**base, "kind": "processing", "line": "Your agent is working on a task"})
+            self.row(TARGET, age=35, **{**base, "kind": "working", "line": "Sleep 90 seconds"})
+
+    def test_the_live_stop_interrupts_once_the_hook_writes_rows_for_the_task(self):
+        self.live_rows(with_hook_rows=True)
+        tmux = FakeTmux()
+        self.assertTrue(self.run_it(tmux))
+        self.assertEqual(len(tmux.escapes()), 1)
+
+    def test_delivery_rows_alone_never_name_the_sessions_task(self):
+        self.live_rows(with_hook_rows=False)
+        tmux = FakeTmux()
+        self.assertFalse(self.run_it(tmux))
+        self.assertEqual(tmux.escapes(), [])
+        self.assertIn("the session is on no task", self.logs[-1])
+
     def test_the_session_on_another_task_gets_no_key(self):
         self.row("task-other")
         tmux = FakeTmux()
