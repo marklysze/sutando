@@ -77,6 +77,8 @@ class Attempts(unittest.TestCase):
         self.assertEqual(self.gw.calls, [], "no beat for an attempt with no generation")
 
     def test_heartbeat_409_aborts_turn(self):
+        """A fence (an ack's task_cancelled, a stale generation) drops the attempt's result and is
+        cancel-acked; a beat's task_cancelled is a cooperative Stop instead (request_stop)."""
         self.gw.answers[task_attempts.TASK_HEARTBEAT_PATH] = {"ok": True, "task_errors": [
             {"task_id": "tsk_A", "error_code": "task_cancelled",
              "cancel_requested_generation": 2, "cancel_requested_attempt": 2}]}
@@ -97,6 +99,21 @@ class Attempts(unittest.TestCase):
         before = len(self.gw.calls)
         a.post_task_beats({"tsk_A"})
         self.assertEqual(len(self.gw.calls), before, "a fenced attempt sends no more beats")
+
+    def test_a_beats_stop_is_a_request_that_never_drops_the_result(self):
+        a = self.mk()
+        a.record_ack("tsk_S", _ack(2))
+        err = {"error_code": "task_cancelled", "cancel_requested_generation": 2, "cancel_requested_attempt": 2}
+        self.assertTrue(a.request_stop("tsk_S", err))
+        self.assertFalse(a.request_stop("tsk_S", err), "asked once")
+        self.assertIsNone(a.result_decision("tsk_S", "done", False), "the result is not dropped")
+        self.assertFalse(a.cancel_ack("tsk_S"), "nothing to confirm while the core may finish")
+        a.stop_outcome("tsk_S", stopped=False)
+        self.assertEqual(self.gw.calls, [], "finished anyway: no cancel-ack")
+        a.request_stop("tsk_S", err)
+        a.stop_outcome("tsk_S", stopped=True)
+        self.assertEqual(self.gw.calls[-1][1], "/v1/tasks/tsk_S/cancel-ack")
+        self.assertEqual(a.get("tsk_S")["fenced"], "cancel_confirmed")
 
     def test_stale_generation_stops_the_core_without_a_cancel_ack(self):
         a = self.mk()

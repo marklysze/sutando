@@ -3699,6 +3699,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
     now = time.time()
+    # Ahead of every early return: a Stop reaches a running task only through these beats.
+    _post_task_beats(inflight, force=force)
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
@@ -3708,7 +3710,6 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _post_task_beats(inflight)
     # An injected row is not the core's beat: presence status stays the core-status file's.
     _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
     try:
@@ -3777,8 +3778,9 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
     return True
 
 
-def _queue_cancel_instruction(tid: str, reason: str) -> None:
-    """Stop the core's work on a fenced attempt through its own cancel signal."""
+def _queue_cancel_instruction(tid: str, reason: str) -> "str | None":
+    """Ask the core to stop its work on a task through its own cancel signal; the control
+    task's id, or None when it could not be written."""
     now = time.time()
     ctl = f"task-ctl-{int(now * 1000)}-{uuid.uuid4().hex[:6]}{_INST_SUFFIX.replace('.', '-')}"
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
@@ -3786,24 +3788,52 @@ def _queue_cancel_instruction(tid: str, reason: str) -> None:
     if not _durable_write(TASKS_DIR / f"{ctl}.txt",
                           task_attempts.cancel_task_text(tid, ctl, stamp, reason)):
         _log(f"task {tid}: cancel instruction not written — the core may finish a fenced attempt")
+        return None
+    return ctl
 
 
 def _fence_attempt(wire_tid: str, error: dict) -> None:
+    if error.get("error_code") == "task_cancelled":
+        # A Stop on a running attempt is cooperative: a result the core still writes is delivered.
+        if _ATTEMPTS.request_stop(wire_tid, error):
+            ctl = _queue_cancel_instruction(_local_tid(wire_tid), "task_cancelled")
+            _ATTEMPTS._update(wire_tid, stop_ctl=ctl)
+        return
     verdict = _ATTEMPTS.fence(wire_tid, error)
     if verdict["new"] and verdict["cancel"]:
         _queue_cancel_instruction(_local_tid(wire_tid), str(error.get("error_code")))
     _ATTEMPTS.cancel_ack(wire_tid)
 
 
-def _post_task_beats(inflight: "set[str]") -> None:
-    if _ATTEMPTS is None:
+_last_task_beat_at = 0.0
+
+
+def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
+    """Every attempt this bridge holds beats once per HEARTBEAT_INTERVAL, for as long as it is held."""
+    global _last_task_beat_at
+    if _ATTEMPTS is None or (not force and time.time() - _last_task_beat_at < HEARTBEAT_INTERVAL):
         return
+    _last_task_beat_at = time.time()
     wire = {_broker_tid(t) for t in inflight}
     for wire_tid in wire:
+        _resolve_stop(wire_tid)
         _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
     for err in _ATTEMPTS.post_task_beats(wire):
         if err.get("task_id") in wire:
             _fence_attempt(err["task_id"], err)
+
+
+def _resolve_stop(wire_tid: str) -> None:
+    """Once the core has handled a Stop's control task: stopped (no result of its own) or finished."""
+    rec = _ATTEMPTS.get(wire_tid)
+    ctl = rec.get("stop_ctl")
+    if not (rec.get("stop_requested") and ctl):
+        return
+    if not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
+        return                                  # the core has not reached the control task yet
+    tid = _local_tid(wire_tid)
+    finished = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid)
+    _ATTEMPTS.stop_outcome(wire_tid, stopped=not finished)
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
