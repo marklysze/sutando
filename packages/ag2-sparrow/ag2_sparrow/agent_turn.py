@@ -288,16 +288,23 @@ def _seq(rec: dict) -> int:
         return 0
 
 
+def _own(rec: dict, task_id: str | None) -> bool:
+    return task_id is None or rec.get("task_id") in (None, task_id)
+
+
 def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterable[dict] = (),
                   server_state: dict | None = None,
-                  server_operation_count: int | None = None) -> TurnVerdict:
+                  server_operation_count: int | None = None,
+                  task_id: str | None = None) -> TurnVerdict:
     """`reconciled`: core-api outcomes for unmatched intents. `server_state`: the task row.
-    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown."""
+    `server_operation_count`: core-api operations for (task_id, turn_id); None is unknown.
+    `task_id`: an outcome naming another task (an answer to its question) never rules this one."""
     by_op: dict = {}
     for o in sorted(records.outcomes, key=_seq):
-        by_op[o.get("operation_id")] = o
+        if _own(o, task_id):
+            by_op[o.get("operation_id")] = o
     intent_by_op = {i.get("operation_id"): i for i in records.intents}
-    for r in reconciled:
+    for r in (r for r in reconciled if _own(r, task_id)):
         op = r.get("operation_id")
         merged = {**intent_by_op.get(op, {}), **by_op.get(op, {}), **r}
         merged["record_type"] = OUTCOME
@@ -356,10 +363,12 @@ def body_sha256(body: str) -> str:
 
 def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = False,
                          reconciled: Iterable[dict] = (),
-                         server_state: dict | None = None) -> ResultDecision:
+                         server_state: dict | None = None,
+                         task_id: str | None = None) -> ResultDecision:
     """What to do with a result file the agent wrote on purpose (not inferred stdout):
     post it unless the task is already closed or the same text was sent as a room message."""
-    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state)
+    verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state,
+                            task_id=task_id)
     if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
         return ResultDecision(SETTLE, {}, verdict.reason if verdict.outcome == TERMINAL_CONFIRMED
                               else "task already closed on server")
