@@ -23,6 +23,7 @@ from typing import Callable
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from delivery.task_dispatch import worker_holds
+from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
 FRESH_S = 1800.0
@@ -150,9 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace")
     a = ap.parse_args(argv)
     tasks_dir = Path(a.tasks_dir)
-    # A worker's inbox is <workspace>/deliveries/<worker>; the core's is <workspace>/tasks.
-    workspace = Path(a.workspace) if a.workspace else (
-        tasks_dir.parent.parent if tasks_dir.parent.name == "deliveries" else tasks_dir.parent)
+    workspace = Path(a.workspace) if a.workspace else resolve_workspace()
     try:
         interrupt(a.target, workspace=workspace, tasks_dir=tasks_dir)
     except Exception as e:                  # advisory: a Stop still completes cooperatively

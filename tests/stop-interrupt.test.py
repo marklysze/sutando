@@ -166,12 +166,13 @@ class StopInterrupt(unittest.TestCase):
             self.assertTrue(self.run_it(tmux))
         self.assertEqual(len(tmux.escapes()), 1)
 
-    def test_the_cli_resolves_the_workspace_from_either_inbox_and_never_fails(self):
+    def test_the_cli_takes_the_canonical_workspace_and_never_fails(self):
         seen = []
-        with mock.patch.object(si, "interrupt", lambda t, **k: seen.append((t, k["workspace"]))):
-            self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks)]), 0)
+        with mock.patch.object(si, "interrupt", lambda t, **k: seen.append((t, k["workspace"]))), \
+                mock.patch.object(si, "resolve_workspace", return_value=self.ws):
             self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.ws / "deliveries" / "w1")]), 0)
-        self.assertEqual(seen, [(TARGET, self.ws), (TARGET, self.ws)])
+            self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks), "--workspace", "/w"]), 0)
+        self.assertEqual(seen, [(TARGET, self.ws), (TARGET, Path("/w"))])
         with mock.patch.object(si, "interrupt", side_effect=RuntimeError("boom")):
             self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks)]), 0, "advisory: never fails")
 
