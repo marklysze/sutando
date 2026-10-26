@@ -7085,7 +7085,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if stopped:
         _log(f"result {tid}: settled without a post (the Stop is confirmed)")
-        _ATTEMPTS.finish(broker_tid)
+        _ATTEMPTS.finish(broker_tid, attempt)
         return True
     decision = _ATTEMPTS.result_decision(broker_tid, body, no_send) if _ATTEMPTS else None
     if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
