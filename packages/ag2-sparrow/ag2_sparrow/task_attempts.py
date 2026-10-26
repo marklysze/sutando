@@ -29,6 +29,8 @@ from typing import Callable
 from . import agent_turn
 
 TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
+# How soon a Stop on a running task is heard; the client heartbeat keeps its own cadence.
+TASK_HEARTBEAT_INTERVAL_S = 15
 ACTIVE_TASKS_PATH = "/v1/tasks/active"
 PROTOCOL_VERSION = 2
 STEP_SUMMARY_MAX = 140
@@ -230,7 +232,7 @@ class TaskAttempts:
         tasks = []
         for tid in sorted(wire_tids):
             rec = data.get(tid) or {}
-            if type(rec.get("execution_generation")) is not int or rec.get("fenced"):
+            if not _beats(rec):
                 continue
             item = {"task_id": tid, "worker_id": self.worker_id(),
                     "execution_generation": rec["execution_generation"]}
@@ -256,6 +258,13 @@ class TaskAttempts:
             return []
         errors = resp.get("task_errors") if isinstance(resp, dict) else None
         return [e for e in errors or [] if isinstance(e, dict) and e.get("error_code") in FENCING_CODES]
+
+    def beating(self, wire_tids) -> bool:
+        """Whether any of these attempts is due per-task beats."""
+        if self._task_beat_disabled:
+            return False
+        data = self._load()
+        return any(_beats(data.get(t) or {}) for t in wire_tids)
 
     def fence(self, wire_tid: str, error: dict) -> dict:
         """Mark the attempt fenced. The caller stops the core's work on it when `cancel` is set."""
@@ -520,3 +529,7 @@ def render_wake(text: str, wake: dict) -> str:
 
 def ask_in_room_rule(task_id: str) -> str:
     return ASK_IN_ROOM_RULE.format(task_id=task_id)
+
+
+def _beats(rec: dict) -> bool:
+    return type(rec.get("execution_generation")) is int and not rec.get("fenced")

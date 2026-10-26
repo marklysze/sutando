@@ -70,6 +70,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import math
 import os
 import stat
 import subprocess
@@ -3809,9 +3810,10 @@ _last_task_beat_at = 0.0
 
 
 def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
-    """Every attempt this bridge holds beats once per HEARTBEAT_INTERVAL, for as long as it is held."""
+    """Every attempt this bridge holds beats once per TASK_HEARTBEAT_INTERVAL_S, for as long as it is held."""
     global _last_task_beat_at
-    if _ATTEMPTS is None or (not force and time.time() - _last_task_beat_at < HEARTBEAT_INTERVAL):
+    if _ATTEMPTS is None or (not force and time.time() - _last_task_beat_at
+                             < task_attempts.TASK_HEARTBEAT_INTERVAL_S):
         return
     _last_task_beat_at = time.time()
     wire = {_broker_tid(t) for t in inflight}
@@ -3821,6 +3823,14 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
     for err in _ATTEMPTS.post_task_beats(wire):
         if err.get("task_id") in wire:
             _fence_attempt(err["task_id"], err)
+
+
+def _poll_wait(inflight: "set[str]") -> int:
+    """The long poll returns when the next per-task beat is due, so a held task beats on time."""
+    if _ATTEMPTS is None or not _ATTEMPTS.beating({_broker_tid(t) for t in inflight}):
+        return POLL_WAIT
+    due = _last_task_beat_at + task_attempts.TASK_HEARTBEAT_INTERVAL_S - time.time()
+    return max(1, min(POLL_WAIT, math.ceil(due)))
 
 
 def _resolve_stop(wire_tid: str) -> None:
@@ -8288,7 +8298,8 @@ def main() -> None:
             prev_ok = poll_grace_since
             _RESP_META.last = None
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
+                            timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
