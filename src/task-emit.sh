@@ -36,8 +36,11 @@ activity_cancel_target() {
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._-]+$' | head -1)"
+	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._~-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._~-]+$' | head -1)"
 	[ -n "$target" ] || return 0
+	# Escape to this pane only when it is mid-turn on the named task; it logs its own decision.
+	local stop="$(dirname "$bus")/stop_interrupt.py"
+	[ ! -f "$stop" ] || ( "${SUTANDO_PY_BIN:-python3}" "$stop" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" >/dev/null & ) || true
 	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0
 }

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Interrupt the turn a Stop names: one Escape to this watcher's pane, only when that pane is
+mid-turn on exactly the cancelled task. Every other case stays cooperative (the queued
+CANCEL_INSTRUCTION is read when the turn ends).
+
+The task is "current" when the newest row the session's own hooks wrote names it and is fresh;
+the pane is mid-turn when it shows Claude Code's `esc to interrupt`. A task a pool worker holds
+is interrupted only by that worker's own watcher. One Escape per cancelled task, ever; each
+decision is logged to the watcher's stderr and as an owner row in the activity log.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from activity_rows import append as append_row  # noqa: E402
+from activity_rows import task_from_file  # noqa: E402
+from delivery.task_dispatch import worker_holds  # noqa: E402
+
+ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
+FRESH_S = 1800.0
+TAIL_BYTES = 256 * 1024
+MARKER_DIR = ("state", "stop-interrupts")
+
+
+def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str | None:
+    """The task the newest session-hook row names, when that row is fresh; else None."""
+    try:
+        with open(workspace / "state" / "agent-activity.jsonl", "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - TAIL_BYTES))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        # TASK_STATUS rows mark delivery, and owner rows are this module's own: neither is the session's turn.
+        if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+            continue
+        task, ts = rec.get("task"), rec.get("ts")
+        if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        return task.get("id") if 0 <= now - ts <= fresh_s else None
+    return None
+
+
+def decide(target: str, *, current: str | None, held_elsewhere: bool,
+           pane_text: str | None) -> tuple[bool, str]:
+    """(send Escape?, why), before the at-most-once claim."""
+    if held_elsewhere:
+        return False, "a pool worker holds it; only that worker's watcher interrupts it"
+    if current != target:
+        return False, f"the session is on {current or 'no task'}, not {target}"
+    if pane_text is None:
+        return False, "the pane could not be read"
+    if not ESC_PROMPT.search(pane_text):
+        return False, "no turn is running in the pane"
+    return True, "the pane is mid-turn on this task"
+
+
+def _held_elsewhere(workspace: Path, tasks_dir: Path, target: str) -> bool:
+    deliveries = workspace / "deliveries"
+    try:
+        if tasks_dir.parent == deliveries:  # a worker's own inbox: it holds what it was handed
+            return not any(p.name.startswith(target + ".") for p in tasks_dir.iterdir())
+        return worker_holds(deliveries, f"{target}.txt")
+    except Exception:
+        return True                         # unreadable pool state: never Escape a pane that may not be on it
+
+
+def _claim(workspace: Path, target: str) -> bool:
+    """True the first time for this task: the marker makes the Escape at-most-once."""
+    d = workspace.joinpath(*MARKER_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(d / target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        return True
+    except FileExistsError:
+        return False
+
+
+def _pane_target(sock: str, run: Callable) -> str | None:
+    if os.environ.get("SUTANDO_TMUX_PANE"):
+        return os.environ["SUTANDO_TMUX_PANE"]
+    session = os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
+    out = run(["tmux", "-S", sock, "list-windows", "-t", f"={session}", "-F", "#{window_index}"])
+    idx = sorted(int(x) for x in (out or "").split() if x.isdigit())
+    return f"={session}:{idx[0]}" if idx else None
+
+
+def _run(argv: list) -> str | None:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = _run,
+              log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
+              now: float | None = None) -> bool:
+    """Decide, send at most one Escape, and log the decision. True when Escape was sent."""
+    now = time.time() if now is None else now
+    sock = os.environ.get("SUTANDO_TMUX_SOCKET") or os.environ.get("SUTANDO_TMUX_SOCK") or "/tmp/sutando-tmux.sock"
+    current = current_task(workspace, now)
+    held = _held_elsewhere(workspace, tasks_dir, target)
+    pane = _pane_target(sock, run) if current == target and not held else None
+    text = run(["tmux", "-S", sock, "capture-pane", "-p", "-J", "-t", pane]) if pane else None
+    send, why = decide(target, current=current, held_elsewhere=held, pane_text=text)
+    if send and not _claim(workspace, target):
+        send, why = False, "already interrupted once for this task"
+    if send:
+        py = os.environ.get("SUTANDO_PY_BIN") or sys.executable
+        sent = run(["bash", str(Path(__file__).resolve().parent / "tmux-pane-keys.sh"), "--python", py,
+                    "-S", sock, "-t", pane, "--", "Escape"]) is not None
+        why = why if sent else f"{why}, but the key could not be sent"
+        send = sent
+    line = f"Stop: {'interrupted the running turn' if send else 'left the turn to finish'} ({why})"
+    log(f"stop-interrupt: {target}: {line}")
+    _log_row(workspace, tasks_dir, target, line, now)
+    return send
+
+
+def _log_row(workspace: Path, tasks_dir: Path, target: str, line: str, now: float) -> None:
+    task, room = {"id": target}, None
+    try:
+        task, room = task_from_file(tasks_dir / f"{target}.txt")
+    except OSError:
+        pass
+    try:
+        append_row(line, kind="notice", room=room, task=task, workspace=workspace, audience="owner", ts=now)
+    except (OSError, ValueError):
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="stop_interrupt.py")
+    ap.add_argument("target")
+    ap.add_argument("--tasks-dir", required=True)
+    ap.add_argument("--workspace")
+    a = ap.parse_args(argv)
+    tasks_dir = Path(a.tasks_dir)
+    # A worker's inbox is <workspace>/deliveries/<worker>; the core's is <workspace>/tasks.
+    workspace = Path(a.workspace) if a.workspace else (
+        tasks_dir.parent.parent if tasks_dir.parent.name == "deliveries" else tasks_dir.parent)
+    try:
+        interrupt(a.target, workspace=workspace, tasks_dir=tasks_dir)
+    except Exception as e:                  # advisory: a Stop still completes cooperatively
+        print(f"stop-interrupt: {a.target}: skipped ({e})", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

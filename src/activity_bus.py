@@ -246,7 +246,8 @@ def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -
     return state, rows
 
 
-CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._-]+)")
+# `~` joins a gateway instance to its broker id (task-<instance>~task-<id>).
+CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._~-]+)")
 
 
 def cancel_target(task_text: str | None) -> str | None:
