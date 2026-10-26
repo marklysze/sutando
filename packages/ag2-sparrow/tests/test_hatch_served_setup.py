@@ -1083,11 +1083,13 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
     def test_the_media_token_a_rotated_token_and_a_url_username_are_registered(self):
         media, rotated = "media-tok-77", "rotated-secret-99"
         token_file = self.home / "token"
-        token_file.write_text(f"REMOTE_TASK_TOKEN={rotated}\n")
+        token_file.write_text("REMOTE_TASK_TOKEN=start-secret-55\n")  # the startup token; then a rotation
+        token_file.chmod(0o600)
         url = "https://longusername1:pw-123456@gw.example/relay"
         out = self.bridge("""
 import json
 from ag2_sparrow import remote_gateway_bridge as m
+open(m.TOKEN_FILE, "w").write("REMOTE_TASK_TOKEN=ROTATED\\n")
 assert m._reload_rotated_token(), "the rotation is read"
 for word in ("MEDIA", "ROTATED", "longusername1"):
     m._log("a line naming " + word)
@@ -3177,7 +3179,7 @@ class Upgrade(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=5000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             row = keepalive.health_row(self.cfg, self.home / "log", now=5000.0)
         self.assertEqual((row["condition"], row["reason"]),
                          ("abnormal", self_upgrade.UPGRADE_FAILED), label)
@@ -4695,7 +4697,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=1000.0 - 1000):
+                mock.patch.object(keepalive, "open_tasks", return_value=(1000.0 - 1000, None, {})):
             row = keepalive.health_row(cfg, self.home, now=1000.0)
             self.assertEqual((row["reason"], row["since"]), (keepalive.TASK_NOT_PICKED_UP, 900.0))
             # A cache applies only with a revision that normalises; a tunables-only cache is no cache.
@@ -4714,7 +4716,7 @@ class Health(Base):
         with mock.patch.object(keepalive, "_found", return_value=[self.home]), \
                 mock.patch.object(keepalive, "last_keepawake", return_value=1000.0), \
                 mock.patch.object(keepalive, "hook_last_run", return_value=None), \
-                mock.patch.object(keepalive, "oldest_open_task", return_value=None):
+                mock.patch.object(keepalive, "open_tasks", return_value=(None, None, {})):
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 11 * 60)
                              ["condition"], "healthy")
             self.assertEqual(keepalive.health_row(cfg, self.home, now=1000.0 + 31 * 60)

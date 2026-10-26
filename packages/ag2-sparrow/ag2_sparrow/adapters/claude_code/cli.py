@@ -7,7 +7,9 @@ parametrised by this adapter's Shape. `install` records the paths, mints the ses
 bridge's claude-local HITL store root and the canonical work root in a 0600 config, writes the unit
 or the plist, has the manager start it, and confirms a fresh holder of the root. With no explicit root,
 the root is the agent's own, `<agents dir>/<segment of its id>`, and install wires the agent's bridge to
-it: a unit of its own, or a declaration a host supervisor runs (`_dirs.bridge_host`). `run` is the managed
+it: a unit of its own, or a declaration a host supervisor runs (`_dirs.bridge_host`). `connect --base --code`
+checks the machine, redeems AG2 Space's one-time code for the agent's relay credential, has the credential
+owner write it to the agent's seat beside its root, then runs install with that seat. `run` is the managed
 launcher (`run --launchd` is launchd's entry shim); `hold` is the pane's own command; `inbox` is the
 Mod's lifecycle CLI; `attach` opens the pane; `stop --confirm` is the local confirmation of a stall
 card. The relay token stays in Sparrow's env file, the Claude login in its config dir. Stdlib only.
@@ -27,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from ... import _dirs, agent_identity, connect_common as cm, gateway_credential_sources as _sources, task_io
+from ...bounded_file_read import read_regular
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust
@@ -41,6 +44,7 @@ SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 UNIT, EXTERNAL = "unit", "external"
 STATUS_MAX_AGE_S = 180
 DECLARATION = "worker.json"
+SETUP_VENDOR = "claude"     # the served setup list this adapter follows: acp.claude
 
 
 def config_path() -> Path:
@@ -149,6 +153,33 @@ def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
     return env
 
 
+def seat_env(token_file: str, agent_id: str) -> "tuple[dict, str]":
+    """(the seat's launch variables, '') when `token_file` is a seat .env, ({}, '') when it is none, or
+    ({}, why): the credential owner exports the seat and clears what the bridge would inherit."""
+    if not token_file:
+        return {}, ""
+    seat, problem = _sources.seat_bridge_environ(token_file, read_regular)
+    if not problem and seat and seat["AGENT_MXID"] != agent_id:
+        problem = f"the seat .env {token_file} names {seat['AGENT_MXID']}, not {agent_id}"
+    return ({}, problem) if problem else (seat, "")
+
+
+def seat_file(root) -> str:
+    """The seat .env connect writes beside the root: under a host supervisor, the only one a bridge runs with."""
+    return cm.seat_env_path(bridge_home(root))
+
+
+def launch_env(cfg: dict) -> "tuple[dict, str]":
+    """(the bridge's whole launch environment, '') or ({}, why): the one place it is built, for a unit, a
+    declaration and the supervisor that runs one."""
+    env = bridge_env(cm.work_root(cfg), cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""), bridge_state(cfg))
+    seat, problem = seat_env(cfg.get("TOKEN_ENV_FILE", ""), cfg["AGENT_ID"])
+    if problem:
+        return {}, problem
+    env.update(seat)
+    return env, ""
+
+
 def install_identity(token_file: str, host_binding: bool) -> str:
     """The agent id by the bridge's own chain over the token file it will run with; the host's binding
     counts only when that file is the host's own device env."""
@@ -186,8 +217,10 @@ def bridge_fix(cfg: dict) -> str:
     if mode == UNIT:
         return f"see {cm.launcher_log(BRIDGE)}, or run {COMMAND} install again"
     if mode != EXTERNAL:
+        where = (f"the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}" if cfg.get("TOKEN_VAULT_KEY") else
+                 f"the token in the seat {cfg.get('TOKEN_ENV_FILE')} names")
         return (f"{mode} runs {bridge_home(root) / DECLARATION} on its next scan of the declarations: start it if it "
-                f"is not running (src/sparrowd.py), with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
+                f"is not running (src/sparrowd.py), with {where}")
     return (f"start the bridge with AGENT_CONNECT_TASK_DIR={root}/tasks AGENT_CONNECT_RESULT_DIR={root}/results "
             f"AGENT_CONNECT_STATE_DIR={bridge_state(cfg)}")
 
@@ -217,7 +250,9 @@ def wire_bridge(cfg: dict) -> str:
     """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
     declaration the host's supervisor runs. '' or why not."""
     root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    env = bridge_env(root, cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""), bridge_state(cfg))
+    env, problem = launch_env(cfg)
+    if problem:
+        return problem
     bridge_state(cfg).mkdir(parents=True, exist_ok=True)
     if mode != UNIT:
         path = bridge_home(root) / DECLARATION
@@ -227,6 +262,10 @@ def wire_bridge(cfg: dict) -> str:
             env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
         if problem:
             return problem
+        if not cfg["TOKEN_VAULT_KEY"]:
+            print(f"declared: {path} ({mode} runs it as worker {name} on its next scan, with the seat "
+                  f"{cfg['TOKEN_ENV_FILE']} and the token file it names)")
+            return ""
         print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
               f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
         print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
@@ -301,8 +340,6 @@ def resolve_root(args) -> "tuple[dict, str]":
         agent_id = install_identity(token, bool(token))
         return {"root": root, "mode": EXTERNAL, "agent_id": agent_id, "token_file": ""}, problem
     mode = _dirs.bridge_host() or UNIT
-    if mode != UNIT and args.token_env_file:
-        return {}, f"--token-env-file is not read under {mode}: its bridge takes the token from the vault"
     token_file = str(Path(args.token_env_file).expanduser().resolve()) if args.token_env_file else \
         (host_env if mode == UNIT else "")
     agent_id = install_identity(token_file, token_file == host_env)
@@ -315,7 +352,13 @@ def resolve_root(args) -> "tuple[dict, str]":
     if not problem and mode == UNIT and not os.path.isfile(token_file):
         problem = (f"{token_file} is missing: put the agent's REMOTE_TASK_TOKEN there (mode 600), or pass "
                    "--token-env-file")
-    return {"root": root, "mode": mode, "agent_id": agent_id, "token_file": token_file if mode == UNIT else ""}, problem
+    if not problem and mode != UNIT and token_file:
+        # The supervisor derives the seat from the root, so a .env anywhere else would never be the one it runs.
+        seat, problem = ({}, "") if token_file != seat_file(root) else seat_env(token_file, agent_id)
+        if not seat and not problem:
+            problem = (f"--token-env-file under {mode} is the agent's seat, {seat_file(root)}, as {COMMAND} connect "
+                       f"writes it; without it the bridge takes the token from the vault")
+    return {"root": root, "mode": mode, "agent_id": agent_id, "token_file": token_file}, problem
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -363,7 +406,8 @@ def install(args) -> int:
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "", "AGENT_ID": agent_id, "BRIDGE": mode,
-              "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) else "",
+              "TOKEN_ENV_FILE": where["token_file"],
+              "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
               "BRIDGE_STATE_DIR": str(state)}
 
     def revise(old: dict, values: dict) -> dict:
@@ -391,6 +435,48 @@ def install(args) -> int:
               file=sys.stderr)
         return EXIT_UNUSABLE
     return 0
+
+
+def connect_preflight(args) -> str:
+    """'' when this host can run the agent, checked before the single-use code is spent; else why not."""
+    if _dirs.task_dir_configured():
+        return "AGENT_CONNECT_TASK_DIR is set; connect wires the agent's own root, so unset it first"
+    claude = shutil.which(args.claude) or args.claude
+    plugin = Path(args.plugin_dir).expanduser().resolve()
+    if not (plugin / ".claude-plugin" / "plugin.json").is_file():
+        return f"{plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)"
+    login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
+                                                                         .resolve()) if args.claude_config_dir else ""}
+    return (version_problem(claude) or launcher.tmux_problem() or launcher.socket_problem(config_dir())
+            or auth_problem(login))
+
+
+def connect(args) -> int:
+    """Preflight, redeem the code, write the agent's seat beside its root, then install exactly as `install`
+    does with the seat's .env as the token env file. The bearer goes only into the seat's token file."""
+    code, problem = cm.read_code(args.code)
+    problem = problem or cm.code_problem(args.base, code) or connect_preflight(args)
+    if problem:
+        print(f"error: {problem}; the code was not used", file=sys.stderr)
+        return EXIT_UNUSABLE
+    redeemed, problem = cm.redeem_code(args.base, code)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    problem = cm.relay_problem(args.base, redeemed["relay_url"], args.trust_relay_host or "")
+    root, problem = ("", problem) if problem else cm.canonical_root(
+        str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
+    seat_env, problem = ("", problem) if problem else cm.write_seat(bridge_home(root), redeemed)
+    if problem:
+        print(f"error: the code is spent but the seat was not written: {problem}; make a new code", file=sys.stderr)
+        return EXIT_UNUSABLE
+    print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat_env).parent} (mode 600)")
+    print(cm.served_setup_line(SETUP_VENDOR))
+    session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
+    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat_env, bridge_state_dir=None))
+    if rc == 0:
+        print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
+    return rc
 
 
 def child_env(cfg: dict, environ=None) -> dict:
@@ -538,8 +624,9 @@ def verify(_args) -> int:
                      problem_ or (f"{sup} missing; run {COMMAND} install" if text is None else
                                   f"{sup} ({cm.job_name(BRIDGE)} {cm.manager_state(BRIDGE)})"))
         elif mode != EXTERNAL:
-            print(f"INFO relay token: the vault key {cfg.get('TOKEN_VAULT_KEY')}, read by {mode} at start; "
-                  f"declared in {bridge_home(root) / DECLARATION}")
+            where = (f"the vault key {cfg.get('TOKEN_VAULT_KEY')}, read by {mode} at start" if cfg.get("TOKEN_VAULT_KEY")
+                     else f"the seat {cfg.get('TOKEN_ENV_FILE')}'s token file, read by the bridge")
+            print(f"INFO relay token: {where}; declared in {bridge_home(root) / DECLARATION}")
     cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line, relay=relay)
     print(f"INFO session id: {cfg['SESSION_ID']}")
     print(f"INFO folder trust: {trust_line(cfg, root)}")
@@ -642,21 +729,9 @@ def hold_cmd(args) -> int:
     return hold.main(args)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog=COMMAND, description="A Claude Code session in a tmux pane on this machine as "
-                                 "an AG2 Space agent (Mods API, CLI %s+)." % _v(MIN_CLI))
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
-                       "start the session (a reinstall stops the old one first)")
+def session_options(p) -> None:
+    """The session's options, shared by install and connect."""
     p.add_argument("--plugin-dir", required=True, help="the ag2space-inbox plugin directory from the repo")
-    p.add_argument("--work", help="an explicit work root, served by a bridge you run (default: the agent's own "
-                   "root, <agents dir>/<agent id>, whose bridge install wires)")
-    p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "
-                   "result dir is <work>/results")
-    p.add_argument("--token-env-file", help="the agent's 0600 env file with REMOTE_TASK_TOKEN (and AGENT_MXID) for "
-                   "the bridge install runs (default: Sparrow's device env)")
-    p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
-                   "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")
@@ -673,7 +748,33 @@ def main(argv=None) -> int:
     p.add_argument("--new-session", action="store_true", help="rotate the session id, only once the old session "
                    "is proven gone (quiescent); else the old id is kept and said so")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog=COMMAND, description="A Claude Code session in a tmux pane on this machine as "
+                                 "an AG2 Space agent (Mods API, CLI %s+)." % _v(MIN_CLI))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("install", help="record the paths, mint the session id, write the unit, have the manager "
+                       "start the session (a reinstall stops the old one first)")
+    p.add_argument("--work", help="an explicit work root, served by a bridge you run (default: the agent's own "
+                   "root, <agents dir>/<agent id>, whose bridge install wires)")
+    p.add_argument("--inbox", help="an explicit work root by its <work>/tasks, as your bridge's task dir; the "
+                   "result dir is <work>/results")
+    p.add_argument("--token-env-file", help="the agent's 0600 env file with REMOTE_TASK_TOKEN (and AGENT_MXID) for "
+                   "the bridge install runs (default: Sparrow's device env)")
+    p.add_argument("--bridge-state-dir", help="with an explicit root: the AGENT_CONNECT_STATE_DIR of the bridge you "
+                   "run, where verify reads its status and the card store sits (default: Sparrow's state dir)")
+    session_options(p)
     p.set_defaults(func=install)
+    c = sub.add_parser("connect", help="check this machine, redeem the one-time code from AG2 Space for the agent's "
+                       "relay credential, write it to the agent's seat (mode 600), then install as install does")
+    c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
+    c.add_argument("--code", help="the one-time code from AG2 Space (starts with acp.): - reads it from stdin; "
+                   "omitted, connect asks for it. A code given here is kept by ps and shell history")
+    c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
+                   "or under it (only when AG2 Space told you to)")
+    session_options(c)
+    c.set_defaults(func=connect)
     run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "
                 "is in the environment, as the unit sets it (a guard against an accidental hand start, not a "
                 "security boundary; use attach to look at the session)")
