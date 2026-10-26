@@ -269,9 +269,31 @@ class TaskAttempts:
         self.log(f"task {wire_tid}: attempt fenced by the broker ({code})")
         return {"new": True, "cancel": code in ("task_cancelled", "stale_execution_generation")}
 
+    def request_stop(self, wire_tid: str, error: dict) -> bool:
+        """A Stop reported by a beat: a request, not a fence, so a result the core still writes is
+        delivered. True the first time, when the caller asks the core to stop."""
+        rec = self.get(wire_tid)
+        if rec.get("stop_requested") or rec.get("fenced"):
+            return False
+        self._update(wire_tid, stop_requested=True,
+                     cancel_requested_generation=error.get("cancel_requested_generation"),
+                     cancel_requested_attempt=error.get("cancel_requested_attempt"))
+        self.log(f"task {wire_tid}: Stop requested — the core is asked to stop; a result it "
+                 "still writes is delivered")
+        return True
+
+    def stop_outcome(self, wire_tid: str, stopped: bool) -> None:
+        """The core answered the Stop: it stopped (confirmed with a cancel-ack), or it finished."""
+        if stopped:
+            self._update(wire_tid, stop_requested=False, stop_confirmed=True)
+            self.cancel_ack(wire_tid)
+        else:
+            self._update(wire_tid, stop_requested=False)
+            self.log(f"task {wire_tid}: the core finished despite the Stop — no cancel-ack")
+
     def cancel_ack(self, wire_tid: str) -> bool:
         rec = self.get(wire_tid)
-        if rec.get("fenced") != "task_cancelled":
+        if rec.get("fenced") != "task_cancelled" and not rec.get("stop_confirmed"):
             return False
         body = {"worker_id": self.worker_id(),
                 "cancel_requested_generation": rec.get("cancel_requested_generation"),
@@ -287,7 +309,7 @@ class TaskAttempts:
         except (OSError, ValueError) as e:
             self.log(f"task {wire_tid}: cancel-ack failed ({e}) — retried next beat")
             return False
-        self._update(wire_tid, fenced="cancel_confirmed")
+        self._update(wire_tid, fenced="cancel_confirmed", stop_confirmed=False)
         return True
 
     # ── result ───────────────────────────────────────────────────────────

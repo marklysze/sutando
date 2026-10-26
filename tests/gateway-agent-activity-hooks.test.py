@@ -82,8 +82,10 @@ class Hooks(unittest.TestCase):
         cancel = _http(409, {"error_code": "task_cancelled", "cancel_requested_generation": 2,
                              "cancel_requested_attempt": 2})
         fake = self.use(FakeGateway(**{"/v1/tasks/task-h2/ack": cancel}))
+        self.assertTrue(gw._take_served_task(_task("task-h2"), set(), []))
         self.assertFalse(gw._post_task_ack("task-h2", durable=True))
-        self.assertEqual(len(self.controls("task-h2")), 1)
+        self.assertIsNone(agent_turn.open_turn_for_task(gw._STATE, "task-h2"), "no turn")
+        self.assertEqual(len(self.controls("task-h2")), 1, "the published task is not started")
         self.assertEqual(fake.posted("/cancel-ack")[0]["cancel_requested_generation"], 2)
 
     def test_the_ack_first_path_records_the_generation_or_refuses_a_cancel(self):
@@ -437,6 +439,65 @@ class Hooks(unittest.TestCase):
             gw._ATTEMPTS.open_wake("task-wake-boundary", {"blocker_episode_id": "e7"})
             gw._ATTEMPTS.remember_task("task-wake-boundary", _task("task-wake-boundary"))
         self.assertEqual(gw._ATTEMPTS.get("task-wake-boundary")["published_at"], first + 50)
+    def stopped_by_a_beat(self, tid):
+        """A running attempt; the next per-task beat answers task_cancelled (a cooperative Stop)."""
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        stop = {"ok": True, "task_errors": [{"task_id": tid, "error_code": "task_cancelled",
+                                              "cancel_requested_generation": 1, "cancel_requested_attempt": 1}]}
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/tasks/heartbeat": stop,
+                                       "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(len(self.controls(tid)), 1, "the core is asked to stop")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(len(self.controls(tid)), 1, "asked once, however many beats repeat it")
+        self.assertEqual(fake.posted("/cancel-ack"), [], "nothing is confirmed yet")
+        return fake, self.controls(tid)[0].stem
+
+    def test_stop_then_finish_posts_the_result_and_sends_no_cancel_ack(self):
+        tid = "task-stop-finish"
+        fake, ctl = self.stopped_by_a_beat(tid)
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "done anyway"))
+        self.assertEqual(fake.posted("/v1/results")[0]["status"], "completed", "a finished reply is delivered")
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(fake.posted("/cancel-ack"), [])
+
+    def test_stop_then_finish_seen_by_the_control_task_first_still_sends_no_cancel_ack(self):
+        tid = "task-stop-finish-2"
+        fake, ctl = self.stopped_by_a_beat(tid)
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text("done anyway")
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(fake.posted("/cancel-ack"), [])
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "done anyway"))
+        self.assertEqual(len(fake.posted("/v1/results")), 1)
+        (gw.RESULTS_DIR / f"{tid}.txt").unlink()
+
+    def test_stop_then_stop_sends_only_the_cancel_ack(self):
+        tid = "task-stop-stop"
+        fake, ctl = self.stopped_by_a_beat(tid)
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(fake.posted("/cancel-ack")[0]["cancel_requested_generation"], 1)
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "late"), "a later result settles")
+        self.assertEqual(fake.posted("/v1/results"), [], "and is never posted")
+
+    def test_every_held_task_beats_each_interval_even_while_the_client_heartbeat_backs_off(self):
+        tid = "task-long-turn"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/heartbeat": _http(404, {})}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        mock.patch.object(gw, "_heartbeat_retry_at", time.time() + 3600).start()
+        clock = [time.time()]
+        mock.patch.object(gw.time, "time", lambda: clock[0]).start()
+        mock.patch.object(gw, "_last_task_beat_at", 0.0).start()
+        for _ in range(3):
+            gw._post_heartbeat({tid})
+            clock[0] += gw.HEARTBEAT_INTERVAL
+        beats = [b for b in fake.posted("/v1/tasks/heartbeat") if any(t["task_id"] == tid for t in b["tasks"])]
+        self.assertEqual(len(beats), 3, "one per interval through a long turn")
+        self.assertEqual(fake.posted("/v1/heartbeat"), [], "the client beat stayed in its backoff")
 
     def test_a_cancel_instruction_that_cannot_be_written_is_reported(self):
         with mock.patch.object(gw, "_durable_write", return_value=False):

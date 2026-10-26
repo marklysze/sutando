@@ -380,11 +380,16 @@ Sutando checkout around it sends neither field.
   pending ack and, for a published task, stops the core (below) — except a stale older lease
   when a newer serve of the same task is pending here, which that serve's ack decides.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
-  rides the client heartbeat's cadence for every attempt with a generation. A `task_errors` entry
-  (`stale_execution_generation`, `task_cancelled`, `task_not_found`, `task_already_terminal`)
-  fences the attempt; for the first two the core gets a `CANCEL_INSTRUCTION` task
-  (`source: relay-control`, whose result is retired locally and never posted), and a cancel is
-  confirmed on `POST /v1/tasks/<id>/cancel-ack`. A 404 disables the per-task beat.
+  is sent every 60 s for every attempt with a generation, for as long as the bridge holds it, even
+  while the client heartbeat is backing off: it is the only way a Stop reaches a running task. A
+  `task_errors` entry of `stale_execution_generation`, `task_not_found` or
+  `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
+  also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one
+  `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
+  posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
+  for the task is posted normally and no cancel-ack is sent; with no result, the stop is confirmed
+  on `POST /v1/tasks/<id>/cancel-ack` and a later result is settled. A `task_cancelled` on the ack
+  means the task is not started and is cancel-acked at once. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
   without a post. A result written before its task's ack named the lease waits for it. On a broker that has
   ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
