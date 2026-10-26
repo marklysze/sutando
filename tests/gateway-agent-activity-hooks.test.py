@@ -412,6 +412,86 @@ class Hooks(unittest.TestCase):
         self.assertEqual(len(fake.posted("/v1/tasks/heartbeat")), 2, "one beat per 15 s, none sooner")
         self.assertEqual(gw._poll_wait(set()), gw.POLL_WAIT, "nothing held: the full long poll")
 
+    def held_then_archived(self, tid):
+        """A served, acked attempt whose task file the core archived unanswered (the orphan pass)."""
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        clock = [time.time()]
+        mock.patch.object(gw._ATTEMPTS, "now", lambda: clock[0]).start()
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{tid}.txt").unlink(missing_ok=True))
+        return fake, clock
+
+    def beat(self, tid):
+        gw._watch_dispatch(tid)
+        return gw._ATTEMPTS.beating({tid})
+
+    def test_an_attempt_archived_unanswered_is_failed_after_ten_minutes_and_stops_beating(self):
+        tid = "task-lost"
+        fake, clock = self.held_then_archived(tid)
+        self.assertTrue(self.beat(tid), "the first miss only starts the clock")
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S - 1
+        self.assertTrue(self.beat(tid))
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        clock[0] += 1
+        self.assertFalse(self.beat(tid), "no beat holds an attempt nobody will answer")
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+        self.assertTrue(any("posting it as failed" in m for m in self.logs))
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "the task left the queue", no_send=True))
+        post = fake.posted("/v1/results")[0]
+        self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 1))
+
+    def test_a_task_put_back_in_the_queue_resets_the_clock(self):
+        tid = "task-requeued"
+        _, clock = self.held_then_archived(tid)
+        self.beat(tid)
+        clock[0] += 300
+        (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
+        self.beat(tid)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        clock[0] += 300
+        self.assertTrue(self.beat(tid), "the clock restarted when the file came back")
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+
+    def test_turn_activity_on_the_task_keeps_it_alive(self):
+        tid = "task-busy-elsewhere"
+        _, clock = self.held_then_archived(tid)
+        self.beat(tid)
+        log = gw._STATE / "agent-activity.jsonl"
+        with open(log, "a") as fh:
+            fh.write(json.dumps({"ts": clock[0] + 500, "kind": "working", "task": {"id": tid}}) + "\n")
+            fh.write(json.dumps({"ts": clock[0] + 590, "kind": "done", "task": {"id": tid},
+                                 "projection": "TASK_STATUS", "audience": "room"}) + "\n")
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S + 10
+        self.assertTrue(self.beat(tid), "a tool call 110 s ago is turn activity; a delivery row is not")
+        clock[0] += 500
+        self.assertFalse(self.beat(tid))
+
+    def test_a_real_result_written_first_is_never_replaced(self):
+        tid = "task-raced"
+        rfile = gw.RESULTS_DIR / f"{tid}.txt"
+        rfile.write_text("the real answer")
+        self.addCleanup(lambda: rfile.unlink(missing_ok=True))
+        self.assertIsNone(gw._write_if_absent(rfile, gw.DISPATCH_LOST_RESULT))
+        self.assertEqual(rfile.read_text(), "the real answer")
+        self.assertFalse(gw._write_if_absent(gw.RESULTS_DIR / "no-such-dir" / "task-x.txt", "x"))
+        with mock.patch.object(gw.os, "write", side_effect=OSError("disk full")):
+            self.assertTrue(gw._write_if_absent(gw.RESULTS_DIR / "task-y.txt", "x"), "created: the ledger rules")
+        (gw.RESULTS_DIR / "task-y.txt").unlink()
+
+    def test_a_failure_result_that_cannot_be_written_is_retried_next_beat(self):
+        tid = "task-lost-retry"
+        _, clock = self.held_then_archived(tid)
+        self.beat(tid)
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S
+        with mock.patch.object(gw, "_write_if_absent", return_value=False):
+            self.assertTrue(self.beat(tid), "not marked lost while its result is unwritten")
+        self.assertTrue(any("retried next beat" in m for m in self.logs))
+        self.assertFalse(self.beat(tid))
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+
     def test_a_cancel_instruction_that_cannot_be_written_is_reported(self):
         with mock.patch.object(gw, "_durable_write", return_value=False):
             gw._queue_cancel_instruction("task-h5", "task_cancelled")

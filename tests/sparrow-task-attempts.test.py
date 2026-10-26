@@ -68,6 +68,32 @@ class Attempts(unittest.TestCase):
         self.assertEqual(body, {"worker_id": wid, "tasks": [
             {"task_id": "tsk_A", "worker_id": wid, "execution_generation": 2}]})
 
+    def test_dispatch_lost_needs_a_leased_attempt_and_ten_quiet_minutes(self):
+        clock = [1000.0]
+        a = self.mk(now=lambda: clock[0])
+        self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "no generation: nothing to fail")
+        a.record_ack("tsk_A", _ack(2))
+        self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "the first miss starts the clock")
+        clock[0] += task_attempts.DISPATCH_LOST_S
+        self.assertFalse(a.dispatch_lost_due("tsk_A", False, clock[0] - 1), "fresh turn activity")
+        self.assertTrue(a.dispatch_lost_due("tsk_A", False, None))
+        a.mark_dispatch_lost("tsk_A")
+        self.assertFalse(a.beating({"tsk_A"}))
+        self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "decided once")
+        d = a.result_decision("tsk_A", "x", True)
+        self.assertEqual((d.action, d.fields), (agent_turn.POST, {"status": "failed", "no_send": True}))
+
+    def test_last_activity_reads_only_the_sessions_own_rows(self):
+        self.assertIsNone(task_attempts.last_activity(self.state, "t1"), "no log")
+        rows = [{"ts": 5, "kind": "working", "task": {"id": "t1"}},
+                {"ts": 9, "kind": "done", "task": {"id": "t1"}, "projection": "TASK_STATUS"},
+                {"ts": 8, "kind": "notice", "task": {"id": "t1"}, "audience": "owner"},
+                {"ts": 7, "kind": "working", "task": {"id": "t2"}},
+                {"ts": True, "kind": "working", "task": {"id": "t1"}}]
+        (self.state / "agent-activity.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+        self.assertEqual(task_attempts.last_activity(self.state, "t1"), 5)
+
     def test_an_ack_without_a_generation_records_nothing(self):
         a = self.mk()
         for resp in ({}, {"execution_generation": 0}, {"execution_generation": "2"}, None):

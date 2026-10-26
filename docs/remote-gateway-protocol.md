@@ -382,7 +382,9 @@ Sutando checkout around it sends neither field.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
   is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
   while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
-  task. While one is held, the task long poll returns when the next beat is due. A
+  task. While one is held, the task long poll returns when the next beat is due. An attempt whose
+  task file has left the queue with no result, no claim and no turn activity for 10 min is never
+  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
   also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one

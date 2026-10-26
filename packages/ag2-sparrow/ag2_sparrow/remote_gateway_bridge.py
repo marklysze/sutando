@@ -369,6 +369,7 @@ TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
 # mistake its own dedup control for collaborator output.
 GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
+DISPATCH_LOST_RESULT = "[no-send] the task left the queue before the agent answered it\n"
 
 
 RESULTS_DIR = _result_dir()
@@ -670,6 +671,27 @@ def _durable_write(path: Path, text: str) -> bool:
         return True
     tmp.unlink(missing_ok=True)
     return False
+
+
+def _write_if_absent(path: Path, text: str) -> "bool | None":
+    """Create `path` holding `text` only if nothing is there: True written, None when a file
+    already was (it wins), False on an error. One small write; its reader rules on the ledger."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return None
+    except OSError as exc:
+        _log(f"could not create {path.name} ({diagnostics.describe(exc)})")
+        return False
+    try:
+        os.write(fd, text.encode("utf-8"))
+        os.fsync(fd)
+        return True
+    except OSError as exc:
+        _log(f"could not write {path.name} ({diagnostics.describe(exc)})")
+        return True                         # the file exists: the ledger already rules it failed
+    finally:
+        os.close(fd)
 
 
 def _read_review_json(path: Path) -> "dict | None":
@@ -3966,6 +3988,7 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
     for wire_tid in wire:
         _resolve_stop(wire_tid)
         _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
+        _watch_dispatch(wire_tid)
     for err in _ATTEMPTS.post_task_beats(wire):
         if err.get("task_id") in wire:
             _fence_attempt(err["task_id"], err)
@@ -3977,6 +4000,26 @@ def _poll_wait(inflight: "set[str]") -> int:
         return POLL_WAIT
     due = _last_task_beat_at + task_attempts.TASK_HEARTBEAT_INTERVAL_S - time.time()
     return max(1, min(POLL_WAIT, math.ceil(due)))
+
+
+def _watch_dispatch(wire_tid: str) -> None:
+    """Fail an attempt the core will never answer: its task file left the queue with no result,
+    no claim and no turn activity for DISPATCH_LOST_S. Its beats stop; the failure is posted."""
+    tid = _local_tid(wire_tid)
+    live = (_task_pending(tid) or os.path.lexists(RESULTS_DIR / f"{tid}.txt")
+            or _delivered_copy_exists(tid))
+    if not _ATTEMPTS.dispatch_lost_due(wire_tid, live, task_attempts.last_activity(_STATE, tid)):
+        return
+    _ATTEMPTS.mark_dispatch_lost(wire_tid)
+    written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", DISPATCH_LOST_RESULT)
+    if not written:
+        _ATTEMPTS.mark_dispatch_lost(wire_tid, False)
+        if written is False:
+            _log(f"task {tid}: its failure result could not be written — retried next beat")
+        return
+    _log(f"task {tid}: its task file left the queue unanswered, with no turn activity for "
+         f"{task_attempts.DISPATCH_LOST_S // 60} min — posting it as failed")
+    wake_outbound()
 
 
 def _resolve_stop(wire_tid: str) -> None:
