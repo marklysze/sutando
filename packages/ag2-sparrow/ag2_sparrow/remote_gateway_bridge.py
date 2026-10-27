@@ -3951,7 +3951,7 @@ def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
              f"generation {gen} may be stopped")
     except OSError as e:
-        _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({e})")
+        _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({diagnostics.describe(e)})")
 
 
 def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> bool:
