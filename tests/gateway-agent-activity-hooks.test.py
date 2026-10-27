@@ -122,6 +122,37 @@ class Hooks(unittest.TestCase):
         self.assertEqual(len(self.controls("task-h4")), 1)
         self.assertEqual(self.controls("task-elsewhere"), [], "only this node's attempts are fenced")
 
+    def test_a_newer_generation_served_here_withdraws_the_old_generations_cancel(self):
+        tid = "task-regen"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": "stale_execution_generation"}]}}))
+        gw._post_heartbeat({tid}, force=True)
+        self.assertEqual(len(self.controls(tid)), 1, "no newer attempt here yet: the core is stopped")
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(self.controls(tid), [], "generation 1's cancel must not stop generation 2")
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["execution_generation"], rec.get("fenced"), rec.get("fence_ctl")), (2, None, None))
+        self.assertTrue(any("withdrawn" in m for m in self.logs))
+
+    def test_a_cancel_the_core_already_took_is_not_withdrawn(self):
+        tid = "task-regen-taken"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": "stale_execution_generation"}]}}))
+        gw._post_heartbeat({tid}, force=True)
+        ctl = self.controls(tid)[0]
+        taken = ctl.with_name(ctl.stem + ".claimed-core")
+        ctl.rename(taken)
+        self.addCleanup(lambda: taken.unlink(missing_ok=True))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertTrue(taken.exists())
+        self.assertTrue(any("already taken" in m for m in self.logs))
+
     def test_two_cancels_in_one_millisecond_both_reach_the_core(self):
         with mock.patch.object(gw.time, "time", return_value=1761500000.0):
             gw._queue_cancel_instruction("task-h5a", "task_cancelled")
