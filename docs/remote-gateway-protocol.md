@@ -392,7 +392,8 @@ Sutando checkout around it sends neither field.
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
   also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
-  generation of the task is acked here. `task_cancelled` is a **cooperative Stop**: the core gets one
+  generation of the task is acked here. If the core took it already, the newer attempt it then
+  leaves with no result and no queued task file is posted as `status: failed` with `no_send`. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
   for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
