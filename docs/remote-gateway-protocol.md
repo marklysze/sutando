@@ -384,7 +384,10 @@ Sutando checkout around it sends neither field.
   while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
   task. While one is held, the task long poll returns when the next beat is due. An attempt whose
   task file has left the queue with no result, no claim and no turn activity for 10 min is never
-  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. A
+  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
+  one still queued whose task file the core took up (a turn row newer than the file) and then left
+  with no turn activity and no result for 30 min; a task file the core has not reached yet keeps
+  beating however long it waits. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
   also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one
