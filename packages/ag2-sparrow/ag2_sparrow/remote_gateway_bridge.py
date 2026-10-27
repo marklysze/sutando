@@ -7876,7 +7876,8 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             if _valid_local_tid(tid) and tid not in staged
             and not _task_pending(tid)
             and not (RESULTS_DIR / f"{tid}.txt").exists()
-            and not _task_archived_recently(tid)}
+            and not _task_archived_recently(tid)
+            and not _broker_holds(tid)}
     confirmed = gone & suspects
     if confirmed:
         for tid in sorted(confirmed):
@@ -7884,6 +7885,11 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
             _log(f"dropped abandoned in-flight id {tid} (no task/result file — completed elsewhere)")
         _save_inflight(inflight)
     return gone - confirmed
+
+
+def _broker_holds(tid: str) -> bool:
+    """An attempt still beating: the dispatch watch fails it with a posted result, never silently."""
+    return _ATTEMPTS is not None and _ATTEMPTS.beating((_broker_tid(tid),))
 
 
 # A task archived here minutes ago was completed HERE, not elsewhere — its
