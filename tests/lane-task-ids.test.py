@@ -14,6 +14,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 import local_task_protocol as ltp  # noqa: E402
