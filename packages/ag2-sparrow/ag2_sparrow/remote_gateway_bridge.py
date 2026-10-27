@@ -370,6 +370,7 @@ TASKS_DIR = _task_dir()
 # mistake its own dedup control for collaborator output.
 GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
 DISPATCH_LOST_RESULT = "[no-send] the task left the queue before the agent answered it\n"
+STALLED_RESULT = "[no-send] the agent stopped working on the task without answering it\n"
 
 
 RESULTS_DIR = _result_dir()
@@ -4011,21 +4012,36 @@ def _poll_wait(inflight: "set[str]") -> int:
 
 def _watch_dispatch(wire_tid: str) -> None:
     """Fail an attempt the core will never answer: its task file left the queue with no result,
-    no claim and no turn activity for DISPATCH_LOST_S. Its beats stop; the failure is posted."""
+    no claim and no turn activity for DISPATCH_LOST_S, or the core engaged its queued task file and
+    then went quiet for STALLED_S with no result. Its beats stop; the failure is posted."""
     tid = _local_tid(wire_tid)
-    live = (_task_pending(tid) or os.path.lexists(RESULTS_DIR / f"{tid}.txt")
-            or _delivered_copy_exists(tid))
-    if not _ATTEMPTS.dispatch_lost_due(wire_tid, live, task_attempts.last_activity(_STATE, tid)):
-        return
+    pending = _task_pending(tid)
+    answered = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid)
+    activity = task_attempts.last_activity(_STATE, tid)
+    if _ATTEMPTS.dispatch_lost_due(wire_tid, pending or answered, activity):
+        _fail_unanswered(wire_tid, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
+                         f"with no turn activity for {task_attempts.DISPATCH_LOST_S // 60} min")
+    elif pending and not answered and _ATTEMPTS.stalled_due(wire_tid, _queued_at(tid), activity):
+        _fail_unanswered(wire_tid, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
+                         f"activity or result for {task_attempts.STALLED_S // 60} min")
+
+
+def _queued_at(tid: str) -> "float | None":
+    try:
+        return (TASKS_DIR / f"{tid}.txt").stat().st_mtime
+    except OSError:
+        return None
+
+
+def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> None:
     _ATTEMPTS.mark_dispatch_lost(wire_tid)
-    written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", DISPATCH_LOST_RESULT)
+    written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
     if not written:
         _ATTEMPTS.mark_dispatch_lost(wire_tid, False)
         if written is False:
             _log(f"task {tid}: its failure result could not be written — retried next beat")
         return
-    _log(f"task {tid}: its task file left the queue unanswered, with no turn activity for "
-         f"{task_attempts.DISPATCH_LOST_S // 60} min — posting it as failed")
+    _log(f"task {tid}: {why} — posting it as failed")
     wake_outbound()
 
 
@@ -4848,6 +4864,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # closing the Team session route removed the only thing that used to deliver it.
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
     if TURN_CONTEXT:
+        if woken:
+            lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
         answer_rule = task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))
         if answer_rule:
