@@ -384,14 +384,15 @@ Sutando checkout around it sends neither field.
   while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
   task. While one is held, the task long poll returns when the next beat is due. An attempt whose
   task file has left the queue with no result, no claim and no turn activity for 10 min is never
-  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. Until
-  then the in-flight reconcile keeps the id, rather than dropping it as completed elsewhere. So is
+  going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
   one still queued whose task file the core took up (a turn row newer than the file) and then left
   with no turn activity and no result for 30 min; a task file the core has not reached yet keeps
-  beating however long it waits. A
+  beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
+  dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
-  also stops the core. `task_cancelled` is a **cooperative Stop**: the core gets one
+  also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
+  generation of the task is acked here. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
   for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
