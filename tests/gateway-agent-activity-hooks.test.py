@@ -600,6 +600,53 @@ class Hooks(unittest.TestCase):
         clock[0] += 500
         self.assertFalse(self.beat(tid))
 
+    def held_in_queue(self, tid):
+        """A served, acked attempt whose task file is still queued."""
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        clock = [(gw.TASKS_DIR / f"{tid}.txt").stat().st_mtime]
+        mock.patch.object(gw._ATTEMPTS, "now", lambda: clock[0]).start()
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{tid}.txt").unlink(missing_ok=True))
+        return fake, clock
+
+    def row(self, tid, ts, kind="working"):
+        with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": ts, "kind": kind, "task": {"id": tid}}) + "\n")
+
+    def test_a_queued_task_the_core_took_up_then_left_is_failed_after_thirty_minutes(self):
+        tid = "task-stalled"
+        fake, clock = self.held_in_queue(tid)
+        self.row(tid, clock[0] + 12, "processing")
+        clock[0] += 12 + gw.task_attempts.STALLED_S - 1
+        self.assertTrue(self.beat(tid))
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        clock[0] += 1
+        self.assertFalse(self.beat(tid), "no beat holds a task the core walked away from")
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALLED_RESULT)
+        self.assertTrue(any("then wrote no turn activity or result for 30 min" in m for m in self.logs))
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "stopped working", no_send=True))
+        post = fake.posted("/v1/results")[0]
+        self.assertEqual((post["status"], post["no_send"]), ("failed", True))
+
+    def test_a_queued_task_the_core_never_took_up_keeps_beating(self):
+        tid = "task-waiting-its-turn"
+        _, clock = self.held_in_queue(tid)
+        self.row(tid, clock[0] - 60, "done")
+        clock[0] += 4 * gw.task_attempts.STALLED_S
+        self.assertTrue(self.beat(tid), "a row from before this file was queued is an earlier turn's")
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+
+    def test_turn_activity_on_a_queued_task_keeps_it_alive(self):
+        tid = "task-long-turn"
+        _, clock = self.held_in_queue(tid)
+        self.row(tid, clock[0] + 5, "processing")
+        self.row(tid, clock[0] + gw.task_attempts.STALLED_S, "working")
+        clock[0] += gw.task_attempts.STALLED_S + 600
+        self.assertTrue(self.beat(tid))
+        clock[0] += gw.task_attempts.STALLED_S
+        self.assertFalse(self.beat(tid))
+
     def test_a_real_result_written_first_is_never_replaced(self):
         tid = "task-raced"
         rfile = gw.RESULTS_DIR / f"{tid}.txt"
