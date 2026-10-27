@@ -3930,7 +3930,26 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> None:
     if _ATTEMPTS is not None:
+        before = _ATTEMPTS.get(wire_tid)
         _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
+        _withdraw_stale_cancel(wire_tid, before)
+
+
+def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
+    """An older generation's cancel must not stop a newer generation now served here."""
+    ctl, old = before.get("fence_ctl"), before.get("execution_generation")
+    gen = _ATTEMPTS.get(wire_tid).get("execution_generation")
+    if not ctl or type(gen) is not int or type(old) is not int or gen <= old:
+        return
+    _ATTEMPTS._update(wire_tid, fence_ctl=None)
+    try:
+        (TASKS_DIR / f"{ctl}.txt").unlink()
+        _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — generation {gen} is served here")
+    except FileNotFoundError:
+        _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
+             f"generation {gen} may be stopped")
+    except OSError as e:
+        _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({e})")
 
 
 def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> bool:
@@ -3948,9 +3967,14 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         return True
     wire_tid = _broker_tid(tid)
     if _ATTEMPTS.fence(wire_tid, {**err, "error_code": code})["new"] and published:
-        _queue_cancel_instruction(tid, code)
+        _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(tid, code))
     _ATTEMPTS.cancel_ack(wire_tid)
     return True
+
+
+def _note_fence_ctl(wire_tid: str, code: str, ctl: "str | None") -> None:
+    if ctl and code == "stale_execution_generation":
+        _ATTEMPTS._update(wire_tid, fence_ctl=ctl)
 
 
 def _queue_cancel_instruction(tid: str, reason: str) -> "str | None":
@@ -3976,7 +4000,8 @@ def _fence_attempt(wire_tid: str, error: dict) -> None:
         return
     verdict = _ATTEMPTS.fence(wire_tid, error)
     if verdict["new"] and verdict["cancel"]:
-        _queue_cancel_instruction(_local_tid(wire_tid), str(error.get("error_code")))
+        code = str(error.get("error_code"))
+        _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(_local_tid(wire_tid), code))
     _ATTEMPTS.cancel_ack(wire_tid)
 
 
