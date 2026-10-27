@@ -2412,7 +2412,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
-                "platform_card")
+                "platform_card",
+                # A room question this agent is asked: one line of quoted room data (branch below).
+                "room_question")
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -4821,6 +4823,10 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
             if isinstance(pc, dict) and all(k in pc for k in _PLATFORM_CARD_KEYS):
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
+        elif f == "room_question":
+            rq_line = task_attempts.render_room_question(task.get(f))
+            if rq_line:
+                lines.append(rq_line)
         elif f == "picker_command":
             # Present but unusable (empty OR null) reaches the parser as a
             # refused stamp; dropping it lets prose decide an unstamped action.
@@ -4843,6 +4849,9 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
     if TURN_CONTEXT:
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
+        answer_rule = task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))
+        if answer_rule:
+            lines.append(answer_rule)
     # A relay-stamped Signal task may attach from ITS OWN output directory only;
     # name it here (absolute) so the marker written is the one the guard confines.
     if sender_tier == "team" and isinstance(task.get("signal"), dict):

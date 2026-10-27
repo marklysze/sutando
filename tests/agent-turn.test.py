@@ -390,5 +390,35 @@ class ResultFileDecision(unittest.TestCase):
                          {"status": "failed", "no_send": True})
 
 
+
+class AnswerOutcomes(unittest.TestCase):
+    """An answer to another task's question never rules this task's turn."""
+
+    def recs(self, *outcomes):
+        intents = [{"record_type": at.INTENT, "turn_id": "t", "seq": o["seq"],
+                    "operation_id": o["operation_id"], "action": "room.question.answer"} for o in outcomes]
+        return at.TurnRecords(intents, list(outcomes), True, (), False)
+
+    def test_another_tasks_input_ready_does_not_suspend_this_one(self):
+        other = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(other), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(other), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_its_own_input_ready_still_suspends_it(self):
+        own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        self.assertEqual(at.classify_turn(self.recs(own), task_id="tsk_me").outcome, at.DURABLY_SUSPENDED)
+        untagged = _outcome("t", 1, phase="input_ready")
+        self.assertEqual(at.classify_turn(self.recs(untagged), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED, "an outcome without a task_id is the turn's own")
+
+    def test_another_tasks_terminal_or_reconciled_outcome_does_not_settle_this_one(self):
+        other = {**_outcome("t", 1, phase="completed", terminal=True), "task_id": "tsk_asker"}
+        self.assertNotEqual(at.classify_turn(self.recs(other), task_id="tsk_me").outcome, at.TERMINAL_CONFIRMED)
+        rec = {**_outcome("t", 2, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(), reconciled=[rec], task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+
 if __name__ == "__main__":
     unittest.main()
