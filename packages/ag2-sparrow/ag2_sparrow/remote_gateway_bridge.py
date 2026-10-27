@@ -371,6 +371,7 @@ TASKS_DIR = _task_dir()
 GATEWAY_REDELIVERY_RESULT = "[no-send] gateway redelivery of already-handled task\n"
 DISPATCH_LOST_RESULT = "[no-send] the task left the queue before the agent answered it\n"
 STALLED_RESULT = "[no-send] the agent stopped working on the task without answering it\n"
+STALE_CANCEL_RESULT = "[no-send] the agent stopped the task on a cancel meant for its earlier attempt\n"
 
 
 RESULTS_DIR = _result_dir()
@@ -3946,6 +3947,7 @@ def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
         (TASKS_DIR / f"{ctl}.txt").unlink()
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — generation {gen} is served here")
     except FileNotFoundError:
+        _ATTEMPTS._update(wire_tid, taken_ctl=ctl)
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
              f"generation {gen} may be stopped")
     except OSError as e:
@@ -4018,6 +4020,7 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
     wire = {_broker_tid(t) for t in inflight}
     for wire_tid in wire:
         _resolve_stop(wire_tid)
+        _resolve_taken_cancel(wire_tid)
         _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
         _watch_dispatch(wire_tid)
     for err in _ATTEMPTS.post_task_beats(wire):
@@ -4066,6 +4069,22 @@ def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> None:
         return
     _log(f"task {tid}: {why} — posting it as failed")
     wake_outbound()
+
+
+def _resolve_taken_cancel(wire_tid: str) -> None:
+    """Once the core has handled an older generation's cancel: a newer attempt it left with no
+    result and no queued task file is posted as failed; one it still answers posts normally."""
+    rec = _ATTEMPTS.get(wire_tid)
+    ctl = rec.get("taken_ctl")
+    if not ctl or not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
+        return
+    tid = _local_tid(wire_tid)
+    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid):
+        _ATTEMPTS._update(wire_tid, taken_ctl=None)
+    elif not _task_pending(tid):
+        _ATTEMPTS._update(wire_tid, taken_ctl=None)
+        _fail_unanswered(wire_tid, tid, STALE_CANCEL_RESULT,
+                         "a cancel meant for its earlier attempt stopped it with no result")
 
 
 def _resolve_stop(wire_tid: str) -> None:

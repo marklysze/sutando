@@ -139,6 +139,50 @@ class Hooks(unittest.TestCase):
         self.assertTrue(taken.exists())
         self.assertTrue(any("already taken" in m for m in self.logs))
 
+    def taken_stale_cancel(self, tid):
+        """Generation 1 fenced, its cancel taken by the core, then generation 2 acked here."""
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": "stale_execution_generation"}]}}))
+        gw._post_heartbeat({tid}, force=True)
+        ctl = self.controls(tid)[0]
+        ctl.unlink()
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2), "/v1/results": {"ok": True},
+                                       "/v1/tasks/heartbeat": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{tid}.txt").unlink(missing_ok=True))
+        return fake, ctl.stem
+
+    def test_a_newer_generation_stopped_by_the_taken_cancel_is_posted_as_failed(self):
+        tid = "task-regen-stopped"
+        fake, ctl = self.taken_stale_cancel(tid)
+        gw._post_task_beats({tid}, force=True)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "the core has not handled the cancel yet")
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]\n")
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{ctl}.txt").unlink(missing_ok=True))
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALE_CANCEL_RESULT)
+        self.assertFalse(gw._ATTEMPTS.beating({tid}))
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "stopped", no_send=True))
+        post = fake.posted("/v1/results")[0]
+        self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 2))
+
+    def test_a_newer_generation_the_core_still_answers_posts_its_own_result(self):
+        tid = "task-regen-answered"
+        _, ctl = self.taken_stale_cancel(tid)
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]\n")
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{ctl}.txt").unlink(missing_ok=True))
+        gw._post_task_beats({tid}, force=True)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "its task file is still queued")
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text("the answer\n")
+        (gw.TASKS_DIR / f"{tid}.txt").unlink()
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), "the answer\n")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("taken_ctl"))
+
     def test_two_cancels_in_one_millisecond_both_reach_the_core(self):
         with mock.patch.object(gw.time, "time", return_value=1761500000.0):
             gw._queue_cancel_instruction("task-h5a", "task_cancelled")
