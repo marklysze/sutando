@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One agent's gateway bridge under sparrowd, from the declaration its claude-local install wrote.
+"""One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
 
 A declaration is data the agent's own session could write, so it chooses nothing: everything the
 bridge runs with is derived from the declaration's path segment (`<agents>/<segment>.bridge/`) by the
@@ -38,10 +38,13 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from ag2_sparrow import agent_identity, gateway_credential_sources as _sources  # noqa: E402
-from ag2_sparrow.adapters.claude_code import cli as adapter  # noqa: E402
+from ag2_sparrow import connect_bridge as adapter  # noqa: E402
+from ag2_sparrow.adapters.claude_code.shape import LOCAL as CLAUDE_LOCAL  # noqa: E402
 from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
+from ag2_sparrow.adapters.codex.connect_cli import COMMAND as CODEX_LOCAL_COMMAND  # noqa: E402
 
-WRITTEN_BY = f"{adapter.COMMAND} install"
+WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
+WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install")
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 SUFFIX = ".bridge"
 MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
@@ -113,8 +116,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         decl = json.loads(raw.decode("utf-8"))
     except (ValueError, RecursionError) as e:  # UnicodeDecodeError is a ValueError
         return None, f"{path}: malformed ({type(e).__name__})"
-    if not isinstance(decl, dict) or decl.get("written_by") != WRITTEN_BY:
-        return None, f"{path}: not written by {WRITTEN_BY}"
+    if not isinstance(decl, dict) or decl.get("written_by") not in WRITERS:
+        return None, f"{path}: not written by {' or '.join(WRITERS)}"
     env = decl.get("env")
     mxid = env.get("AGENT_MXID") if isinstance(env, dict) else None
     try:
@@ -126,6 +129,8 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     seat = _sources.is_seat(env)
+    if not seat and decl["written_by"] != WRITTEN_BY:
+        return None, f"{path}: {decl['written_by']} declares only a seat's bridge"
     want_env, problem = seat_env(root, mxid) if seat else (adapter.bridge_env(root, mxid), "")
     if problem:
         return None, f"{path}: {problem}"
@@ -150,15 +155,15 @@ def bridge_environ(decl: dict, token: str, base=None, url: str = "") -> dict:
     """What the bridge runs under: sparrowd's environment minus the host-only variables, every name the
     owner lists for a host's gateway tokens and endpoints and every key it carries, plus the derived env, an empty owner
     DM, the owner's carried config (resolved here, from the host's files if need be) and the agent's token
-    (with `url`, the agent's own gateway from endpoint(), when the token embeds none). A seat's is the
-    derived env alone: its credential is its own token file, so no token, URL or carried config is added."""
+    (with `url`, the agent's own gateway from endpoint(), when the token embeds none). A seat's is an
+    allowlist: the adapter's seat_child_env, its derived env over a few safe host names and nothing else."""
+    host = os.environ if base is None else base
+    if is_seat(decl):
+        return adapter.seat_child_env(decl["env"], host)
     # The carried keys come only from the owner's result below, never from the generic base.
     strip = _sources.bridge_strip_keys() + _sources.BRIDGE_CARRIED_CONFIG
-    host = os.environ if base is None else base
     env = {k: v for k, v in host.items() if k not in HOST_ONLY and k not in strip}
     env.update(decl["env"], REMOTE_PROACTIVE_ROOM="")
-    if is_seat(decl):
-        return env
     token_env = _sources.bridge_token_environ(token, url)
     env.update(_sources.bridge_carried_config(host, read_regular))
     env.update(token_env)
