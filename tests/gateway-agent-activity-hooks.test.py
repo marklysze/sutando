@@ -588,6 +588,20 @@ class Hooks(unittest.TestCase):
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 1))
 
+    def test_an_attempt_the_broker_still_holds_is_failed_not_dropped_from_flight(self):
+        tid = "task-archived-long-ago"
+        fake, clock = self.held_then_archived(tid)
+        old = time.time() - 2 * gw.ARCHIVE_COMPLETION_GRACE_S
+        os.utime(gw.TASKS_DIR / "archive" / f"{tid}.txt", (old, old))
+        inflight = {tid}
+        gw._reconcile_abandoned(inflight, gw._reconcile_abandoned(inflight, set()))
+        self.assertEqual(inflight, {tid}, "a live attempt is not completed elsewhere")
+        self.assertFalse(any("dropped abandoned" in m for m in self.logs))
+        self.beat(tid)
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S
+        self.assertFalse(self.beat(tid))
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+
     def test_a_task_put_back_in_the_queue_resets_the_clock(self):
         tid = "task-requeued"
         _, clock = self.held_then_archived(tid)
