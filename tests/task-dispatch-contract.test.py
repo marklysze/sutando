@@ -779,6 +779,22 @@ class MainDispatchTest(unittest.TestCase):
         (self.results_dir / "task-b.txt").write_text("   \n")
         self.assertEqual(self._run("has-result", str(self.results_dir), "task-b.txt")[0], 1)
 
+    def test_a_result_older_than_the_queued_file_answered_an_earlier_turn(self):
+        # A wake rewrites the same task file after its first turn's result was archived.
+        old = self.results_dir / "archive" / "2026-10" / "task-a.txt"
+        _write(old)
+        task = self.tasks_dir / "task-a.txt"
+        task.write_text("id: task-a\ntask: resumed\n")
+        os.utime(old, (time.time() - 60, time.time() - 60))
+        has = ("has-result", str(self.results_dir), "task-a.txt")
+        self.assertEqual(self._run(*has)[0], 0, "without the file, any result answers")
+        self.assertEqual(self._run(*has, "--task-file", str(task))[0], 1)
+        (self.results_dir / "task-a.txt").write_text("this turn's answer\n")
+        self.assertEqual(self._run(*has, "--task-file", str(task))[0], 0)
+        self.assertEqual(self._run(*has, "--task-file", str(self.tasks_dir / "gone.txt"))[0], 0,
+                         "an unreadable task file filters nothing")
+        self.assertEqual(self._run(*has, "--task-file")[0], 2)
+
     def test_sort_by_priority_orders_by_tier_then_mtime(self):
         low = self.tasks_dir / "task-low.txt"
         normal = self.tasks_dir / "task-normal.txt"

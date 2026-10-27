@@ -23,7 +23,7 @@ cleanup.
 
 CLI, for bash callers with only an interpreter path:
 
-    task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
+    task_dispatch.py has-result <results_dir> <filename> [--task-file P]  # exit 0/1
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
     task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
@@ -148,13 +148,28 @@ def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | st
     return not Path(payload).exists() and not has_ready_result(results_dir, filename)
 
 
-def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
+def has_ready_result(results_dir: "Path | str", filename: str, *,
+                     task_file: "Path | str | None" = None) -> bool:
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
     An empty or whitespace-only file — live or archived — is not a delivery and
-    does not stop the search; `find_ready_result` walks past it.
+    does not stop the search; `find_ready_result` walks past it. With `task_file`,
+    a result older than that file answered an earlier turn of the same id, not this one.
     """
-    return find_ready_result_for_filename(results_dir, filename) is not None
+    reader = read_ready_result
+    since = _mtime(task_file) if task_file is not None else None
+    if since is not None:
+        def reader(path):
+            written = _mtime(path)
+            return None if written is not None and written < since else read_ready_result(path)
+    return find_ready_result_for_filename(results_dir, filename, reader=reader) is not None
+
+
+def _mtime(path) -> "float | None":
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
 
 
 def ready_result_filenames(results_dir: "Path | str", filenames, *,
@@ -409,7 +424,7 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 
 
 _USAGE = (
-    "usage: task_dispatch.py has-result <results_dir> <filename>\n"
+    "usage: task_dispatch.py has-result <results_dir> <filename> [--task-file P]\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py head-abandoned <results_dir> <filename> <payload>   # exit 0 drop / 1 keep\n"
     "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
@@ -551,10 +566,10 @@ def _main(argv: list[str]) -> int:
         return 2
     cmd, first, second, rest = argv[0], argv[1], argv[2], argv[3:]
     if cmd == "has-result":
-        if rest:
+        if rest and (len(rest) != 2 or rest[0] != "--task-file"):
             print(_USAGE, file=sys.stderr)
             return 2
-        return 0 if has_ready_result(first, second) else 1
+        return 0 if has_ready_result(first, second, task_file=rest[1] if rest else None) else 1
     if cmd == "head-abandoned":
         if len(rest) != 1:
             print(_USAGE, file=sys.stderr)

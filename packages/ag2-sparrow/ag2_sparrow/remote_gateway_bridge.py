@@ -4858,6 +4858,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # closing the Team session route removed the only thing that used to deliver it.
     lines.extend(ag2space_tier_lines(sender_tier, collaborator_enabled, f"results/{tid}.txt"))
     if TURN_CONTEXT:
+        if woken:
+            lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
     # A relay-stamped Signal task may attach from ITS OWN output directory only;
     # name it here (absolute) so the marker written is the one the guard confines.
