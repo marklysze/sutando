@@ -32,6 +32,8 @@ TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
 TASK_HEARTBEAT_INTERVAL_S = 15
 # An attempt whose task file left the queue unanswered, with no turn activity this long, is failed.
 DISPATCH_LOST_S = 600
+# A queued attempt the core engaged and then left with no turn activity or result this long is failed.
+STALLED_S = 1800
 ACTIVITY_TAIL_BYTES = 256 * 1024
 ACTIVE_TASKS_PATH = "/v1/tasks/active"
 PROTOCOL_VERSION = 2
@@ -259,6 +261,13 @@ class TaskAttempts:
             self._update(wire_tid, missing_since=self.now())
             return False
         return self.now() - max(float(since), last_activity or 0.0) >= DISPATCH_LOST_S
+
+    def stalled_due(self, wire_tid: str, queued_at: "float | None", last_activity: "float | None") -> bool:
+        """True once the core engaged this attempt's queued task file (a turn row newer than the file)
+        and then wrote no turn row or result for STALLED_S: its turn ended without answering it."""
+        if not _beats(self.get(wire_tid)) or queued_at is None or last_activity is None:
+            return False
+        return last_activity >= queued_at and self.now() - last_activity >= STALLED_S
 
     def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> None:
         self._update(wire_tid, dispatch_lost=lost)
