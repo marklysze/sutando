@@ -24,7 +24,7 @@ UNREADABLE = "unreadable"
 RETENTION_S = 7 * 86400.0
 #: Hard cap: past it, the oldest records of tasks no longer queued go first.
 MAX_RECORDS = 5000
-_TID = re.compile(r"\Atask-[A-Za-z0-9._-]{1,160}\Z")
+_TID = re.compile(r"\Atask-[A-Za-z0-9._~-]{1,160}\Z")
 
 
 def store_dir(ws: Path) -> Path:

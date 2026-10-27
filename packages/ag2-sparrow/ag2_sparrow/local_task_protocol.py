@@ -253,6 +253,21 @@ def valid_task_id(tid: str) -> bool:
     return bool(TASK_ID_RE.match(tid or ""))
 
 
+# A named gateway instance prefixes its broker's id: `task-<instance>~<task id>`.
+INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def valid_local_task_id(tid) -> bool:
+    """A live task id, or one a named gateway instance owns (`task-<instance>~<task id>`)."""
+    if not isinstance(tid, str):
+        return False
+    if valid_task_id(tid):
+        return True
+    inst, sep, broker = tid[len("task-"):].partition("~")
+    return (tid.startswith("task-") and bool(sep) and INSTANCE_ID_RE.fullmatch(inst) is not None
+            and valid_task_id(broker))
+
+
 def valid_archive_lookup_id(tid: str) -> bool:
     """True iff `tid` is safe to look up as an archived filename stem.
 
