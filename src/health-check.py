@@ -64,6 +64,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
+from channel_env_resolve import resolve_channel_env  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
@@ -6783,17 +6784,9 @@ def _gateway_configured() -> bool:
     try:
         if os.environ.get("REMOTE_TASK_TOKEN") or os.environ.get("AG2_REMOTE_TOKEN"):
             return True
-        gw_env = claude_home_path("channels", "ag2space", ".env")
-        if gw_env.exists():
-            return any(
-                ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN="))
-                # errors="replace" is load-bearing, not cosmetic: without it a
-                # single non-UTF-8 byte raises, the except below swallows it, and a
-                # CONFIGURED gateway reads as unconfigured — which now also silences
-                # the gateway-down warn. Fail-open on a decode error is exactly the
-                # class this PR closes. (Caught in review by Sutando-Pro.)
-                for ln in gw_env.read_text(errors="replace").splitlines()
-            )
+        # Which file defines the token is content, not filename, and the same
+        # owner answers it for startup and for runtime-health.
+        return resolve_channel_env(claude_home_path("channels"), "ag2space") is not None
     except OSError:
         # EXPECTED failures only: the env file is unreadable / the path is bad.
         # Those genuinely mean "cannot confirm a gateway here" -> unconfigured.
@@ -6830,13 +6823,37 @@ def _gateway_lock_pids() -> "dict[str, str]":
     return out
 
 
+def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """WARN when every connection row is on the legacy DotSpace and none on its successor: a
+    terminal-run core is never moved by the desktop and goes silent if the legacy one goes read-only."""
+    import connections  # noqa: PLC0415
+    import dotspace  # noqa: PLC0415
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        # Read the record as it is: list_connections may import or adopt rows, a write.
+        rows = connections._read(connections.record_path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable record is reported by the connections surfaces
+        return None
+    legacy, target = dotspace.LEGACY_SERVER, dotspace.SUCCESSOR_SERVER
+    servers = {dotspace.dotspace_for(str(r.get("server") or ""), fetch=dotspace.NO_FETCH).server for r in rows}
+    if servers != {legacy}:
+        return None
+    inst = connections.instance_for(target)
+    return {"name": "sspace-migration", "status": "warn",
+            "detail": (f"only connected to {legacy}, no {target} connection — get a connect code at "
+                       f"{target}'s agent portal, then from the repo run: python3 scripts/connections.py add "
+                       f"'<code>' && python3 scripts/connections.py promote {inst} --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs" (docs/connections.md, '
+                       f'"Moving a terminal-run core to {target}")')}
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
     local core (and results back up).
 
     Returns None when the mobile gateway is NOT configured (no REMOTE_TASK_TOKEN /
-    AG2_REMOTE_TOKEN in env or channels/ag2space/.env) — a Sutando-only user
+    AG2_REMOTE_TOKEN in env or under channels/ag2space/) — a Sutando-only user
     without the mobile gateway never sees this check. Otherwise: ``warn`` when
     configured-but-not-running (with the delivery impact spelled out) or on a
     duplicate-process pileup, ``ok`` when a single instance is running.
@@ -13443,6 +13460,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
     # a plugin manifest declares its own health_probe; the host checks host
