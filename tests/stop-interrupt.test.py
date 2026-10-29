@@ -23,6 +23,8 @@ import stop_interrupt as si  # noqa: E402
 TARGET = "task-ag2space_dlocal~task-0e542ed29e181e5510"
 BUSY = "✻ Running… (12s · esc to interrupt)\n> "
 IDLE = "> \n  ? for shortcuts"
+DIALOG = ("✻ Running… (40m · esc to interrupt)\n│ Bash command\n│   gh pr merge 1\n│ Do you want to proceed?\n"
+          "│ ❯ 1. Yes\n│   2. No, and tell Claude what to do differently (esc)\n")
 
 
 class FakeTmux:
@@ -127,6 +129,55 @@ class StopInterrupt(unittest.TestCase):
         tmux = FakeTmux()
         self.assertFalse(self.run_it(tmux))
         self.assertEqual(tmux.escapes(), [])
+
+    def tui_card(self, session="sutando-core"):
+        from hitl.cards import manager_for
+        from hitl.schema import HumanRequirement
+        return manager_for(self.ws).create(HumanRequirement(
+            kind="confirmation", runtime="claude", message="waiting", guard=f"g-{session}",
+            subject={"source": "tui", "session": session}, device={"id": session, "name": session}))
+
+    def card_status(self, req):
+        from hitl.cards import manager_for
+        return manager_for(self.ws).get(req.id).status
+
+    def test_a_prompt_parked_past_the_freshness_window_is_answered_with_one_escape(self):
+        self.row(TARGET, age=si.FRESH_S + 600)
+        tmux = FakeTmux(DIALOG.split("\n", 1)[1])
+        self.assertTrue(self.run_it(tmux), "a turn parked on a prompt writes no rows")
+        self.assertEqual(len(tmux.escapes()), 1)
+        self.assertIn("a dialog in the pane holds this task", self.owner_rows()[-1]["line"])
+
+    def test_an_open_terminal_card_waives_the_row_age_and_is_expired_by_the_escape(self):
+        self.row(TARGET, age=si.FRESH_S + 600)
+        req, other = self.tui_card(), self.tui_card("sutando-worker-2")
+        tmux = FakeTmux(DIALOG)
+        self.assertTrue(self.run_it(tmux))
+        self.assertEqual(len(tmux.escapes()), 1)
+        self.assertEqual(self.card_status(req), "expired")
+        self.assertEqual(self.card_status(other), "pending", "another session's card is left alone")
+        self.assertIn("1 terminal prompt card(s) expired", self.owner_rows()[-1]["line"])
+
+    def test_an_open_card_with_an_idle_pane_gets_no_key_and_stays(self):
+        self.row(TARGET, age=si.FRESH_S + 600)
+        req = self.tui_card()
+        tmux = FakeTmux(IDLE)
+        self.assertFalse(self.run_it(tmux))
+        self.assertEqual(tmux.escapes(), [])
+        self.assertEqual(self.card_status(req), "pending")
+
+    def test_a_prompt_parked_on_another_task_gets_no_key(self):
+        self.row("task-other", age=si.FRESH_S + 600)
+        self.tui_card()
+        tmux = FakeTmux(DIALOG)
+        self.assertFalse(self.run_it(tmux))
+        self.assertEqual(tmux.escapes(), [])
+        self.assertEqual([c for c in tmux.calls if "capture-pane" in c], [], "the pane is not even read")
+
+    def test_a_dialog_quoted_above_the_turn_row_is_not_live(self):
+        self.assertTrue(si.live_dialog(DIALOG))
+        self.assertFalse(si.live_dialog("│ ❯ 1. Yes\n✻ Running… (3s · esc to interrupt)\n"))
+        self.assertFalse(si.live_dialog(None))
 
     def test_delivery_rows_and_its_own_rows_never_count_as_the_session_turn(self):
         self.row(TARGET)

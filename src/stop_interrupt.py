@@ -3,8 +3,11 @@
 mid-turn on exactly the cancelled task. Every other case stays cooperative (the queued
 CANCEL_INSTRUCTION is read when the turn ends).
 
-The task is "current" when the newest row the session's own hooks wrote names it and is fresh;
-the pane is mid-turn when it shows Claude Code's `esc to interrupt`. A task a pool worker holds
+The task is "current" when the newest row the session's own hooks wrote names it and is fresh,
+or names it at any age while a terminal dialog holds the session (an open TUI requirement for it,
+or a live dialog on the pane): a turn parked on a prompt writes no rows. The pane is mid-turn when
+it shows Claude Code's `esc to interrupt` or that live dialog; the Escape answers the dialog, and
+the session's open TUI requirements are then expired. A task a pool worker holds
 is interrupted only by that worker's own watcher. One Escape per cancelled task, ever; each
 decision is logged to the watcher's stderr and as an owner row in the activity log.
 
@@ -26,6 +29,7 @@ from typing import Callable
 from activity_bus import ActivityStore, LifecycleTransition
 from activity_rows import append as append_row
 from activity_rows import task_from_file
+from delivery.pane_gate import AWAIT_HINT, live_tail
 from delivery.task_dispatch import worker_holds
 from local_task_protocol import find_archived_result
 from result_markers import parse_markers
@@ -41,13 +45,19 @@ MARKER_DIR = ("state", "stop-interrupts")
 
 def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str | None:
     """The task the newest session-hook row names, when that row is fresh; else None."""
+    task, ts = newest_task(workspace)
+    return task if ts is not None and 0 <= now - ts <= fresh_s else None
+
+
+def newest_task(workspace: Path) -> "tuple[str | None, float | None]":
+    """(task, ts) of the newest session-hook row, at any age; (None, None) when there is none."""
     try:
         with open(workspace / "state" / "agent-activity.jsonl", "rb") as fh:
             fh.seek(0, os.SEEK_END)
             fh.seek(max(0, fh.tell() - TAIL_BYTES))
             lines = fh.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        return None
+        return None, None
     for line in reversed(lines):
         try:
             rec = json.loads(line)
@@ -59,8 +69,39 @@ def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str |
         task, ts = rec.get("task"), rec.get("ts")
         if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
             continue
-        return task.get("id") if 0 <= now - ts <= fresh_s else None
-    return None
+        return task.get("id"), ts
+    return None, None
+
+
+def live_dialog(pane_text: str | None) -> bool:
+    """A dialog below the pane's last turn row is waiting for a key."""
+    return bool(pane_text) and any(AWAIT_HINT.search(ln) for ln in live_tail(pane_text.splitlines()))
+
+
+def _session() -> str:
+    return os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
+
+
+def _tui_requirements(workspace: Path, session: str) -> tuple:
+    """The manager and the session's open TUI requirements; (None, []) without a readable store."""
+    try:
+        from hitl.cards import manager_for
+        manager = manager_for(workspace)
+        return manager, [r for r in manager.active()
+                         if (r.subject or {}).get("source") == "tui" and (r.subject or {}).get("session") == session]
+    except Exception:
+        return None, []
+
+
+def _expire(manager, reqs: list) -> int:
+    n = 0
+    for r in reqs:
+        try:
+            manager.expire(r.id)
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 def decide(target: str, *, current: str | None, held_elsewhere: bool,
@@ -72,6 +113,8 @@ def decide(target: str, *, current: str | None, held_elsewhere: bool,
         return False, f"the session is on {current or 'no task'}, not {target}"
     if pane_text is None:
         return False, "the pane could not be read"
+    if live_dialog(pane_text):
+        return True, "a dialog in the pane holds this task"
     if not ESC_PROMPT.search(pane_text):
         return False, "no turn is running in the pane"
     return True, "the pane is mid-turn on this task"
@@ -121,10 +164,14 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     """Decide, send at most one Escape, and log the decision. True when Escape was sent."""
     now = time.time() if now is None else now
     sock = os.environ.get("SUTANDO_TMUX_SOCKET") or os.environ.get("SUTANDO_TMUX_SOCK") or "/tmp/sutando-tmux.sock"
+    newest, _ = newest_task(workspace)
     current = current_task(workspace, now)
+    manager, reqs = _tui_requirements(workspace, _session()) if newest == target else (None, [])
     held = _held_elsewhere(workspace, tasks_dir, target)
-    pane = _pane_target(sock, run) if current == target and not held else None
+    pane = _pane_target(sock, run) if newest == target and not held else None
     text = run(["tmux", "-S", sock, "capture-pane", "-p", "-J", "-t", pane]) if pane else None
+    if newest == target and (reqs or live_dialog(text)):
+        current = target                    # parked on a prompt: no rows are written, so age is moot
     send, why = decide(target, current=current, held_elsewhere=held, pane_text=text)
     if send and not _claim(workspace, target):
         send, why = False, "already interrupted once for this task"
@@ -134,6 +181,8 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
                     "-S", sock, "-t", pane, "--", "Escape"]) is not None
         why = why if sent else f"{why}, but the key could not be sent"
         send = sent
+        if send and reqs:
+            why = f"{why}; {_expire(manager, reqs)} terminal prompt card(s) expired"
     line = f"Stop: {'interrupted the running turn' if send else 'left the turn to finish'} ({why})"
     log(f"stop-interrupt: {target}: {line}")
     _log_row(workspace, tasks_dir, target, line, now)
