@@ -9,7 +9,7 @@
 # Fire-and-forget through the skill's own writer (which decides whether the file names a room);
 # it must never delay or fail the emit, and it is inert when TASKS_DIR is unset (tests, probes).
 # The scheduler owns the task's lifecycle: QUEUED when the file lands, RUNNING once a live core was
-# told, CANCELLED for the task a CANCEL_INSTRUCTION names. Through the activity bus (state, then rows),
+# told, a stop request for the task a CANCEL_INSTRUCTION names. Through the activity bus (state, then rows),
 # fire-and-forget: it can neither delay nor fail the emit, and it is inert when TASKS_DIR is unset.
 # `$2` is a basename (joined to TASKS_DIR) or an absolute resolved path: rejoining
 # an absolute one to TASKS_DIR would read an existing payload as missing.
@@ -36,9 +36,12 @@ activity_cancel_target() {
 	[ -n "$task_file" ] && [ -f "$task_file" ] || return 0
 	local bus="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/activity_bus.py"
 	[ -f "$bus" ] || return 0
-	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._-]+$' | head -1)"
+	target="$(grep -oE 'CANCEL_INSTRUCTION:[[:space:]]*stop processing[[:space:]]+task-[A-Za-z0-9._~-]+' "$task_file" 2>/dev/null | grep -oE 'task-[A-Za-z0-9._~-]+$' | head -1)"
 	[ -n "$target" ] || return 0
-	( "${SUTANDO_PY_BIN:-python3}" "$bus" transition CANCELLED --task-id "$target" --reason "cancel requested" >/dev/null 2>&1 & ) 2>/dev/null || true
+	# Escape to this pane only when it is mid-turn on the named task, then CANCELLED once the stop is confirmed.
+	local stop="$(dirname "$bus")/stop_interrupt.py"
+	[ ! -f "$stop" ] || ( "${SUTANDO_PY_BIN:-python3}" "$stop" "$target" --tasks-dir "${TASKS_DIR_ABS:-$TASKS_DIR}" --control-file "$task_file" >/dev/null & ) || true
+	( "${SUTANDO_PY_BIN:-python3}" "$bus" stop-requested --task-id "$target" >/dev/null 2>&1 & ) 2>/dev/null || true
 	return 0
 }
 queued_activity_row() { activity_transition QUEUED "$1"; activity_cancel_target "$1"; }

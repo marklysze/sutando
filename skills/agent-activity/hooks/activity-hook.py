@@ -34,7 +34,8 @@ WRITER = Path(__file__).resolve().parent.parent / "scripts" / "activity.py"  # l
 SKIP_TOOLS = {"Read", "Glob", "Grep", "TodoWrite"}
 MAXLEN = 100
 TEXT_MAX = 240
-TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w-]*"  # chat tasks in, bookkeeping out
+# `~` joins a gateway instance to its broker id (task-<instance>~task-<id>).
+TASK_ID = r"task-(?!cron-|bench-|workstream-|project-grouping-)[A-Za-z0-9][\w~-]*"  # chat tasks in, bookkeeping out
 TASK_REF = re.compile(rf"\b{TASK_ID}\b")
 
 
