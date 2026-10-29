@@ -110,7 +110,7 @@ class ViewTests(unittest.TestCase):
         return asyncio.run(self.disp.handle(method, params))
 
     def test_list_is_empty_without_a_record(self):
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]})
 
     def test_list_on_an_empty_record_imports_the_channel_file_token_through_the_view_vault(self):
         home = self.ws / "claude-home"
@@ -128,7 +128,7 @@ class ViewTests(unittest.TestCase):
         self.assertEqual((preview["server"], preview["agent_mxid"], preview["verified"], preview["authenticated"]),
                          ("alpha-fixture.net", "@sutando:alpha-fixture.net", True, True))
         self.assertEqual(preview["gateway_url"], "https://chat.alpha-fixture.net")
-        self.assertEqual(self.call("connection.list"), {"connections": []}, "a preview saves nothing")
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]}, "a preview saves nothing")
         self.assertEqual(self.vault.store, {})
 
         out = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net",
@@ -149,6 +149,49 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(self.vault.store[row["token_ref"]], TOKEN_A, "an existing server is left as is")
         self.assertEqual(len(self.call("connection.list")["connections"]), 1)
 
+    def test_add_starts_the_new_bridge_and_leaves_the_primary_routing(self):
+        first = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.assertEqual((first["launch"]["ok"], self.spawned), (True, ["alpha-fixture-net"]))
+        envs = []
+        self.view.spawn = lambda argv, env, log: envs.append(env) or DEAD_PID
+        with mock.patch.dict(os.environ, {"REMOTE_PROACTIVE_ROOM": "!room"}):
+            second = self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.assertEqual(second["launch"]["instance"], "beta-fixture-net")
+        self.assertEqual([e["GATEWAY_INSTANCE"] for e in envs], ["beta-fixture-net"], "the second lane starts beside the first")
+        self.assertEqual(envs[0]["REMOTE_PROACTIVE_ROOM"], "", "only the primary carries the proactive room")
+        self.assertEqual(connections.primary_instance(self.ws), "alpha-fixture-net")
+        self.assertEqual(second["connection"]["running"], False)
+
+    def test_add_reports_a_failed_start_with_its_reason(self):
+        def broken(argv, env, log):
+            raise OSError("no python")
+        self.view.spawn = broken
+        out = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.assertEqual((out["created"], out["launch"]["ok"], out["launch"]["reason"]), (True, False, "launch_failed"))
+        self.assertEqual((out["connection"]["state"], out["connection"]["reason"]), ("failed", "launch_failed"))
+
+    def test_add_does_not_start_a_bridge_that_already_holds_the_lease(self):
+        from _helpers import bridge_lease
+        holder = bridge_lease.start(self.ws, "alpha-fixture-net")
+        try:
+            out = self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+            self.assertEqual((out["launch"]["lease"], self.spawned), ("already_running", []))
+            self.assertTrue(out["connection"]["running"])
+        finally:
+            bridge_lease.stop(holder)
+
+    def test_disconnect_stays_down_and_reconnect_starts_now(self):
+        self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.call("connection.disconnect", instance="beta-fixture-net")
+        self.assertEqual([e["instance"] for e in connections.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net"],
+                         "a relaunch of every lane leaves the disconnected one down")
+        again = self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.assertIsNone(again["launch"], "re-adding a parked row does not start it")
+        self.spawned.clear()
+        out = self.call("connection.reconnect", instance="beta-fixture-net")
+        self.assertEqual((out["launch"]["ok"], self.spawned), (True, ["beta-fixture-net"]))
+
     def test_promoting_off_a_running_legacy_primary_is_a_conflict_naming_the_restart(self):
         from _helpers import bridge_lease
         connections.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
@@ -165,6 +208,48 @@ class ViewTests(unittest.TestCase):
         self.assertIn("restart.sh --stop-only", str(cm.exception))
         self.assertEqual(connections.primary_instance(self.ws), "", "nothing moved")
 
+    def test_promote_moves_the_primary_off_a_running_legacy_bridge_and_unpark_brings_it_back(self):
+        from _helpers import bridge_lease
+        started = []
+        inner = bridge_lease.spawner(self.ws, started=started)
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            status = self.ws / "state" / f"gateway-status.{env['GATEWAY_INSTANCE']}.json"
+            status.parent.mkdir(parents=True, exist_ok=True)
+            status.write_text(json.dumps({"pid": proc.pid, "connected": True}))
+            return proc
+        self.view.spawn, self.view.kill = spawn, None
+        connections.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        connections.add_connection(TOKEN_B, added_by="owner", expected_server="beta-fixture.net", workspace=self.ws,
+                                   vault=self.vault, preview=connections.preview_connection(TOKEN_B, fetch=self.gateway,
+                                                                                            getaddrinfo=public_getaddrinfo))
+        legacy = bridge_lease.start(self.ws, "")
+        try:
+            out = self.call("connection.promote", instance="beta-fixture-net")
+            legacy.wait(5)
+            self.assertEqual((out["connection"]["primary"], out["previous"], out["stopped_pid"], out["changed"],
+                              out["relaunch_needed"]), (True, "", legacy.pid, True, False))
+            self.assertEqual(out["launch"]["pid"], started[0].pid)
+            listed = {r["instance"]: r for r in self.call("connection.list")["connections"]}
+            self.assertEqual((listed[""]["state"], listed[""]["reason"], listed[""]["parked"]), ("parked", "parked", True))
+            out = self.call("connection.unpark", instance="")
+            self.assertEqual((out["connection"]["parked"], out["launch"]), (False, None))
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.promote", instance="")
+            self.assertEqual(cm.exception.code, CONFLICT)
+            self.assertTrue(str(cm.exception).startswith("legacy_bridge_not_running"))
+        finally:
+            bridge_lease.stop(legacy)
+            for proc in started:
+                bridge_lease.stop(proc)
+
+    def test_promote_and_unpark_of_an_unknown_instance_are_invalid_params(self):
+        for method in ("connection.promote", "connection.unpark"):
+            with self.assertRaises(ProtocolError) as cm:
+                self.call(method, instance="nope")
+            self.assertEqual(cm.exception.code, -32602, method)
+
     def test_confirm_against_a_moved_identity_is_a_conflict(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]
         self.assertEqual((preview["server"], preview["verified"]), ("alpha-fixture.net", True))
@@ -174,12 +259,13 @@ class ViewTests(unittest.TestCase):
         self.assertTrue(str(cm.exception).startswith("mismatch"))
         self.assertIn("alpha-fixture.net", str(cm.exception))
         self.assertNotIn("secret-alpha", str(cm.exception))
-        self.assertEqual(self.call("connection.list"), {"connections": []})
+        self.assertEqual(self.call("connection.list"), {"connections": [], "capabilities": ["legacy_readopt"]})
         self.assertEqual(self.vault.store, {})
 
     def test_status_state_and_set_primary(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         (self.ws / "state" / "gateway-status.alpha-fixture-net.json").write_text(
             json.dumps({"connected": True, "last_ok_ts": 42}))
         listed = self.call("connection.list")["connections"]
@@ -196,6 +282,7 @@ class ViewTests(unittest.TestCase):
     def test_remove_leaves_the_other_connection_alone(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         self.call("connection.reconnect", instance="alpha-fixture-net")
         self.call("connection.reconnect", instance="beta-fixture-net")
         with self.assertRaises(ProtocolError) as cm:
@@ -212,6 +299,7 @@ class ViewTests(unittest.TestCase):
     def test_reconnect_launches_exactly_that_bridge(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         out = self.call("connection.reconnect", instance="beta-fixture-net")
         self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["launch"]["stopped_pid"]), (True, DEAD_PID, 0))
         self.assertEqual(self.spawned, ["beta-fixture-net"])
@@ -221,6 +309,7 @@ class ViewTests(unittest.TestCase):
     def test_disconnect_keeps_the_row_and_reconnect_resumes_it(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         with self.assertRaises(ProtocolError) as cm:
             self.call("connection.disconnect", instance="alpha-fixture-net")
         self.assertEqual(cm.exception.code, CONFLICT)
@@ -228,12 +317,12 @@ class ViewTests(unittest.TestCase):
         out = self.call("connection.disconnect", instance="beta-fixture-net")
         row = out["connection"]
         self.assertEqual((row["instance"], row["disabled"], row["state"], row["reason"]),
-                         ("beta-fixture-net", True, "disconnected", "disabled"))
+                         ("beta-fixture-net", True, "parked", "disabled"))
         self.assertNotIn("secret-", json.dumps(out))
         self.assertIn("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", self.vault.store, "the token stays")
         listed = self.call("connection.list")["connections"]
         self.assertEqual([(r["instance"], r["disabled"], r["state"]) for r in listed],
-                         [("alpha-fixture-net", False, "pending"), ("beta-fixture-net", True, "disconnected")])
+                         [("alpha-fixture-net", False, "pending"), ("beta-fixture-net", True, "parked")])
         self.assertEqual([r.get("agent_display_name") for r in listed], [None, None], "identity fields are spelled out")
         out = self.call("connection.reconnect", instance="beta-fixture-net")
         self.assertEqual((out["launch"]["ok"], self.spawned), (True, ["beta-fixture-net"]))
@@ -247,6 +336,7 @@ class ViewTests(unittest.TestCase):
     def test_update_token_replaces_the_secret_or_answers_conflict(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         self.call("connection.disconnect", instance="beta-fixture-net")
         with self.assertRaises(ProtocolError) as cm:
             self.call("connection.update_token", instance="beta-fixture-net", token=TOKEN_A)
@@ -280,6 +370,7 @@ class ViewTests(unittest.TestCase):
     def test_token_state_unknown_is_a_conflict_with_the_same_code(self):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         refusal = connections.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
         with mock.patch.object(connections, "update_token", side_effect=refusal):
             with self.assertRaises(ProtocolError) as cm:
@@ -294,6 +385,7 @@ class ViewTests(unittest.TestCase):
         import os
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.spawned.clear()
         self.gateway.agents["https://rejecting-fixture.net"] = "reject"
         with self.assertRaises(ProtocolError) as cm:
             self.call("connection.add", token="https://rejecting-fixture.net|bad", confirm=True,

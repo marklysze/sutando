@@ -96,8 +96,16 @@ def fetch(url, token, address=None):
 DEAD_PID = 4_194_404
 
 
+# Set while a promote runs: the spawned bridge also reports the gateway poll promote waits for.
+CONNECTS = []
+
+
 def spawn(argv, env, log_path):
     SPAWNED.append(env["GATEWAY_INSTANCE"])
+    if CONNECTS:
+        status = WS / "state" / f"gateway-status.{env['GATEWAY_INSTANCE']}.json"
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({"pid": DEAD_PID, "connected": True}))
     return DEAD_PID
 
 
@@ -172,6 +180,8 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("DELETE", "/api/v1/connections/x?force=1", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
                            ("GET", "/api/v1/connections/known-servers", None),
+                           ("POST", "/api/v1/connections/x/promote", {}),
+                           ("POST", "/api/v1/connections/x/unpark", {}),
                            ("POST", "/api/v1/connections/x/disconnect", {}),
                            ("POST", "/api/v1/connections/x/reconnect", {}),
                            ("POST", "/api/v1/connections/x/token", {"token": TOKEN_A})):
@@ -202,7 +212,7 @@ for origin in ("https://evil-fixture.net", "null", "http://localhost.evil-fixtur
     check(f"no CORS grant is echoed to {origin}", "Access-Control-Allow-Origin" not in h, h)
 check("nothing was stored by the refused requests", (FakeVault.store, SPAWNED) == ({}, []))
 s, b, _ = req("GET", "/api/v1/connections")
-check("nothing was stored by the refused requests (record)", b == {"connections": []}, b)
+check("nothing was stored by the refused requests (record)", b == {"connections": [], "capabilities": ["legacy_readopt"], "no_primary": False}, b)
 
 print("== CORS: echo the loopback Origin only, never * ==")
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"})
@@ -233,7 +243,7 @@ check("preview names the registered, identity-confirmed server",
       (p.get("server"), p.get("server_source"), p.get("verified")) == ("alpha-fixture.net", "identity", True), p)
 check("preview carries no secret", no_secret(b))
 s, b, _ = req("GET", "/api/v1/connections")
-check("a preview saves nothing", b == {"connections": []})
+check("a preview saves nothing", b == {"connections": [], "capabilities": ["legacy_readopt"], "no_primary": False})
 
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True})
 check("confirm without expected_server is 400", s == 400, f"{s} {b}")
@@ -255,6 +265,10 @@ s, b, _ = req("POST", "/api/v1/connections", {"token": "https://chat.alpha-fixtu
 check("an existing connection is 200 created:false", s == 200 and (b or {}).get("created") is False, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta-fixture.net"})
 check("a second server is 201 and not primary", s == 201 and not b["connection"]["primary"], f"{s} {b}")
+check("confirm started each new bridge, the existing one again while it was down",
+      SPAWNED == ["alpha-fixture-net", "alpha-fixture-net", "beta-fixture-net"] and b["launch"]["ok"] is True, (SPAWNED, b))
+check("the second lane does not take the primary", b["connection"]["primary"] is False and b["connection"]["running"] is False, b)
+SPAWNED.clear()
 
 print("== refusals the review asked for ==")
 s, b, _ = req("POST", "/api/v1/connections", {"token": "https://rejecting-fixture.net|bad", "confirm": True,
@@ -329,13 +343,15 @@ check("DELETE known-servers is 405, never a removal", s == 405, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/disconnect", {})
 check("disconnecting the primary is 409 primary_cannot_disconnect", (s, b) == (409, {"error": "primary_cannot_disconnect"}), f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
-check("disconnect is 200 with the disabled row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
-      b["connection"]["reason"]) == (True, "disconnected", "disabled"), f"{s} {b}")
+check("disconnect is 200 with the parked row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
+      b["connection"]["reason"]) == (True, "parked", "disabled"), f"{s} {b}")
+check("a restart's launch plan leaves the parked row down",
+      [e["instance"] for e in C.launch_plan({}, workspace=WS)] == ["alpha-fixture-net"])
 check("disconnect leaks no secret", no_secret(b))
 check("the token stays in the vault", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET" in FakeVault.store)
 s, b, _ = req("GET", "/api/v1/connections")
 check("the list shows the flag and the state", [(r["instance"], r["disabled"], r["state"]) for r in b["connections"]]
-      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "disconnected")], b)
+      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "parked")], b)
 check("every row spells out the identity fields", all(k in r for r in b["connections"] for k in C.IDENTITY_FIELDS))
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
 check("disconnecting twice is still 200", s == 200 and b["connection"]["disabled"] is True, f"{s} {b}")
@@ -421,6 +437,29 @@ check("exactly one primary after the move", [r["primary"] for r in b["connection
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/reconnect", {})
 check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == DEAD_PID, f"{s} {b}")
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
+CONNECTS.append(True)
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/promote", {})
+check("promote is 200 naming the parked row", s == 200 and (b["connection"]["primary"], b["previous"], b["changed"],
+      b["relaunch_needed"]) == (True, "beta-fixture-net", True, False), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the old primary is parked, not removed", [(r["instance"], r["primary"], r["parked"], r["reason"]) for r in b["connections"]]
+      == [("alpha-fixture-net", True, False, None), ("beta-fixture-net", False, True, "parked")], b)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/unpark", {})
+check("unpark is 200 and starts the bridge", s == 200 and b["connection"]["parked"] is False and b["launch"]["ok"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("a promote back is 200", s == 200 and b["previous"] == "alpha-fixture-net", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("promoting the primary again changes nothing", s == 200 and (b["changed"], b["previous"]) == (False, None), f"{s} {b}")
+CONNECTS.clear()
+with C._transaction(WS) as rec:
+    rec[C.LEGACY_PARKED_KEY] = True
+s, b, _ = req("POST", "/api/v1/connections/legacy/unpark", {})
+check("POST /connections/legacy/unpark reaches the legacy row (instance '')", s == 200 and
+      (b["connection"]["instance"], b["connection"]["legacy"], b["connection"]["parked"], b["launch"]) == ("", True, False, None),
+      f"{s} {b}")
+check("and clears its park", C.legacy_parked(WS) is False)
+s, b, _ = req("GET", "/api/v1/connections")
+check("named rows say legacy false", [r["legacy"] for r in b["connections"]] == [False, False], b)
 s, b, _ = req("DELETE", "/api/v1/connections/beta-fixture-net")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")
 s, b, h = req("DELETE", "/api/v1/connections/alpha-fixture-net")
@@ -444,6 +483,21 @@ check("a refusing vault is 503 vault_unavailable", (s, b) == (503, {"error": "va
 api.connections_http = lambda method, path, body, query=None: _real(
     method, path, body, query, vault=FakeVault(), fetch=fetch, spawn=spawn, getaddrinfo=public_getaddrinfo)
 
+print("== a vault refusal while starting the added bridge ==")
+_real_launch_env = C.launch_env
+def _refusing_launch_env(*_a, **_kw):
+    raise C.VaultUnavailable("secret vault not importable (ImportError)")
+C.launch_env = _refusing_launch_env
+try:
+    s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
+finally:
+    C.launch_env = _real_launch_env
+check("the add still succeeds with the saved row", s in (200, 201) and (b or {}).get("connection", {}).get("instance") == "alpha-fixture-net", f"{s} {b}")
+check("its launch is a failed record naming the class",
+      ((b or {}).get("launch") or {}).get("ok") is False and b["launch"].get("reason") == "vault_unavailable", f"{b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the row persists", "alpha-fixture-net" in [r["instance"] for r in (b or {}).get("connections") or []], f"{s} {b}")
+
 print("== SUTANDO_API_TOKEN, when set, is the bearer ==")
 api.API_TOKEN = "operator-token"
 s, b, _ = req("GET", "/api/v1/connections")
@@ -451,6 +505,24 @@ check("the minted token stops working once the operator set one", s == 401, f"{s
 s, b, _ = req("GET", "/api/v1/connections", auth="Bearer operator-token")
 check("the operator's token reads", s == 200, f"{s} {b}")
 api.API_TOKEN = ""
+
+print("== a fresh code for the legacy row's server is adopted into a named row ==")
+C.record_path(WS).unlink()
+FakeVault.store.clear()
+C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.alpha-fixture.net|rotated"}, workspace=WS, vault=FakeVault())
+s, b, _ = req("GET", "/api/v1/connections")
+check("the list names the capability the client gates its reconnect button on",
+      s == 200 and b["capabilities"] == ["legacy_readopt"] and [r["instance"] for r in b["connections"]] == [""], f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"})
+check("the paste is a 201 create of a named row, not 'already connected'",
+      s == 201 and b["created"] is True and b["connection"]["instance"] == "alpha-fixture-net"
+      and b["connection"]["legacy"] is False, f"{s} {b}")
+check("the secret is in the vault under the new row's key", FakeVault.store.get("AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET") == TOKEN_A)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the legacy row is retired and parked for its launchers",
+      [r["instance"] for r in b["connections"]] == ["alpha-fixture-net"] and C.legacy_parked(WS), b)
+C.record_path(WS).unlink()
+FakeVault.store.clear()
 
 print("== DELETE elsewhere ==")
 s, b, _ = req("DELETE", "/task")
@@ -515,6 +587,15 @@ check("the imported secret went to the vault, never the response",
 check("the row is persisted", (WS / "state" / "connections.json").is_file())
 s, b, _ = req("GET", "/api/v1/connections")
 check("a later GET lists the same row from the record", [r["token_ref"] for r in (b or {}).get("connections", [])] == ["REMOTE_TASK_TOKEN"], b)
+check("a record with a primary says so", (b or {}).get("no_primary") is False, b)
+
+print("== rows with no primary are reported, so the panel can ask for one ==")
+(WS / "state" / "connections.json").unlink()
+C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
+                  workspace=WS, vault=FakeVault())
+s, b, _ = req("GET", "/api/v1/connections")
+check("two named rows and no primary list with no_primary true",
+      s == 200 and len((b or {}).get("connections", [])) == 2 and b.get("no_primary") is True, f"{s} {b}")
 
 server.server_close()
 print()
