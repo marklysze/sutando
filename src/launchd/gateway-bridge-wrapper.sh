@@ -1,5 +1,5 @@
 #!/bin/bash
-# Wrapper for the launchd-managed ag2.space gateway bridge
+# Wrapper for the launchd-managed gateway bridge
 # (src/remote-gateway-bridge.py).
 #
 # Why a wrapper (not a bare ProgramArguments python3 call): the bridge needs
@@ -176,6 +176,22 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
+  # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
+  # resume on its own once the row is unparked.
+  if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
+    [ "${_PARKED_SAID:-0}" = 1 ] || echo "[gateway-bridge-wrapper] the legacy connection is parked; waiting for unpark" >&2
+    _PARKED_SAID=1
+    rm -f "$MARKER"
+    sleep "$RESTART_DELAY" &
+    CHILD_PID=$!
+    set +e
+    wait "$CHILD_PID"
+    set -e
+    CHILD_PID=''
+    continue
+  fi
+  [ "${_PARKED_SAID:-0}" = 1 ] && { echo "[gateway-bridge-wrapper] the legacy connection is unparked; launching" >&2; date +%s > "$MARKER"; }
+  _PARKED_SAID=0
   # Once a named row holds the primary this legacy bridge is a secondary: it must not
   # inherit the proactive room, or two bridges post nudges. Otherwise the variable is
   # passed through as is, unset included: the bridge reads the device env only when unset.
@@ -197,6 +213,8 @@ while [ "$STOPPING" = 0 ]; do
   set -e
   CHILD_PID=''
   [ "$STOPPING" = 0 ] || break
+  # Stopped by a primary move (or stood down on it): no alert, and the loop above waits.
+  python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1 && continue
   [ "$CHILD_RC" -eq 75 ] && { stop_agents_supervisor; rm -f "$MARKER"; exit 0; }
   # rc 69 is the bridge's poll-stall exit: an outage, already in its log and status file.
   if [ "$CHILD_RC" -eq 69 ]; then

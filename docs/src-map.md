@@ -123,7 +123,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
 - **`install-cron-runner-launchd.sh`** — Install / uninstall the launchd-supervised cron-runner job.
-- **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
+- **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, whichever lane saw it first.
@@ -155,6 +155,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
+- **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
@@ -380,6 +381,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/hitl/`
 
 - **`__init__.py`** — _(no header comment)_
+- **`cards.py`** — Owner decision cards: one builder for a choice request and one store handle per workspace.
 - **`detector.py`** — Claude readiness detector — the Requirement Detector half of the runtime supervisor, and the one-state ClaudeTuiDriver v0 (AUTH_REQUIRED only).
 - **`events.py`** — Ingest RuntimeEvents dropped by the runtime drivers (the desktop watchdog's `hitl_events.rs`) into the HumanRequirement Manager.
 - **`host.py`** — The machine a requirement's terminal is on: the per-host label, "" when unreadable.
@@ -397,7 +399,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
-- **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed ag2.space gateway bridge (src/remote-gateway-bridge.py).
+- **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`
 
@@ -472,7 +474,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`agents_view.py`** — Read-only agent discovery over the per-host liveness directory.
 - **`capability_registry.py`** — Provider-neutral, ephemeral read-capability registry.
-- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / disconnect / reconnect / update_token.
+- **`connections_view.py`** — Connections surface for the Sutando Server: connection.list / known_servers / add / remove / set_primary / promote / unpark / disconnect / reconnect / update_token.
 - **`dispatcher.py`** — Runtime-API request-domain dispatch, separated from socket transport.
 - **`ha_adapter.py`** — runtime-api ↔ human-action adapter, over the HITL Requirement store.
 - **`identity_source.py`** — Where the identity surface reads from, and the one IdentityView built from it.

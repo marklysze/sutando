@@ -1258,6 +1258,10 @@ def _handle_hitl_action(task: dict):
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
+    if out == "refused":
+        if getattr(handler, "last_branch", None) == "fallback":
+            return False
+        return "refused:" + (getattr(handler, "last_reason", "") or "not at owner tier")
     if out == "applied" and getattr(handler, "last_turn", False):
         # Recorded, and the requirement asked for a turn: the same relay task goes on to
         # the core (idempotent by id) with a header saying it is a click, not an order.
@@ -1471,6 +1475,17 @@ def _is_redelivery_control(body: str) -> bool:
 DELIVERY_SKIP_AFTER_CHANNEL = True
 
 
+def _team_task_media_root(tid: str, tier) -> "str | None":
+    if tier != "team":
+        return None
+    delivery = _delivery_tid(tid)
+    media_modes = _load_task_media() if delivery is not None else None
+    if (media_modes is not None
+            and (media_modes.get(_broker_tid(delivery)) or {}).get("mode") == "task-media"):
+        return str(RESULTS_DIR / delivery)
+    return None
+
+
 def _guarded_result_body(tid: str, body: str):
     """Scan a non-owner result BEFORE any marker is interpreted.
 
@@ -1507,16 +1522,8 @@ def _guarded_result_body(tid: str, body: str):
                 "source_message_id", "user_id")}
         except OSError:
             pass
-    # 5G ⑤a-cap: a TEAM task whose sidecar says task-media may attach from the DELIVERY
-    # task's `<results>/<id>/` (a dedup requeue carries the original's instruction).
-    attach_roots: tuple = ()
-    if tier == "team":
-        _delivery_for_media = _delivery_tid(tid)
-        _media_modes = _load_task_media() if _delivery_for_media is not None else None
-        if (_media_modes is not None
-                and (_media_modes.get(_broker_tid(_delivery_for_media)) or {}).get("mode")
-                == "task-media"):
-            attach_roots = (str(RESULTS_DIR / _delivery_for_media),)
+    root = _team_task_media_root(tid, tier)
+    attach_roots = (root,) if root else ()
     verdict = classify(
         body, tier, None, secret_filter=filter_chat_secrets,
         scan_sensitive_data=scan_sensitive_data, attach_roots=attach_roots)
@@ -1599,13 +1606,13 @@ def _claude_local_store_root() -> Path:
     return store_root(_STATE)
 
 
-def _project_claude_local(mods, room: str, log=print) -> list:
+def _project_claude_local(mods, room: str, log=print):
     """Project the claude-local root's cards into the owner DM (the room filled on the
     requirement under the store lock when the launcher could not know it)."""
     manager_mod, projector, _ = mods
     root = _claude_local_store_root()
     if not root.is_dir():
-        return []
+        return projector.ProjectionPass([], [], [])
     store = manager_mod.HitlStore(root)
     manager = manager_mod.HitlManager(store, policy=None)
     with store.locked():
@@ -1617,8 +1624,9 @@ def _project_claude_local(mods, room: str, log=print) -> list:
                     sub["room"] = room
                 store.save(req, store.projection(req.id))
     if not projector.pending_ids(manager):
-        return []
-    return projector.project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
+        return projector.ProjectionPass([], [], [])
+    return projector.project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
+                                  describe=_http_error_body)
 
 
 def _project_hitl(log=print) -> int:
@@ -1630,8 +1638,8 @@ def _project_hitl(log=print) -> int:
     calling this every pulse re-sends nothing; it is the driver that was
     missing, not the machinery.
     """
-    if GATEWAY_INSTANCE:
-        return 0  # only the primary gateway (launched without GATEWAY_INSTANCE) projects the owner's cards
+    if not owns_unaddressed():
+        return 0  # only the primary gateway projects the owner's cards
     room = resolve_destination(OWNER_PRIVATE)  # a runtime prompt is the owner's, whatever room raised it
     if not room:
         _held("the runtime prompt card")
@@ -1644,26 +1652,42 @@ def _project_hitl(log=print) -> int:
             return 0
         manager_mod, projector, _ = mods
         HitlManager, HitlStore, default_store = manager_mod.HitlManager, manager_mod.HitlStore, manager_mod.default_store
-        pending_ids, project = projector.pending_ids, projector.project
+        pending_ids, project_pass = projector.pending_ids, projector.project_pass
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
         log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
-    done, failed, raised = [], False, None
+    done, refused, gave_up, failed, raised = [], [], [], False, None
     # Each store gets its pass: a stuck card in one never holds back the other's.
-    try:
-        if pending_ids(manager):
-            got = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room)
-            done, failed = list(got or []), not got
-    except Exception as e:  # noqa: BLE001 — re-raised below, after the claude-local pass
-        failed, raised = True, e
-    try:
-        done += _project_claude_local(mods, room, log)
-    except Exception as e:  # noqa: BLE001 — re-raised below
-        failed, raised = True, raised or e
+    for drive in ("default", "claude-local"):
+        try:
+            if drive == "claude-local":
+                got = _project_claude_local(mods, room, log)
+            elif pending_ids(manager):
+                got = project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
+                                   describe=_http_error_body)
+            else:
+                continue
+        except Exception as e:  # noqa: BLE001 — re-raised below, after both passes
+            failed, raised = True, raised or e
+            got = getattr(e, "projection", None)  # a pass that accepted nothing still reports its cards
+            if not isinstance(got, projector.ProjectionPass):
+                continue
+        done += got.done
+        refused += got.refused
+        gave_up += got.failed
+        # A pass whose every send was rejected; one card's own refusal is not the relay's.
+        failed = failed or (drive == "default" and not (got.done or got.refused or got.failed))
     for req_id, event_id in done:
         log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    for req_id, attempt, error, delay in refused:
+        log(f"hitl: card {req_id} refused by the relay ({error}), attempt {attempt}/"
+            f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
+    for req_id, revision, error in gave_up:
+        log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
+            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
         if raised is not None:
@@ -1682,8 +1706,11 @@ def _hitl_reply_handler(owner_mxid: str, log=print):
             return None
         manager_mod, _, replies = mods
         workspace = _STATE.parent
-        return replies.HitlReplyHandler(manager_mod.HitlManager(manager_mod.HitlStore(manager_mod.default_store(workspace))),
-                                        owner_mxid, workspace=workspace, log=log)
+        return replies.HitlReplyHandler(
+            manager_mod.HitlManager(manager_mod.HitlStore(manager_mod.default_store(workspace))),
+            owner_mxid, workspace=workspace, log=log,
+            authorize=lambda ev: _click_owner_problem(
+                owner_mxid, str(ev.get("actor_id") or ""), ev.get("access_tier")))
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
         log(f"hitl: reply handler unavailable ({diagnostics.describe(e)}); card clicks will not be applied")
         return None
@@ -1764,6 +1791,8 @@ def _hitl_control_body(hitl_out) -> str:
     if out.startswith(REARM_PENDING):
         return (f"Recorded: keep waiting. The new card could not be raised yet ({out[len(REARM_PENDING):]}); "
                 "the launcher completes it at its next reconcile.")
+    if out.startswith("refused:"):
+        return f"That click did not apply: {out[8:]}."
     if out.startswith("rejected:"):
         return f"That click did not apply: the card had already moved ({out[9:]}). Please use the current card."
     if out.startswith("cancelled:"):
@@ -1921,6 +1950,12 @@ PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
 # Host-injected () -> bool, asked once right after the poller lease is taken: False drops
 # PROACTIVE_ROOM, so a bridge spawned before another became primary never carries it too.
 PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
+# Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
+# None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
+OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected () -> reason or None, asked once right after the poller lease is taken: a reason
+# stands this bridge down (exit 75) before it polls. None (standalone default) never stands down.
+STAND_DOWN_GATE: Callable[[], "str | None"] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Host-injected task -> reason or None, asked before a fresh task is queued: a reason settles it
 # as a redelivery instead. None (standalone default) queues every fresh task.
@@ -2049,8 +2084,8 @@ def resolve_destination(audience: str, *, room_id: str | None = None,
     reading kept identity-bound on disk across restarts and outages; with no reading it is "" and the
     caller holds the message, never the pinned room. CURRENT_ROOM is the triggering room;
     SELECTED_MEMBERS are explicit recipients (the one list-valued audience); SYSTEM is the
-    configured destination. Eligibility is the instance, never the pin: only the primary (launched
-    without GATEWAY_INSTANCE) owns unaddressed nudges and projects cards."""
+    configured destination. Eligibility is the instance, never the pin: only the primary
+    (`owns_unaddressed`) owns unaddressed nudges and projects cards."""
     if audience == OWNER_PRIVATE:
         refresh_routing()
         return _ROUTING["owner_dm"]
@@ -2061,6 +2096,17 @@ def resolve_destination(audience: str, *, room_id: str | None = None,
     if audience == SYSTEM:
         return PROACTIVE_ROOM or ""
     raise ValueError(f"unknown audience {audience!r}")
+
+
+def owns_unaddressed() -> bool:
+    """Whether this bridge is the primary: the host's answer, else launched without GATEWAY_INSTANCE."""
+    if OWNS_UNADDRESSED is None:
+        return not GATEWAY_INSTANCE
+    try:
+        return bool(OWNS_UNADDRESSED())
+    except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the launch-time rule
+        _log_backoff(("owns-unaddressed", type(e).__name__), f"primary check failed ({diagnostics.describe(e)})")
+        return not GATEWAY_INSTANCE
 
 
 def proactive_room() -> str:
@@ -5511,12 +5557,33 @@ def _task_source(tid: str) -> "str | None":
     return local_task_protocol.parse_task_headers_trusted(text).headers.get("source")
 
 
-def _read_attachment(path_str: str) -> "tuple[str, str, str]":
+# confinement was required but could not be resolved (e.g. task file missing):
+# unlike confine_root=None — the owner's plain-allowlist path — this fails closed.
+_CONFINE_UNRESOLVED = object()
+
+
+def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]":
     """(basename, base64 bytes, "") for an allowlisted readable file, or
     ("", "", reason) — the refusals both upload routes report in-band."""
+    if confine_root is _CONFINE_UNRESOLVED:
+        return "", "", "task provenance unavailable"
     fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
     if not is_path_sendable(fpath):
         return "", "", "path not allowlisted"
+    if confine_root is not None:
+        confined_path = os.path.abspath(os.path.expanduser(path_str.strip()))
+        try:
+            fd = team_result_guard.open_confined_attachment(confined_path, confine_root)
+        except (OSError, ValueError):
+            return "", "", "outside the task's media directory"
+        try:
+            with os.fdopen(fd, "rb") as f:
+                if os.fstat(f.fileno()).st_size > MAX_MEDIA_BYTES:
+                    return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
+                return (os.path.basename(confined_path),
+                        base64.b64encode(f.read()).decode("ascii"), "")
+        except OSError as e:
+            return "", "", f"read failed: {e}"
     try:
         size = os.path.getsize(fpath)
     except OSError as e:
@@ -5547,7 +5614,8 @@ def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple[str, str]":
+def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str,
+                            confine_root=None) -> "tuple[str, str]":
     """Upload one attachment against a Signal task's own lease. Returns
     ("ok"|"note"|"defer", reason).
 
@@ -5555,7 +5623,7 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str) -> "tuple
     an in-band note: the retry has to re-offer the same wire id, ordinal and
     bytes for the relay to resume the upload it may already have recorded.
     """
-    name, content_b64, reason = _read_attachment(path_str)
+    name, content_b64, reason = _read_attachment(path_str, confine_root)
     if reason:
         return "note", reason
     safe_tid = urllib.parse.quote(wire_id, safe="")
@@ -6157,8 +6225,8 @@ def _post_proactive() -> None:
             continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and GATEWAY_INSTANCE:
-            continue  # a named secondary never owns unaddressed nudges; the primary runs without GATEWAY_INSTANCE
+        if route == "send" and peek_room is None and not owns_unaddressed():
+            continue  # a secondary never owns unaddressed nudges
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
@@ -6196,7 +6264,7 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (GATEWAY_INSTANCE or not proactive_room())):
+                route == "send" and room_override is None and (not owns_unaddressed() or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)
@@ -7469,6 +7537,15 @@ def _post_ready_results(inflight: set[str]) -> None:
                 _log(f"delivery deferred for {tid} — media sidecar unreadable")
                 continue
             task_media = (_media.get(_wire) or {}).get("mode") == "task-media"
+            confine_root = None
+            if task_media:
+                task_file = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+                if task_file is None:
+                    # No provenance to resolve confinement from — fail closed.
+                    confine_root = _CONFINE_UNRESOLVED
+                else:
+                    tier = team_result_guard.resolve_access_tier(task_file)
+                    confine_root = _team_task_media_root(tid, tier)
             room = _load_task_rooms().get(tid, "")
             sent = 0
             deferred = False
@@ -7479,7 +7556,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                     sent += 1
                     continue
                 if task_media:
-                    status, reason = _upload_task_attachment(_wire, ordinal, fp)
+                    status, reason = _upload_task_attachment(
+                        _wire, ordinal, fp, confine_root=confine_root)
                 else:
                     ok, reason = (_upload_attachment(room, fp) if room
                                   else (False, "origin room unknown"))
@@ -7968,6 +8046,20 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _stand_down_if_asked() -> None:
+    """Exit 75 (a supervising wrapper does not relaunch) when the host says this bridge must not run."""
+    if STAND_DOWN_GATE is None:
+        return
+    try:
+        reason = STAND_DOWN_GATE()
+    except Exception as e:  # noqa: BLE001 — an unanswerable host keeps the bridge running
+        _log(f"stand-down check failed ({diagnostics.describe(e)}) — running")
+        return
+    if reason:
+        _log(f"standing down: {reason}")
+        sys.exit(75)
+
+
 def _settle_proactive_room() -> None:
     """Ask the host whether this bridge keeps PROACTIVE_ROOM now that it holds the lease."""
     global PROACTIVE_ROOM
@@ -8186,6 +8278,7 @@ def main() -> None:
         sys.exit(75)
     # Heartbeat first: the settle can wait on the connections record lock past the stale window.
     _start_lock_heartbeat()
+    _stand_down_if_asked()
     _settle_proactive_room()
     _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
     atexit.register(_retract_own_lane)
