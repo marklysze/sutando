@@ -432,7 +432,9 @@ A journal line that does not parse makes the journal unreadable (`failed` + `no_
 unterminated last line younger than 30 s, an append in progress, which defers the result.
 
 Each task file then carries one writer-owned line telling the agent to ask a question that blocks
-it with `room.question.ask` on its exact `task_id`. A wake (the same task re-served with
+it with `room.question.ask` on its exact `task_id`, to send anything the room should read with
+`room.message.send` before asking, and that its result file is never posted while the question is
+open (`waiting_input` + `no_send`). A wake (the same task re-served with
 `wake.resolved_blockers` after the answer) runs once per `blocker_episode_id`
 (`state/relay-wake-episodes.json`): it is queued again under the same id, with each answer appended
 to the task's line as quoted room data, and it is acked at the same generation into a new turn.

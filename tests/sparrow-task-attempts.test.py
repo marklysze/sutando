@@ -305,6 +305,11 @@ class Attempts(unittest.TestCase):
         self.assertIn("`room.question.ask`", rule)
         self.assertNotIn("~", rule)
 
+    def test_the_ask_in_room_rule_sends_visible_text_before_asking(self):
+        rule = task_attempts.ask_in_room_rule("tsk_A")
+        self.assertLess(rule.index("`room.message.send`"), rule.index("Then write this task's result file"))
+        self.assertIn("never posted while the question is open", rule)
+
     def test_cancel_task_text_is_the_cores_cancel_signal(self):
         text = task_attempts.cancel_task_text("task-x", "task-ctl-1", "2026-10-26T00:00:00Z",
                                               "task_cancelled")
