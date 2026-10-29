@@ -78,15 +78,28 @@ class Hooks(unittest.TestCase):
         self.assertEqual(rec["execution_generation"], 4)
         self.assertEqual(agent_turn.open_turn_for_task(gw._STATE, "task-h1").stem, rec["turn_id"])
 
-    def test_a_cancelled_ack_stops_the_core_and_is_acknowledged(self):
+    def test_a_cancelled_ack_withdraws_the_untaken_task_and_is_acknowledged(self):
         cancel = _http(409, {"error_code": "task_cancelled", "cancel_requested_generation": 2,
                              "cancel_requested_attempt": 2})
         fake = self.use(FakeGateway(**{"/v1/tasks/task-h2/ack": cancel}))
         self.assertTrue(gw._take_served_task(_task("task-h2"), set(), []))
         self.assertFalse(gw._post_task_ack("task-h2", durable=True))
         self.assertIsNone(agent_turn.open_turn_for_task(gw._STATE, "task-h2"), "no turn")
-        self.assertEqual(len(self.controls("task-h2")), 1, "the published task is not started")
+        self.assertFalse((gw.TASKS_DIR / "task-h2.txt").exists(), "the published task is not started")
+        self.assertEqual(self.controls("task-h2"), [])
         self.assertEqual(fake.posted("/cancel-ack")[0]["cancel_requested_generation"], 2)
+
+    def test_a_cancelled_ack_stops_a_task_the_core_has_taken_up(self):
+        fake = self.use(FakeGateway(**{"/v1/tasks/task-h2t/ack": _http(409, {"error_code": "task_cancelled"}),
+                                       "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._take_served_task(_task("task-h2t"), set(), []))
+        with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.time() + 5, "kind": "processing", "task": {"id": "task-h2t"}}) + "\n")
+        self.assertFalse(gw._post_task_ack("task-h2t", durable=True))
+        self.assertTrue((gw.TASKS_DIR / "task-h2t.txt").exists())
+        self.assertEqual(len(self.controls("task-h2t")), 1, "the core is asked to stop")
+        self.assertTrue(gw._deliver_result_payload("task-h2t", "task-h2t", "late"))
+        self.assertEqual(fake.posted("/v1/results"), [], "its result is settled, never posted")
 
     def test_the_ack_first_path_records_the_generation_or_refuses_a_cancel(self):
         self.use(FakeGateway(**{"/v1/tasks/task-h3/ack": _ack("task-h3", 2)}))

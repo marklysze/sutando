@@ -4002,7 +4002,8 @@ def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
 
 def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> bool:
     """An ack refused with a fencing code: the attempt is fenced, its pending ack retired and,
-    when the task was published, the core stopped. False for any other answer."""
+    when the task was published, its file withdrawn if untaken, else the core stopped. False for
+    any other answer."""
     if _ATTEMPTS is None:
         return False
     code, err = task_attempts.error_code_of(raw)
@@ -4015,8 +4016,8 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         return True
     wire_tid = _broker_tid(tid)
     if _ATTEMPTS.fence(wire_tid, {**err, "error_code": code})["new"] and published:
-        if code in CLOSED_CODES:
-            _withdraw_closed(wire_tid, err)
+        if code in CLOSED_CODES or code == "task_cancelled":
+            _withdraw_closed(wire_tid, {**err, "error_code": code})
         else:
             _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(tid, code))
     _ATTEMPTS.cancel_ack(wire_tid)
