@@ -729,6 +729,7 @@ class Hooks(unittest.TestCase):
         self.assertFalse(self.beat(tid), "no beat holds an attempt nobody will answer")
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
         self.assertTrue(any("posting it as failed" in m for m in self.logs))
+        self.assertEqual(self.controls(tid), [], "a task the core never took has no turn to stop")
         self.assertTrue(gw._deliver_result_payload(tid, tid, "the task left the queue", no_send=True))
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 1))
@@ -820,6 +821,9 @@ class Hooks(unittest.TestCase):
         self.assertFalse(self.beat(tid), "no beat holds a task the core walked away from")
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALLED_RESULT)
         self.assertTrue(any("then wrote no turn activity or result for 30 min" in m for m in self.logs))
+        self.assertEqual(len(self.controls(tid)), 1, "a turn parked on a prompt gets the Stop path's Escape")
+        self.beat(tid)
+        self.assertEqual(len(self.controls(tid)), 1, "asked once")
         self.assertTrue(gw._deliver_result_payload(tid, tid, "stopped working", no_send=True))
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"]), ("failed", True))
