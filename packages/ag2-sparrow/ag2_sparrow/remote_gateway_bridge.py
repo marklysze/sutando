@@ -4140,8 +4140,10 @@ def _watch_dispatch(wire_tid: str) -> None:
         _fail_unanswered(wire_tid, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
                          f"with no turn activity for {task_attempts.DISPATCH_LOST_S // 60} min")
     elif pending and not answered and _ATTEMPTS.stalled_due(wire_tid, _queued_at(tid), activity):
-        _fail_unanswered(wire_tid, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
-                         f"activity or result for {task_attempts.STALLED_S // 60} min")
+        if _fail_unanswered(wire_tid, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
+                            f"activity or result for {task_attempts.STALLED_S // 60} min"):
+            # A turn parked on a terminal prompt is answered by the Stop path's Escape.
+            _queue_cancel_instruction(tid, "stalled")
 
 
 def _queued_at(tid: str) -> "float | None":
@@ -4151,16 +4153,18 @@ def _queued_at(tid: str) -> "float | None":
         return None
 
 
-def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> None:
+def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> bool:
+    """True when this call wrote the failure result."""
     _ATTEMPTS.mark_dispatch_lost(wire_tid)
     written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
     if not written:
         _ATTEMPTS.mark_dispatch_lost(wire_tid, False)
         if written is False:
             _log(f"task {tid}: its failure result could not be written — retried next beat")
-        return
+        return False
     _log(f"task {tid}: {why} — posting it as failed")
     wake_outbound()
+    return True
 
 
 def _resolve_taken_cancel(wire_tid: str) -> None:
