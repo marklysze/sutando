@@ -110,7 +110,7 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len(self.relay.acks), acks, "a wake this client cannot run is not claimed")
         self.assertEqual(len(self.relay.results), 1, "and never answered with a no-send redelivery")
 
-    def test_a_cancelled_ack_stops_the_core_and_is_acknowledged(self):
+    def test_a_cancelled_ack_withdraws_the_untaken_task_and_is_acknowledged(self):
         def on_post(path, payload):
             if path.endswith("/ack"):
                 return 409, {"error": "task cancelled", "error_code": "task_cancelled",
@@ -127,11 +127,9 @@ class Lifecycle(unittest.TestCase):
         body = next(b for p, b in self.relay.post_paths if p.endswith("/cancel-ack"))
         self.assertEqual((body["cancel_requested_generation"], body["cancel_requested_attempt"]), (2, 2))
         self.assertRegex(body["worker_id"], r"^[0-9a-f]{32}$")
-        ctl = list((self.bridges.ws / "tasks").glob("task-ctl-*.txt"))
-        self.assertEqual(len(ctl), 1)
-        text = ctl[0].read_text()
-        self.assertIn("source: relay-control", text)
-        self.assertIn(f"task: CANCEL_INSTRUCTION: stop processing {TID} ", text)
+        self.bridges.wait_logged(proc, "its untaken task file was withdrawn")
+        self.assertFalse((self.bridges.ws / "tasks" / f"{TID}.txt").exists(), "the core never starts it")
+        self.assertEqual(list((self.bridges.ws / "tasks").glob("task-ctl-*.txt")), [])
 
 
 if __name__ == "__main__":
