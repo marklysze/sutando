@@ -232,8 +232,8 @@ def _gateway_configured():
     """Whether a gateway is provisioned on THIS host.
 
     The gateway bridge only runs where an enabled connection row exists or a remote task
-    token is configured (env or channels/ag2space/.env). Returns True (configured), False
-    (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR / unreadable .env).
+    token is configured (env, or any contained file under channels/ag2space/). Returns True
+    (configured), False (config readable, no token), or None (can't tell — no CLAUDE_CONFIG_DIR).
     Mirrors health-check.check_gateway_bridge's detection."""
     if connections.enabled_rows():
         return True
@@ -242,14 +242,13 @@ def _gateway_configured():
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
     if not cfg:
         return None
+    # Delegated so this surface agrees with startup and health-check; imported here because
+    # the resolver pulls in shared/, which a helper loading this file from a bare src copy lacks.
     try:
-        with open(os.path.join(cfg, "channels", "ag2space", ".env")) as f:
-            for ln in f:
-                if ln.startswith(("REMOTE_TASK_TOKEN=", "AG2_REMOTE_TOKEN=")):
-                    return True
-    except OSError:
+        from channel_env_resolve import resolve_channel_env
+        return resolve_channel_env(os.path.join(cfg, "channels"), "ag2space") is not None
+    except (OSError, ImportError):
         return None
-    return False
 
 
 def _gateway_running():
