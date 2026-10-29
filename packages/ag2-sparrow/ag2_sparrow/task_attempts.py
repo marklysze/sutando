@@ -53,8 +53,10 @@ _EPISODE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 ASK_IN_ROOM_RULE = (
     "For a question that blocks THIS task, ask it in this task's room: call `room.action.execute` "
     "with action `room.question.ask`, top-level `task_id` `{task_id}`, and `arguments` `prompt` "
-    "(plus `options` when the answer is a choice). Then write this task's result file with a "
-    "one-line note of what you asked; it is not sent, and the task waits for the answer. Use "
+    "(plus `options` when the answer is a choice). Anything the room should read besides the "
+    "question, send first with `room.message.send`. Then write this task's result file with a "
+    "one-line note of what you asked; it is never posted while the question is open, and the task "
+    "waits for the answer. Use "
     "`ask-owner.py` for every other question (no task, another channel, or the MCP is unreachable).")
 # A wake reuses the task's id and filename, so its file says it is a new turn.
 WAKE_TURN_RULE = (
