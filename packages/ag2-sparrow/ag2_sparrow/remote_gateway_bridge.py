@@ -4017,7 +4017,10 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         return True
     wire_tid = _broker_tid(tid)
     if _ATTEMPTS.fence(wire_tid, {**err, "error_code": code})["new"] and published:
-        _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(tid, code))
+        if code in CLOSED_CODES:
+            _withdraw_closed(wire_tid, err)
+        else:
+            _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(tid, code))
     _ATTEMPTS.cancel_ack(wire_tid)
     return True
 
@@ -4049,10 +4052,41 @@ def _fence_attempt(wire_tid: str, error: dict) -> None:
             _ATTEMPTS._update(wire_tid, stop_ctl=ctl)
         return
     verdict = _ATTEMPTS.fence(wire_tid, error)
+    code = str(error.get("error_code"))
     if verdict["new"] and verdict["cancel"]:
-        code = str(error.get("error_code"))
         _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(_local_tid(wire_tid), code))
+    elif verdict["new"] and code in CLOSED_CODES:
+        _withdraw_closed(wire_tid, error)
     _ATTEMPTS.cancel_ack(wire_tid)
+
+
+CLOSED_CODES = ("task_already_terminal", "task_not_found")
+
+
+def _withdraw_closed(wire_tid: str, error: dict) -> None:
+    """A task the broker closed leaves the inbox if the core has not taken it up; once taken, the
+    core is asked to stop. Its result is settled by the fence either way, never posted."""
+    tid = _local_tid(wire_tid)
+    reason = error.get("reason") or error.get("terminal_reason")
+    why = f"closed on the server ({error.get('error_code')}{f', {reason}' if reason else ''})"
+    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid):
+        return
+    queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{tid}.assigned-*")]
+    activity = task_attempts.last_activity(_STATE, tid)
+    for path in queued:
+        try:
+            if activity is not None and activity >= path.stat().st_mtime:
+                break                           # the core's turn has touched it: taken
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            _log(f"task {tid}: {why}, its task file could not be withdrawn ({diagnostics.describe(e)})")
+            break
+        _log(f"task {tid}: {why} — its untaken task file was withdrawn")
+        return
+    _queue_cancel_instruction(tid, why)
+    _log(f"task {tid}: {why} — the core has taken it up and is asked to stop")
 
 
 _last_task_beat_at = 0.0
@@ -4173,8 +4207,7 @@ def _reconcile_ledger(inflight: "set[str]") -> None:
     wire = {_broker_tid(t) for t in inflight}
     found = _ATTEMPTS.compare_with_server(wire, server)
     for wire_tid in found["closed_on_server"]:
-        _fence_attempt(wire_tid, {"error_code": "task_already_terminal"})
-        _queue_cancel_instruction(_local_tid(wire_tid), "closed on server")
+        _fence_attempt(wire_tid, {"error_code": "task_already_terminal", "reason": "no longer listed active"})
     _durable_write(OUTSTANDING_TASKS_FILE, json.dumps(
         {"checked_at": _last_ledger_reconcile, "tasks": found["missing_locally"]}, sort_keys=True))
     if found["missing_locally"]:
