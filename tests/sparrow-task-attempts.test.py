@@ -305,6 +305,11 @@ class Attempts(unittest.TestCase):
         self.assertIn("`room.question.ask`", rule)
         self.assertNotIn("~", rule)
 
+    def test_the_ask_in_room_rule_sends_visible_text_before_asking(self):
+        rule = task_attempts.ask_in_room_rule("tsk_A")
+        self.assertLess(rule.index("`room.message.send`"), rule.index("Then write this task's result file"))
+        self.assertIn("never posted while the question is open", rule)
+
     def test_render_wake_renders_an_answers_list_answer_by_answer(self):
         text = task_attempts.render_wake("x", {"resolved_blockers": [
             {"question_id": "q1", "outcome": "answered", "answered_by": "@o:x",
