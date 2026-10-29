@@ -258,7 +258,8 @@ class Hooks(unittest.TestCase):
         mock.patch.object(gw, "_last_ledger_reconcile", 0.0).start()
         gw._reconcile_ledger({tid})
         self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "task_already_terminal")
-        self.assertEqual(len(self.controls(tid)), 1, "the core is stopped")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "its untaken file is withdrawn")
+        self.assertEqual(self.controls(tid), [], "nothing for the core to stop")
         self.assertTrue(gw._deliver_result_payload(tid, tid, "answer"), "settled")
         self.assertEqual(fake.posted("/v1/results"), [], "never sent ungated")
 
@@ -315,7 +316,7 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(agent_turn.open_turn_for_task(gw._STATE, "task-late"))
         self.assertEqual(gw._ATTEMPTS.get("task-late")["execution_generation"], 1)
 
-    def test_every_fencing_ack_answer_fences_retires_and_stops_the_core(self):
+    def test_every_fencing_ack_answer_fences_retires_and_stops_or_withdraws(self):
         cases = [(409, "stale_execution_generation"), (404, "stale_execution_generation"),
                  (409, "task_not_found"), (409, "task_already_terminal")]
         for status, code in cases:
@@ -330,9 +331,65 @@ class Hooks(unittest.TestCase):
                 self.assertFalse(gw._post_task_ack(tid, durable=True))
                 self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], code)
                 self.assertNotIn(tid, gw._load_pending_acks(), "its pending ack is retired")
-                self.assertEqual(len(self.controls(tid)), 1, "the core is stopped")
+                closed = code in gw.CLOSED_CODES
+                self.assertEqual(len(self.controls(tid)), 0 if closed else 1, "stopped, or withdrawn untaken")
+                self.assertEqual((gw.TASKS_DIR / f"{tid}.txt").exists(), not closed)
                 self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
                 self.assertEqual(fake.posted("/v1/results"), [], "its result is settled, never posted")
+
+    def closed_by_beat(self, tid, **err):
+        fake = self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": "task_already_terminal", **err}]}, "/v1/results": {"ok": True}}))
+        gw._post_heartbeat({tid}, force=True)
+        return fake
+
+    def test_a_closed_task_the_core_has_not_taken_is_withdrawn_from_the_inbox(self):
+        tid = "task-closed-untaken"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        fake = self.closed_by_beat(tid, reason="question_resolved")
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "the core never runs it")
+        self.assertEqual(self.controls(tid), [])
+        self.assertTrue(any("question_resolved" in m and "withdrawn" in m for m in self.logs))
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
+        self.assertEqual(fake.posted("/v1/results"), [], "nothing reaches the room")
+
+    def test_a_closed_task_the_core_has_taken_up_is_stopped_not_withdrawn(self):
+        tid = "task-closed-taken"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        with open(gw._STATE / "agent-activity.jsonl", "a") as fh:
+            fh.write(json.dumps({"ts": time.time() + 5, "kind": "processing", "task": {"id": tid}}) + "\n")
+        fake = self.closed_by_beat(tid, reason="max_queued_age_exceeded")
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "a file the core is on stays")
+        self.assertEqual(len(self.controls(tid)), 1, "the core is asked to stop")
+        self.closed_by_beat(tid)
+        self.assertEqual(len(self.controls(tid)), 1, "asked once")
+        self.assertTrue(gw._deliver_result_payload(tid, tid, "late"))
+        self.assertEqual(fake.posted("/v1/results"), [])
+
+    def test_a_closed_task_the_core_claimed_first_is_stopped(self):
+        tid = "task-closed-claimed"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        queued = gw.TASKS_DIR / f"{tid}.txt"
+        claimed = queued.with_name(f"{tid}.claimed-core")
+        queued.rename(claimed)
+        self.addCleanup(lambda: claimed.unlink(missing_ok=True))
+        self.closed_by_beat(tid)
+        self.assertTrue(claimed.exists())
+        self.assertEqual(len(self.controls(tid)), 1)
+
+    def test_a_closed_task_already_answered_is_left_to_its_settled_result(self):
+        tid = "task-closed-answered"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        result = gw.RESULTS_DIR / f"{tid}.txt"
+        result.parent.mkdir(parents=True, exist_ok=True)
+        result.write_text("answer")
+        self.addCleanup(lambda: result.unlink(missing_ok=True))
+        self.closed_by_beat(tid)
+        self.assertEqual(self.controls(tid), [])
 
     def test_a_stale_older_lease_with_a_newer_serve_here_is_left_to_the_newer_ack(self):
         tid = "task-reserved"
