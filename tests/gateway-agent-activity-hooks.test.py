@@ -719,6 +719,28 @@ class Hooks(unittest.TestCase):
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 1))
 
+    def test_a_wake_archived_unanswered_is_failed_despite_the_first_attempts_reply(self):
+        tid = "task-lost-wake"
+        task = {"id": tid, "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.assertIsNotNone(gw._write_task(dict(task)))
+        for d in (gw.TASKS_DIR, gw.RESULTS_DIR):
+            (d / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked.")
+        wake = {"blocker_episode_id": "e1", "resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "yes"}}]}
+        self.assertEqual(gw._write_task({**task, "wake": wake}), (tid, True))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        clock = [time.time()]
+        mock.patch.object(gw._ATTEMPTS, "now", lambda: clock[0]).start()
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{tid}.txt").unlink(missing_ok=True))
+        self.beat(tid)
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S
+        self.assertFalse(self.beat(tid), "the first attempt's archived reply does not answer the wake")
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+
     def test_an_attempt_the_broker_still_holds_is_failed_not_dropped_from_flight(self):
         tid = "task-archived-long-ago"
         fake, clock = self.held_then_archived(tid)
@@ -895,6 +917,24 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(gw._write_task({**task, "wake": wake}))
         self.assertEqual(sum("wake for task-h8: not run here" in m for m in self.logs), 1,
                          "logged once per episode, not per re-serve")
+
+    def test_a_wake_for_a_task_stopped_meanwhile_is_withdrawn_unrun(self):
+        task = {"id": "task-h8c", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.assertIsNotNone(gw._write_task(dict(task)))
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / "task-h8c.txt").rename(gw.TASKS_DIR / "archive" / "task-h8c.txt")
+        (gw.RESULTS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.RESULTS_DIR / "archive" / "task-h8c.txt").write_text("I asked.")
+        wake = {"blocker_episode_id": "e1", "resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "yes"}}]}
+        self.assertEqual(gw._write_task({**task, "wake": wake}), ("task-h8c", True))
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True},
+                                       "/v1/tasks/task-h8c/ack": _http(409, {"error_code": "task_cancelled"})}))
+        self.assertFalse(gw._post_task_ack("task-h8c", durable=True))
+        self.assertFalse((gw.TASKS_DIR / "task-h8c.txt").exists(), "the core never runs the wake")
+        self.assertEqual(self.controls("task-h8c"), [])
+        self.assertTrue(gw._deliver_result_payload("task-h8c", "task-h8c", "late"))
+        self.assertEqual(fake.posted("/v1/results"), [], "nothing reaches the room")
 
     def test_an_ack_first_wake_is_left_unacked_and_logged_once(self):
         task = {"id": "task-h11", "task": "hi", "source": "ag2space", "user_id": "@o:x"}

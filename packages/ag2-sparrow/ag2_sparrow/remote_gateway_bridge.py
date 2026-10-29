@@ -4068,7 +4068,7 @@ def _withdraw_closed(wire_tid: str, error: dict) -> None:
     tid = _local_tid(wire_tid)
     reason = error.get("reason") or error.get("terminal_reason")
     why = f"closed on the server ({error.get('error_code')}{f', {reason}' if reason else ''})"
-    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid):
+    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
         return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{tid}.assigned-*")]
     activity = task_attempts.last_activity(_STATE, tid)
@@ -4123,7 +4123,7 @@ def _watch_dispatch(wire_tid: str) -> None:
     then went quiet for STALLED_S with no result. Its beats stop; the failure is posted."""
     tid = _local_tid(wire_tid)
     pending = _task_pending(tid)
-    answered = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid)
+    answered = os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid)
     activity = task_attempts.last_activity(_STATE, tid)
     if _ATTEMPTS.dispatch_lost_due(wire_tid, pending or answered, activity):
         _fail_unanswered(wire_tid, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
@@ -4160,7 +4160,7 @@ def _resolve_taken_cancel(wire_tid: str) -> None:
     if not ctl or not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
         return
     tid = _local_tid(wire_tid)
-    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid):
+    if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
         _ATTEMPTS._update(wire_tid, taken_ctl=None)
     elif not _task_pending(tid):
         _ATTEMPTS._update(wire_tid, taken_ctl=None)
@@ -4179,7 +4179,17 @@ def _resolve_stop(wire_tid: str) -> None:
     tid = _local_tid(wire_tid)
     if os.path.lexists(RESULTS_DIR / f"{tid}.txt"):
         return                                  # delivery rules: a reply posts, nothing to send stops
-    _ATTEMPTS.stop_outcome(wire_tid, stopped=not _delivered_copy_exists(tid))
+    _ATTEMPTS.stop_outcome(wire_tid, stopped=not _own_copy_exists(tid))
+
+
+def _own_copy_exists(tid: str) -> bool:
+    """An archived copy of this attempt's own result. A woken attempt's is its own outbox item:
+    the first attempt's copies are archived under the same id."""
+    item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if not item:
+        return _delivered_copy_exists(tid)
+    root = getattr(_delivery_core().backend, "root", None)
+    return root is not None and read_item(root, item) is not None
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
