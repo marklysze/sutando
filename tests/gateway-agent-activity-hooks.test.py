@@ -136,7 +136,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual((rec["execution_generation"], rec.get("fenced"), rec.get("fence_ctl")), (2, None, None))
         self.assertTrue(any("withdrawn" in m for m in self.logs))
 
-    def test_an_old_cancel_whose_withdrawal_cannot_be_recorded_keeps_the_ack_pending(self):
+    def test_an_old_cancel_the_core_took_is_recorded_before_the_ack_settles(self):
         tid = "task-regen-unrec"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
         gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
@@ -144,17 +144,21 @@ class Hooks(unittest.TestCase):
             {"task_id": tid, "error_code": "stale_execution_generation"}]}}))
         gw._post_heartbeat({tid}, force=True)
         self.assertEqual(len(self.controls(tid)), 1)
+        ctl = self.controls(tid)[0]
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        ctl.rename(gw.TASKS_DIR / "archive" / ctl.name)     # the core took and archived it
         self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
         self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
-        with self.failing_save("relay-task-attempts"):
-            self.assertFalse(gw._post_task_ack(tid, durable=True))
-        self.assertEqual(len(self.controls(tid)), 1, "nothing withdrawn before it is recorded")
+        real = gw._ATTEMPTS._merge
+        with mock.patch.object(gw._ATTEMPTS, "_merge", side_effect=lambda w, f: (
+                ({}, False) if "taken_ctl" in f else real(w, f))):
+            self.assertFalse(gw._post_task_ack(tid, durable=True), "the taken cancel is not recorded")
         self.assertIn(tid, gw._load_pending_acks())
         self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
         gw._retry_pending_acks({tid})
-        self.assertEqual(self.controls(tid), [], "the retry withdraws it")
         rec = gw._ATTEMPTS.get(tid)
-        self.assertEqual((rec["execution_generation"], rec.get("fence_ctl"), rec.get("taken_ctl")), (2, None, None))
+        self.assertEqual((rec["execution_generation"], rec.get("taken_ctl")), (2, ctl.stem),
+                         "the retry records that the core ran it")
         self.assertNotIn(tid, gw._load_pending_acks())
 
     def test_a_cancel_the_core_already_took_is_not_withdrawn(self):
@@ -203,6 +207,23 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload(tid, tid, "stopped", no_send=True))
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"], post["execution_generation"]), ("failed", True, 2))
+
+    def test_a_taken_cancel_keeps_its_marker_until_the_failure_is_recorded(self):
+        tid = "task-regen-unrec"
+        _, ctl = self.taken_stale_cancel(tid)
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]\n")
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{ctl}.txt").unlink(missing_ok=True))
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        real = gw._ATTEMPTS._merge
+        with mock.patch.object(gw._ATTEMPTS, "_merge", side_effect=lambda w, f: (
+                ({}, False) if "dispatch_lost" in f else real(w, f))):
+            gw._post_task_beats({tid}, force=True)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("taken_ctl"), ctl, "kept: the next beat retries")
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALE_CANCEL_RESULT)
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("taken_ctl"))
 
     def test_a_newer_generation_the_core_still_answers_posts_its_own_result(self):
         tid = "task-regen-answered"
@@ -735,7 +756,7 @@ class Hooks(unittest.TestCase):
         return fake, clock
 
     def beat(self, tid):
-        gw._watch_dispatch(tid)
+        gw._post_task_beats({tid}, force=True)
         return gw._ATTEMPTS.beating({tid})
 
     def test_an_attempt_archived_unanswered_is_failed_after_ten_minutes_and_stops_beating(self):
@@ -927,8 +948,9 @@ class Hooks(unittest.TestCase):
         self.beat(tid)
         clock[0] += gw.task_attempts.DISPATCH_LOST_S
         with mock.patch.object(gw, "_write_if_absent", return_value=False):
-            self.assertTrue(self.beat(tid), "not marked lost while its result is unwritten")
+            self.assertFalse(self.beat(tid), "recorded as lost; its result is owed")
         self.assertTrue(any("retried next beat" in m for m in self.logs))
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
         self.assertFalse(self.beat(tid))
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
 
@@ -1194,24 +1216,99 @@ class Hooks(unittest.TestCase):
         self.ran(tid)
         self.posted_once_under_its_generation(fake, tid, inflight)
 
+    def no_ctl_write(self):
+        real = gw._durable_write
+        return mock.patch.object(gw, "_durable_write", side_effect=lambda path, text, *a, **k: (
+            False if path.name.startswith("task-ctl-") else real(path, text, *a, **k)))
+
+    def beat_error(self, tid, code):
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": code}]}}))
+        gw._post_task_beats({tid}, force=True)
+
+    def test_an_ack_first_task_recovers_from_one_failed_contract_write(self):
+        tid = "task-af-contract"
+        contract = gw._ATTEMPTS._contract_path
+        contract.unlink(missing_ok=True)
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+        inflight = set()
+        with self.failing_save("relay-broker-contract"):
+            self.assertFalse(gw._take_ack_first(_task(tid, ack_first=True), inflight, {}))
+        self.assertFalse(contract.exists())
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1, "the generation is saved")
+        self.assertIsNot((gw._load_held() or {})[tid].get("accepted"), True, "kept staged")
+        self.assertTrue(gw._advance_held_tasks(inflight), "the same-generation re-ack repairs the contract")
+        self.assertTrue(contract.exists())
+        self.assertNotIn(tid, gw._load_held() or {})
+        self.ran(tid)
+        self.posted_once_under_its_generation(fake, tid, inflight)
+
     def test_beat_fences_and_stops_act_only_once_recorded(self):
         for code in ("stale_execution_generation", "task_cancelled"):
             with self.subTest(code=code):
                 tid = f"task-unrec-{code.split('_')[0]}"
-                self.assertTrue(gw._take_served_task(_task(tid), set(), []))
                 gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
-                self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
-                    {"task_id": tid, "error_code": code}]}}))
                 with self.failing_save("relay-task-attempts"):
-                    gw._post_heartbeat({tid}, force=True)
+                    self.beat_error(tid, code)
                 self.assertEqual(self.controls(tid), [], "nothing acted on before it is recorded")
                 self.assertFalse(gw._ATTEMPTS.get(tid).get("fenced") or gw._ATTEMPTS.get(tid).get("stop_requested"))
-                gw._post_heartbeat({tid}, force=True)
-                gw._post_heartbeat({tid}, force=True)
+                self.beat_error(tid, code)
+                self.beat_error(tid, code)
                 self.assertEqual(len(self.controls(tid)), 1, "acted on once, when the beat repeats it")
                 rec = gw._ATTEMPTS.get(tid)
                 ctl = rec.get("fence_ctl") or rec.get("stop_ctl")
                 self.assertEqual(self.controls(tid)[0].name, f"{ctl}.txt", "the recorded id is the queued one")
+
+    def test_a_cancel_owed_by_a_fence_or_stop_survives_a_storage_outage(self):
+        for code in ("stale_execution_generation", "task_cancelled"):
+            with self.subTest(code=code):
+                tid = f"task-owed-{code.split('_')[0]}"
+                gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+                with self.no_ctl_write():
+                    self.beat_error(tid, code)
+                    self.assertEqual(self.controls(tid), [])
+                    with self.failing_save("relay-task-attempts"):
+                        self.beat_error(tid, code)
+                self.assertEqual(self.controls(tid), [], "nothing written during the outage")
+                self.beat_error(tid, code)
+                self.beat_error(tid, code)
+                self.assertEqual(len(self.controls(tid)), 1, "storage back: exactly one control")
+                rec = gw._ATTEMPTS.get(tid)
+                self.assertEqual(self.controls(tid)[0].name, f"{rec.get('fence_ctl') or rec.get('stop_ctl')}.txt")
+                self.assertIsNone(rec.get("owed_ctl"))
+
+    def test_a_closed_task_taken_up_is_stopped_after_a_storage_outage(self):
+        tid = "task-owed-closed"
+        self.assertIsNotNone(gw._write_task(_task(tid)))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.claimed-core1")
+        with self.no_ctl_write():
+            self.beat_error(tid, "task_already_terminal")
+        self.assertEqual(self.controls(tid), [])
+        self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "task_already_terminal")
+        self.beat_error(tid, "task_already_terminal")
+        self.assertEqual(len(self.controls(tid)), 1, "the owed cancel is written once storage is back")
+        self.beat_error(tid, "task_already_terminal")
+        self.assertEqual(len(self.controls(tid)), 1)
+
+    def test_a_failure_result_owed_through_a_storage_outage_is_written_once(self):
+        tid = "task-owed-lost"
+        _, clock = self.held_then_archived(tid)
+        self.beat(tid)
+        clock[0] += gw.task_attempts.DISPATCH_LOST_S
+        with mock.patch.object(gw, "_write_if_absent", return_value=False), \
+                self.failing_save("relay-task-attempts"):
+            self.beat(tid)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        with mock.patch.object(gw, "_write_if_absent", return_value=False):
+            self.assertFalse(self.beat(tid), "recorded as lost, its result owed")
+            with self.failing_save("relay-task-attempts"):
+                self.beat(tid)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        self.assertFalse(self.beat(tid))
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+        self.beat(tid)
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
 
     def test_a_dispatch_lost_that_cannot_be_recorded_writes_no_failure(self):
         tid = "task-lost-unrec"

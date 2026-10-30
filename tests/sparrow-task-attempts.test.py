@@ -79,7 +79,7 @@ class Attempts(unittest.TestCase):
         clock[0] += task_attempts.DISPATCH_LOST_S
         self.assertFalse(a.dispatch_lost_due("tsk_A", False, clock[0] - 1), "fresh turn activity")
         self.assertTrue(a.dispatch_lost_due("tsk_A", False, None))
-        a.mark_dispatch_lost("tsk_A")
+        a.mark_dispatch_lost("tsk_A", "failed")
         self.assertFalse(a.beating({"tsk_A"}))
         self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "decided once")
         d = a.result_decision("tsk_A", "x", True)
@@ -386,7 +386,7 @@ class Attempts(unittest.TestCase):
             False if p.name.startswith("relay-task-attempts") else real(p, d)))
         with no_ledger:
             self.assertFalse(a.ack_settled("tsk_L"))
-            self.assertFalse(a.mark_dispatch_lost("tsk_S"))
+            self.assertFalse(a.mark_dispatch_lost("tsk_S", "failed"))
             self.assertEqual(a.fence("tsk_S", {"error_code": "stale_execution_generation"}),
                              {"new": False, "cancel": False, "unsaved": True})
             self.assertFalse(a.request_stop("tsk_S", {"error_code": "task_cancelled"}))

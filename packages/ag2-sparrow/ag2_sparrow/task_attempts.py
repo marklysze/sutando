@@ -227,6 +227,9 @@ class TaskAttempts:
         if type(gen) is not int or gen < 1:
             self.ack_settled(wire_tid)
             return None
+        if not self.broker_names_leases():
+            # Before the same-generation return, so a re-ack repairs a contract write that failed.
+            self._save_json(self._contract_path, {"names_lease_generation": True})
         rec = self.get(wire_tid)
         if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.turn_context
                                                        or not open_turn):
@@ -239,8 +242,6 @@ class TaskAttempts:
                   "awaiting_ack": False}
         if self.turn_context and open_turn:
             fields.update(self._open_turn(wire_tid, gen, rec, agent_mxid))
-        if not self.broker_names_leases():
-            self._save_json(self._contract_path, {"names_lease_generation": True})
         return self._update(wire_tid, **fields)
 
     def broker_names_leases(self) -> bool:
@@ -336,8 +337,9 @@ class TaskAttempts:
         window = STALLED_S if core_motion == "idle" else STALLED_UNOBSERVED_S
         return last_activity >= queued_at and self.now() - last_activity >= window
 
-    def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> bool:
-        return self._set(wire_tid, dispatch_lost=lost)
+    def mark_dispatch_lost(self, wire_tid: str, body: str) -> bool:
+        """Stop the attempt's beats; `body` is the failure result it owes until one is written."""
+        return self._set(wire_tid, dispatch_lost=body)
 
     def beating(self, wire_tids) -> bool:
         """Whether any of these attempts is due per-task beats."""
@@ -367,7 +369,8 @@ class TaskAttempts:
         rec = self.get(wire_tid)
         if rec.get("stop_requested") or rec.get("fenced"):
             return False
-        if not self._set(wire_tid, stop_requested=True, stop_ctl=stop_ctl,
+        owed = {"owed_ctl": {"id": stop_ctl, "reason": "task_cancelled"}} if stop_ctl else {}
+        if not self._set(wire_tid, stop_requested=True, stop_ctl=stop_ctl, **owed,
                          cancel_requested_generation=error.get("cancel_requested_generation"),
                          cancel_requested_attempt=error.get("cancel_requested_attempt")):
             self.log(f"task {wire_tid}: Stop not recorded — asked again on the next beat")

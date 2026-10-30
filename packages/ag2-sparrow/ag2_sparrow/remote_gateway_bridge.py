@@ -3996,20 +3996,25 @@ def _withdraw_stale_cancel(wire_tid: str, before: dict, gen: "int | None") -> bo
     ctl, old = before.get("fence_ctl"), before.get("execution_generation")
     if not ctl or gen is None or type(old) is not int or gen <= old:
         return True
-    if not _ATTEMPTS._set(wire_tid, fence_ctl=None, taken_ctl=ctl):
+    if (before.get("owed_ctl") or {}).get("id") == ctl and not _ctl_written(ctl):
+        if _ATTEMPTS._set(wire_tid, fence_ctl=None, owed_ctl=None):
+            _log(f"task {wire_tid}: cancel {ctl} for generation {old} dropped before it was written")
+            return True
+        return False
+    if not _ATTEMPTS._set(wire_tid, fence_ctl=None, taken_ctl=ctl, owed_ctl=None):
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} not recorded — the ack is retried")
         return False
     try:
         (TASKS_DIR / f"{ctl}.txt").unlink()
     except FileNotFoundError:
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
-             f"generation {gen} may be stopped")
+             "the newer generation may be stopped")
         return True
     except OSError as e:
         _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({diagnostics.describe(e)})")
         return True
     _ATTEMPTS._set(wire_tid, taken_ctl=None)    # left set, it waits on a result that never comes
-    _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — generation {gen} is served here")
+    _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — a newer generation is served here")
     return True
 
 
@@ -4028,25 +4033,25 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         _log(f"task ack for {tid}: an older lease was refused; the newer serve here is acked instead")
         return True
     wire_tid = _broker_tid(tid)
-    queue = published and code not in CLOSED_CODES and code != "task_cancelled"
-    ctl = _new_ctl_id() if queue and code == "stale_execution_generation" else None
-    verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **({"fence_ctl": ctl} if ctl else {}))
+    owed = _fence_owes(wire_tid, code, {**err, "error_code": code}) if published else {}
+    verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **owed)
     if verdict.get("unsaved"):
         return True                             # its pending ack is kept: the retry is fenced again
     _forget_pending_ack(tid, lease_id)
     if verdict["new"] and published:
-        if not queue:
-            _withdraw_closed(wire_tid, {**err, "error_code": code})
-        else:
-            _queue_fence_cancel(wire_tid, tid, code, ctl)
+        _settle_owed(wire_tid)
     _ATTEMPTS.cancel_ack(wire_tid)
     return True
 
 
-def _queue_fence_cancel(wire_tid: str, tid: str, code: str, ctl: "str | None") -> None:
-    """Queue the fence's cancel under the id the fence recorded; one never written is unrecorded."""
-    if _queue_cancel_instruction(tid, code, ctl) is None and ctl:
-        _ATTEMPTS._set(wire_tid, fence_ctl=None)
+def _fence_owes(wire_tid: str, code: str, error: dict) -> dict:
+    """What a new fence owes the core, saved in the fence's own write: a closed task's withdrawal,
+    else a cancel under an id fixed now (a stale generation's is kept for a newer one to withdraw)."""
+    if code in CLOSED_CODES or code == "task_cancelled":
+        return {"owed_close": _closed_why(error)}
+    ctl = _new_ctl_id()
+    return {"owed_ctl": {"id": ctl, "reason": code},
+            **({"fence_ctl": ctl} if code == "stale_execution_generation" else {})}
 
 
 def _new_ctl_id() -> str:
@@ -4062,39 +4067,69 @@ def _queue_cancel_instruction(tid: str, reason: str, ctl: "str | None" = None) -
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     if not _durable_write(TASKS_DIR / f"{ctl}.txt",
                           task_attempts.cancel_task_text(tid, ctl, stamp, reason)):
-        _log(f"task {tid}: cancel instruction not written — the core may finish a fenced attempt")
+        _log(f"task {tid}: cancel instruction not written — retried next beat")
         return None
     return ctl
+
+
+def _ctl_written(ctl: str) -> bool:
+    """The control task is queued, taken, answered or archived: writing it again would repeat it."""
+    return (_task_pending(ctl) or _archived_task_file(ctl) is not None
+            or os.path.lexists(RESULTS_DIR / f"{ctl}.txt") or _delivered_copy_exists(ctl))
+
+
+def _settle_owed(wire_tid: str) -> None:
+    """Carry out what a saved fence, Stop or failure still owes. Each marker is cleared only once
+    its work is done, so a failed write is retried by the next beat."""
+    rec, tid = _ATTEMPTS.get(wire_tid), _local_tid(wire_tid)
+    if rec.get("owed_close"):
+        _withdraw_closed(wire_tid, str(rec["owed_close"]))
+        rec = _ATTEMPTS.get(wire_tid)
+    owed = rec.get("owed_ctl")
+    if isinstance(owed, dict) and isinstance(owed.get("id"), str):
+        ctl = owed["id"]
+        if _ctl_written(ctl) or _queue_cancel_instruction(tid, str(owed.get("reason")), ctl):
+            _ATTEMPTS._set(wire_tid, owed_ctl=None)
+    body = rec.get("dispatch_lost")
+    if isinstance(body, str) and not (os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid)):
+        written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
+        if written:
+            _log(f"task {tid}: its owed failure result is written — posting it as failed")
+            wake_outbound()
+        elif written is False:
+            _log_backoff((tid, "lost-unwritten"), f"task {tid}: its failure result could not be "
+                         "written — retried next beat")
 
 
 def _fence_attempt(wire_tid: str, error: dict) -> None:
     if error.get("error_code") == "task_cancelled":
         # A Stop on a running attempt is cooperative: a result the core still writes is delivered.
         ctl = _new_ctl_id()
-        if (_ATTEMPTS.request_stop(wire_tid, error, stop_ctl=ctl)
-                and _queue_cancel_instruction(_local_tid(wire_tid), "task_cancelled", ctl) is None):
-            _ATTEMPTS._set(wire_tid, stop_requested=False, stop_ctl=None)   # asked again next beat
+        if _ATTEMPTS.request_stop(wire_tid, error, stop_ctl=ctl):
+            _settle_owed(wire_tid)
         return
     code = str(error.get("error_code"))
-    ctl = _new_ctl_id() if code == "stale_execution_generation" else None
-    verdict = _ATTEMPTS.fence(wire_tid, error, **({"fence_ctl": ctl} if ctl else {}))
-    if verdict["new"] and verdict["cancel"]:
-        _queue_fence_cancel(wire_tid, _local_tid(wire_tid), code, ctl)
-    elif verdict["new"] and code in CLOSED_CODES:
-        _withdraw_closed(wire_tid, error)
+    owed = _fence_owes(wire_tid, code, error) if code in CLOSED_CODES or code == "stale_execution_generation" else {}
+    if _ATTEMPTS.fence(wire_tid, error, **owed)["new"]:
+        _settle_owed(wire_tid)
     _ATTEMPTS.cancel_ack(wire_tid)
 
 
 CLOSED_CODES = ("task_already_terminal", "task_not_found")
 
 
-def _withdraw_closed(wire_tid: str, error: dict) -> None:
-    """A task the broker closed leaves the inbox if the core has not taken it up; once taken, the
-    core is asked to stop. Its result is settled by the fence either way, never posted."""
-    tid = _local_tid(wire_tid)
+def _closed_why(error: dict) -> str:
     reason = error.get("reason") or error.get("terminal_reason")
-    why = f"closed on the server ({error.get('error_code')}{f', {reason}' if reason else ''})"
+    return f"closed on the server ({error.get('error_code')}{f', {reason}' if reason else ''})"
+
+
+def _withdraw_closed(wire_tid: str, why: str) -> None:
+    """A task the broker closed leaves the inbox if the core has not taken it up; once taken, the
+    core is asked to stop. Its result is settled by the fence either way, never posted. Its
+    `owed_close` marker goes only when that is done, or with the cancel it becomes."""
+    tid = _local_tid(wire_tid)
     if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
+        _ATTEMPTS._set(wire_tid, owed_close=None)
         return
     queued = [TASKS_DIR / f"{tid}.txt", *TASKS_DIR.glob(f"{tid}.assigned-*")]
     activity = task_attempts.last_activity(_STATE, tid)
@@ -4109,9 +4144,10 @@ def _withdraw_closed(wire_tid: str, error: dict) -> None:
             _log(f"task {tid}: {why}, its task file could not be withdrawn ({diagnostics.describe(e)})")
             break
         _log(f"task {tid}: {why} — its untaken task file was withdrawn")
+        _ATTEMPTS._set(wire_tid, owed_close=None)
         return
-    _queue_cancel_instruction(tid, why)
-    _log(f"task {tid}: {why} — the core has taken it up and is asked to stop")
+    if _ATTEMPTS._set(wire_tid, owed_close=None, owed_ctl={"id": _new_ctl_id(), "reason": why}):
+        _log(f"task {tid}: {why} — the core has taken it up and is asked to stop")
 
 
 _last_task_beat_at = 0.0
@@ -4126,6 +4162,7 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
     _last_task_beat_at = time.time()
     wire = {_broker_tid(t) for t in inflight}
     for wire_tid in wire:
+        _settle_owed(wire_tid)
         _resolve_stop(wire_tid)
         _resolve_taken_cancel(wire_tid)
         _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
@@ -4178,20 +4215,17 @@ def _queued_at(tid: str) -> "float | None":
         return None
 
 
-def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> None:
-    if not _ATTEMPTS.mark_dispatch_lost(wire_tid):
+def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> bool:
+    """The failure is recorded with its result body before the result is written, so a result
+    that cannot be written yet is owed and retried by every beat until it is. False when the
+    failure could not be recorded."""
+    if not _ATTEMPTS.mark_dispatch_lost(wire_tid, body):
         _log_backoff((tid, "lost-unrecorded"), f"task {tid}: {why}, but that could not be "
                      "recorded — retried next beat")
-        return
-    written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
-    if not written:
-        if not _ATTEMPTS.mark_dispatch_lost(wire_tid, False):
-            _log(f"task {tid}: its beats stay stopped — the failure was not written or undone")
-        if written is False:
-            _log(f"task {tid}: its failure result could not be written — retried next beat")
-        return
-    _log(f"task {tid}: {why} — posting it as failed")
-    wake_outbound()
+        return False
+    _log(f"task {tid}: {why} — recorded as failed")
+    _settle_owed(wire_tid)
+    return True
 
 
 def _resolve_taken_cancel(wire_tid: str) -> None:
@@ -4204,10 +4238,9 @@ def _resolve_taken_cancel(wire_tid: str) -> None:
     tid = _local_tid(wire_tid)
     if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
         _ATTEMPTS._update(wire_tid, taken_ctl=None)
-    elif not _task_pending(tid):
-        _ATTEMPTS._update(wire_tid, taken_ctl=None)
-        _fail_unanswered(wire_tid, tid, STALE_CANCEL_RESULT,
-                         "a cancel meant for its earlier attempt stopped it with no result")
+    elif not _task_pending(tid) and _fail_unanswered(
+            wire_tid, tid, STALE_CANCEL_RESULT, "a cancel meant for its earlier attempt stopped it with no result"):
+        _ATTEMPTS._set(wire_tid, taken_ctl=None)    # the failure is owed: a failed clear only repeats it
 
 
 def _resolve_stop(wire_tid: str) -> None:
