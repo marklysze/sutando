@@ -114,6 +114,7 @@ class TaskAttempts:
         self._wake_items_path = self.state_dir / f"relay-wake-items{suffix}.json"
         self._contract_path = self.state_dir / f"relay-broker-contract{suffix}.json"
         self._task_beat_disabled = False
+        self._worker_id: "str | None" = None
 
     # ── storage ──────────────────────────────────────────────────────────
     def _load(self) -> dict:
@@ -123,11 +124,14 @@ class TaskAttempts:
         return self._save_json(self.path, data)
 
     def _save_json(self, path: Path, data: dict) -> bool:
+        return self._save_text(path, json.dumps(data, sort_keys=True))
+
+    def _save_text(self, path: Path, text: str) -> bool:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
             with os.fdopen(fd, "w") as fh:
-                json.dump(data, fh, sort_keys=True)
+                fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
@@ -155,6 +159,10 @@ class TaskAttempts:
     def _update(self, wire_tid: str, **fields) -> dict:
         return self._merge(wire_tid, fields)[0]
 
+    def _set(self, wire_tid: str, **fields) -> bool:
+        """Merge `fields` into the record; whether it was saved."""
+        return self._merge(wire_tid, fields)[1]
+
     def _merge(self, wire_tid: str, fields: dict) -> "tuple[dict, bool]":
         """Merge `fields` into the record; the record and whether it was saved. An unreadable
         ledger is left as it is, never rewritten."""
@@ -171,19 +179,21 @@ class TaskAttempts:
         return dict(self._load().get(wire_tid) or {})
 
     def worker_id(self) -> str:
-        """One lease-holder id per install, the same on ack, beats, results and cancel-ack."""
+        """One lease-holder id per install, the same on ack, beats, results and cancel-ack. One that
+        cannot be saved is kept for this process, so its acks and results still agree."""
+        if self._worker_id:
+            return self._worker_id
         try:
             value = self._worker_path.read_text().strip()
             if len(value) == 32 and all(c in "0123456789abcdef" for c in value):
+                self._worker_id = value
                 return value
         except OSError:
             pass
         value = secrets.token_hex(16)
-        try:
-            self._worker_path.parent.mkdir(parents=True, exist_ok=True)
-            self._worker_path.write_text(value)
-        except OSError:
-            pass
+        if not self._save_text(self._worker_path, value):
+            self.log("task attempts: the worker id was not saved — kept for this process only")
+        self._worker_id = value
         return value
 
     # ── ack ──────────────────────────────────────────────────────────────
@@ -326,8 +336,8 @@ class TaskAttempts:
         window = STALLED_S if core_motion == "idle" else STALLED_UNOBSERVED_S
         return last_activity >= queued_at and self.now() - last_activity >= window
 
-    def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> None:
-        self._update(wire_tid, dispatch_lost=lost)
+    def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> bool:
+        return self._set(wire_tid, dispatch_lost=lost)
 
     def beating(self, wire_tids) -> bool:
         """Whether any of these attempts is due per-task beats."""
@@ -336,27 +346,32 @@ class TaskAttempts:
         data = self._load()
         return any(_beats(data.get(t) or {}) for t in wire_tids)
 
-    def fence(self, wire_tid: str, error: dict) -> dict:
-        """Mark the attempt fenced. The caller stops the core's work on it when `cancel` is set."""
+    def fence(self, wire_tid: str, error: dict, **extra) -> dict:
+        """Mark the attempt fenced, with `extra` fields in the same write. The caller stops the core's
+        work on it when `cancel` is set; `unsaved` when nothing was recorded and nothing may act on it."""
         code = str(error.get("error_code") or "")
         rec = self.get(wire_tid)
         if rec.get("fenced") == code:
             return {"new": False, "cancel": False}
-        self._update(wire_tid, fenced=code, awaiting_ack=False,
-                     cancel_requested_generation=error.get("cancel_requested_generation"),
-                     cancel_requested_attempt=error.get("cancel_requested_attempt"))
+        if not self._set(wire_tid, fenced=code, awaiting_ack=False,
+                         cancel_requested_generation=error.get("cancel_requested_generation"),
+                         cancel_requested_attempt=error.get("cancel_requested_attempt"), **extra):
+            self.log(f"task {wire_tid}: fence ({code}) not recorded — acted on when it is repeated")
+            return {"new": False, "cancel": False, "unsaved": True}
         self.log(f"task {wire_tid}: attempt fenced by the broker ({code})")
         return {"new": True, "cancel": code in ("task_cancelled", "stale_execution_generation")}
 
-    def request_stop(self, wire_tid: str, error: dict) -> bool:
+    def request_stop(self, wire_tid: str, error: dict, stop_ctl: "str | None" = None) -> bool:
         """A Stop reported by a beat: a request, not a fence, so a result the core still writes is
-        delivered. True the first time, when the caller asks the core to stop."""
+        delivered. True the first time it is recorded, when the caller asks the core to stop."""
         rec = self.get(wire_tid)
         if rec.get("stop_requested") or rec.get("fenced"):
             return False
-        self._update(wire_tid, stop_requested=True,
-                     cancel_requested_generation=error.get("cancel_requested_generation"),
-                     cancel_requested_attempt=error.get("cancel_requested_attempt"))
+        if not self._set(wire_tid, stop_requested=True, stop_ctl=stop_ctl,
+                         cancel_requested_generation=error.get("cancel_requested_generation"),
+                         cancel_requested_attempt=error.get("cancel_requested_attempt")):
+            self.log(f"task {wire_tid}: Stop not recorded — asked again on the next beat")
+            return False
         self.log(f"task {wire_tid}: Stop requested — the core is asked to stop; a result it "
                  "still writes is delivered")
         return True
@@ -364,10 +379,9 @@ class TaskAttempts:
     def stop_outcome(self, wire_tid: str, stopped: bool) -> None:
         """The core answered the Stop: it stopped (confirmed with a cancel-ack), or it finished."""
         if stopped:
-            self._update(wire_tid, stop_requested=False, stop_confirmed=True)
-            self.cancel_ack(wire_tid)
-        else:
-            self._update(wire_tid, stop_requested=False)
+            if self._set(wire_tid, stop_requested=False, stop_confirmed=True):
+                self.cancel_ack(wire_tid)
+        elif self._set(wire_tid, stop_requested=False):
             self.log(f"task {wire_tid}: the core finished despite the Stop — no cancel-ack")
 
     def stop_by_result(self, wire_tid: str, body: str, no_send: bool) -> "bool | None":
@@ -399,8 +413,7 @@ class TaskAttempts:
         except (OSError, ValueError) as e:
             self.log(f"task {wire_tid}: cancel-ack failed ({e}) — retried next beat")
             return False
-        self._update(wire_tid, fenced="cancel_confirmed", stop_confirmed=False)
-        return True
+        return self._set(wire_tid, fenced="cancel_confirmed", stop_confirmed=False)
 
     # ── result ───────────────────────────────────────────────────────────
     def result_fields(self, wire_tid: str) -> dict:
@@ -409,10 +422,13 @@ class TaskAttempts:
         return ({"execution_generation": gen, "worker_id": self.worker_id()}
                 if type(gen) is int else {})
 
-    def ack_settled(self, wire_tid: str) -> None:
-        """The ack is answered without a generation (a legacy broker): nothing to wait for."""
-        if self.get(wire_tid).get("awaiting_ack"):
-            self._update(wire_tid, awaiting_ack=False)
+    def ack_settled(self, wire_tid: str) -> bool:
+        """The ack is answered without a generation (a legacy broker): nothing to wait for. False
+        when that could not be recorded."""
+        data = self._read_json(self.path)
+        if data is None:
+            return False
+        return not (data.get(wire_tid) or {}).get("awaiting_ack") or self._set(wire_tid, awaiting_ack=False)
 
     def result_hold(self, wire_tid: str) -> "str | None":
         """Why this result must wait for its ack, or None when it may go now. A broker known to
@@ -429,9 +445,10 @@ class TaskAttempts:
                 self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s on a "
                          "broker that names leases — its result waits for the ack or a fence")
             return "its ack has not named the lease, and this broker names leases"
+        if not self._set(wire_tid, awaiting_ack=False):
+            return "its ack wait could not be ended on disk"
         self.log(f"task {wire_tid}: no ack named its lease within {ACK_HOLD_MAX_S:.0f}s — its result "
                  "is gated on its own journal records and goes without lease fields")
-        self._update(wire_tid, awaiting_ack=False)
         return None
 
     def result_decision(self, wire_tid: str, body: str, no_send: bool):

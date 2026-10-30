@@ -136,6 +136,27 @@ class Hooks(unittest.TestCase):
         self.assertEqual((rec["execution_generation"], rec.get("fenced"), rec.get("fence_ctl")), (2, None, None))
         self.assertTrue(any("withdrawn" in m for m in self.logs))
 
+    def test_an_old_cancel_whose_withdrawal_cannot_be_recorded_keeps_the_ack_pending(self):
+        tid = "task-regen-unrec"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+            {"task_id": tid, "error_code": "stale_execution_generation"}]}}))
+        gw._post_heartbeat({tid}, force=True)
+        self.assertEqual(len(self.controls(tid)), 1)
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        with self.failing_save("relay-task-attempts"):
+            self.assertFalse(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(len(self.controls(tid)), 1, "nothing withdrawn before it is recorded")
+        self.assertIn(tid, gw._load_pending_acks())
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
+        gw._retry_pending_acks({tid})
+        self.assertEqual(self.controls(tid), [], "the retry withdraws it")
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["execution_generation"], rec.get("fence_ctl"), rec.get("taken_ctl")), (2, None, None))
+        self.assertNotIn(tid, gw._load_pending_acks())
+
     def test_a_cancel_the_core_already_took_is_not_withdrawn(self):
         tid = "task-regen-taken"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
@@ -1144,6 +1165,64 @@ class Hooks(unittest.TestCase):
         self.assertNotIn(tid, gw._load_pending_acks(), "retired once the generation is on disk")
         self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
         self.posted_once_under_its_generation(fake, tid, inflight)
+
+    def test_an_ack_first_task_whose_generation_cannot_be_recorded_stays_staged(self):
+        tid, path, good = "task-af-unrec", gw._ATTEMPTS.path, []
+
+        def ack(_payload):
+            good.append(path.read_bytes())
+            path.write_text("{not json")
+            return _ack(tid, 1)
+
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": ack}))
+        inflight, fates = set(), {}
+        self.assertFalse(gw._take_ack_first(_task(tid, ack_first=True), inflight, fates))
+        self.assertEqual(len(fake.posted("/ack")), 1)
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "not published")
+        entry = (gw._load_held() or {}).get(tid)
+        self.assertIsNotNone(entry, "the manifest entry is live")
+        self.assertIsNot(entry.get("accepted"), True, "not marked accepted")
+        self.assertTrue((gw._held_dir() / entry["staged"]).exists(), "still staged")
+        self.assertTrue(any(f"ack_first task {tid}: accepted, but its generation" in m for m in self.logs))
+
+        path.write_bytes(good[0])
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 1)
+        self.assertTrue(gw._advance_held_tasks(inflight), "the next pass re-acks and publishes")
+        self.assertEqual(len(fake.posted("/ack")), 2)
+        self.assertNotIn(tid, gw._load_held() or {})
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
+        self.ran(tid)
+        self.posted_once_under_its_generation(fake, tid, inflight)
+
+    def test_beat_fences_and_stops_act_only_once_recorded(self):
+        for code in ("stale_execution_generation", "task_cancelled"):
+            with self.subTest(code=code):
+                tid = f"task-unrec-{code.split('_')[0]}"
+                self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+                gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+                self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True, "task_errors": [
+                    {"task_id": tid, "error_code": code}]}}))
+                with self.failing_save("relay-task-attempts"):
+                    gw._post_heartbeat({tid}, force=True)
+                self.assertEqual(self.controls(tid), [], "nothing acted on before it is recorded")
+                self.assertFalse(gw._ATTEMPTS.get(tid).get("fenced") or gw._ATTEMPTS.get(tid).get("stop_requested"))
+                gw._post_heartbeat({tid}, force=True)
+                gw._post_heartbeat({tid}, force=True)
+                self.assertEqual(len(self.controls(tid)), 1, "acted on once, when the beat repeats it")
+                rec = gw._ATTEMPTS.get(tid)
+                ctl = rec.get("fence_ctl") or rec.get("stop_ctl")
+                self.assertEqual(self.controls(tid)[0].name, f"{ctl}.txt", "the recorded id is the queued one")
+
+    def test_a_dispatch_lost_that_cannot_be_recorded_writes_no_failure(self):
+        tid = "task-lost-unrec"
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        with self.failing_save("relay-task-attempts"):
+            gw._fail_unanswered(tid, tid, "failed", "test")
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "retried next beat")
+        self.assertFalse(gw._ATTEMPTS.get(tid).get("dispatch_lost"))
+        gw._fail_unanswered(tid, tid, "failed", "test")
+        self.assertTrue((gw.RESULTS_DIR / f"{tid}.txt").exists())
+        self.assertTrue(gw._ATTEMPTS.get(tid)["dispatch_lost"])
 
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}

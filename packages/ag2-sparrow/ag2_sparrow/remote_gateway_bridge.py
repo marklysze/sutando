@@ -3293,8 +3293,10 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
             reason = raw.lower()
             if "not leased" in reason:
-                if _ATTEMPTS is not None:
-                    _ATTEMPTS.ack_settled(_broker_tid(tid))
+                if _ATTEMPTS is not None and not _ATTEMPTS.ack_settled(_broker_tid(tid)):
+                    _log_backoff((tid, "ack-unsettled"), f"task ack for {tid}: not leased, but its "
+                                 "ack wait could not be ended on disk — the pending ack is kept")
+                    return False
                 if "stale lease generation" in reason:
                     _log(f"task ack for {tid} named a superseded lease generation "
                          "— the broker re-serves it; not retrying")
@@ -3345,7 +3347,10 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         body.update(_ATTEMPTS.ack_fields())
     try:
         doc = _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=_ACK_TIMEOUT_S)
-        _record_attempt(wire_tid, doc)
+        if not _record_attempt(wire_tid, doc):
+            _log_backoff((tid, "ack-unrecorded"), f"ack_first task {tid}: accepted, but its generation "
+                         "could not be recorded — kept staged, retrying")
+            return "retry"
         return "accepted"
     except urllib.error.HTTPError as e:
         raw = _http_error_body(e) if e.code in (404, 409) else ""
@@ -3969,34 +3974,43 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
 
 
 def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> bool:
-    """False when the ack named a generation that is not on disk afterwards."""
+    """False when what the ack settles is not on disk afterwards: its generation, the end of the
+    ack wait, the broker's lease contract, or an older generation's cancel."""
     if _ATTEMPTS is None:
         return True
-    before = _ATTEMPTS.get(wire_tid)
-    _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
     gen = doc.get("execution_generation") if isinstance(doc, dict) else None
-    if type(gen) is int and gen >= 1 and _ATTEMPTS.get(wire_tid).get("execution_generation") != gen:
+    gen = gen if type(gen) is int and gen >= 1 else None
+    if not _withdraw_stale_cancel(wire_tid, _ATTEMPTS.get(wire_tid), gen):
         return False
-    _withdraw_stale_cancel(wire_tid, before)
-    return True
+    _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
+    rec = _ATTEMPTS._read_json(_ATTEMPTS.path)
+    rec = None if rec is None else rec.get(wire_tid) or {}
+    if rec is None or rec.get("awaiting_ack"):
+        return False
+    return gen is None or (rec.get("execution_generation") == gen and _ATTEMPTS.broker_names_leases())
 
 
-def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
-    """An older generation's cancel must not stop a newer generation now served here."""
+def _withdraw_stale_cancel(wire_tid: str, before: dict, gen: "int | None") -> bool:
+    """An older generation's cancel must not stop a newer generation now served here. It is
+    recorded as taken before it is withdrawn, so a failed write never loses one the core ran."""
     ctl, old = before.get("fence_ctl"), before.get("execution_generation")
-    gen = _ATTEMPTS.get(wire_tid).get("execution_generation")
-    if not ctl or type(gen) is not int or type(old) is not int or gen <= old:
-        return
-    _ATTEMPTS._update(wire_tid, fence_ctl=None)
+    if not ctl or gen is None or type(old) is not int or gen <= old:
+        return True
+    if not _ATTEMPTS._set(wire_tid, fence_ctl=None, taken_ctl=ctl):
+        _log(f"task {wire_tid}: cancel {ctl} for generation {old} not recorded — the ack is retried")
+        return False
     try:
         (TASKS_DIR / f"{ctl}.txt").unlink()
-        _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — generation {gen} is served here")
     except FileNotFoundError:
-        _ATTEMPTS._update(wire_tid, taken_ctl=ctl)
         _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
              f"generation {gen} may be stopped")
+        return True
     except OSError as e:
         _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({diagnostics.describe(e)})")
+        return True
+    _ATTEMPTS._set(wire_tid, taken_ctl=None)    # left set, it waits on a result that never comes
+    _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — generation {gen} is served here")
+    return True
 
 
 def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> bool:
@@ -4009,30 +4023,41 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
     if code not in task_attempts.FENCING_CODES:
         return False
     newer = _load_pending_leases().get(tid) not in (None, lease_id)
-    _forget_pending_ack(tid, lease_id)
     if code == "stale_execution_generation" and newer:
+        _forget_pending_ack(tid, lease_id)
         _log(f"task ack for {tid}: an older lease was refused; the newer serve here is acked instead")
         return True
     wire_tid = _broker_tid(tid)
-    if _ATTEMPTS.fence(wire_tid, {**err, "error_code": code})["new"] and published:
-        if code in CLOSED_CODES or code == "task_cancelled":
+    queue = published and code not in CLOSED_CODES and code != "task_cancelled"
+    ctl = _new_ctl_id() if queue and code == "stale_execution_generation" else None
+    verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **({"fence_ctl": ctl} if ctl else {}))
+    if verdict.get("unsaved"):
+        return True                             # its pending ack is kept: the retry is fenced again
+    _forget_pending_ack(tid, lease_id)
+    if verdict["new"] and published:
+        if not queue:
             _withdraw_closed(wire_tid, {**err, "error_code": code})
         else:
-            _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(tid, code))
+            _queue_fence_cancel(wire_tid, tid, code, ctl)
     _ATTEMPTS.cancel_ack(wire_tid)
     return True
 
 
-def _note_fence_ctl(wire_tid: str, code: str, ctl: "str | None") -> None:
-    if ctl and code == "stale_execution_generation":
-        _ATTEMPTS._update(wire_tid, fence_ctl=ctl)
+def _queue_fence_cancel(wire_tid: str, tid: str, code: str, ctl: "str | None") -> None:
+    """Queue the fence's cancel under the id the fence recorded; one never written is unrecorded."""
+    if _queue_cancel_instruction(tid, code, ctl) is None and ctl:
+        _ATTEMPTS._set(wire_tid, fence_ctl=None)
 
 
-def _queue_cancel_instruction(tid: str, reason: str) -> "str | None":
+def _new_ctl_id() -> str:
+    return f"task-ctl-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}{_INST_SUFFIX.replace('.', '-')}"
+
+
+def _queue_cancel_instruction(tid: str, reason: str, ctl: "str | None" = None) -> "str | None":
     """Ask the core to stop its work on a task through its own cancel signal; the control
     task's id, or None when it could not be written."""
     now = time.time()
-    ctl = f"task-ctl-{int(now * 1000)}-{uuid.uuid4().hex[:6]}{_INST_SUFFIX.replace('.', '-')}"
+    ctl = ctl or _new_ctl_id()
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     if not _durable_write(TASKS_DIR / f"{ctl}.txt",
@@ -4045,14 +4070,16 @@ def _queue_cancel_instruction(tid: str, reason: str) -> "str | None":
 def _fence_attempt(wire_tid: str, error: dict) -> None:
     if error.get("error_code") == "task_cancelled":
         # A Stop on a running attempt is cooperative: a result the core still writes is delivered.
-        if _ATTEMPTS.request_stop(wire_tid, error):
-            ctl = _queue_cancel_instruction(_local_tid(wire_tid), "task_cancelled")
-            _ATTEMPTS._update(wire_tid, stop_ctl=ctl)
+        ctl = _new_ctl_id()
+        if (_ATTEMPTS.request_stop(wire_tid, error, stop_ctl=ctl)
+                and _queue_cancel_instruction(_local_tid(wire_tid), "task_cancelled", ctl) is None):
+            _ATTEMPTS._set(wire_tid, stop_requested=False, stop_ctl=None)   # asked again next beat
         return
-    verdict = _ATTEMPTS.fence(wire_tid, error)
     code = str(error.get("error_code"))
+    ctl = _new_ctl_id() if code == "stale_execution_generation" else None
+    verdict = _ATTEMPTS.fence(wire_tid, error, **({"fence_ctl": ctl} if ctl else {}))
     if verdict["new"] and verdict["cancel"]:
-        _note_fence_ctl(wire_tid, code, _queue_cancel_instruction(_local_tid(wire_tid), code))
+        _queue_fence_cancel(wire_tid, _local_tid(wire_tid), code, ctl)
     elif verdict["new"] and code in CLOSED_CODES:
         _withdraw_closed(wire_tid, error)
     _ATTEMPTS.cancel_ack(wire_tid)
@@ -4152,10 +4179,14 @@ def _queued_at(tid: str) -> "float | None":
 
 
 def _fail_unanswered(wire_tid: str, tid: str, body: str, why: str) -> None:
-    _ATTEMPTS.mark_dispatch_lost(wire_tid)
+    if not _ATTEMPTS.mark_dispatch_lost(wire_tid):
+        _log_backoff((tid, "lost-unrecorded"), f"task {tid}: {why}, but that could not be "
+                     "recorded — retried next beat")
+        return
     written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
     if not written:
-        _ATTEMPTS.mark_dispatch_lost(wire_tid, False)
+        if not _ATTEMPTS.mark_dispatch_lost(wire_tid, False):
+            _log(f"task {tid}: its beats stay stopped — the failure was not written or undone")
         if written is False:
             _log(f"task {tid}: its failure result could not be written — retried next beat")
         return

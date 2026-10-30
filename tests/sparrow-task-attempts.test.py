@@ -374,6 +374,47 @@ class Attempts(unittest.TestCase):
                 self.assertEqual(path.read_text(), "{x", "left as it was")
                 self.assertEqual(a.wake_item("tsk_X"), task_attempts.UNKNOWN)
 
+    def test_every_ledger_writer_reports_a_write_it_could_not_make(self):
+        clock = [1000.0]
+        a = self.mk(now=lambda: clock[0])
+        a.remember_task("tsk_L", {})
+        a.record_ack("tsk_S", _ack(1))
+        a.record_ack("tsk_C", _ack(1))
+        a.fence("tsk_C", {"error_code": "task_cancelled"})
+        real = a._save_json
+        no_ledger = unittest.mock.patch.object(a, "_save_json", side_effect=lambda p, d: (
+            False if p.name.startswith("relay-task-attempts") else real(p, d)))
+        with no_ledger:
+            self.assertFalse(a.ack_settled("tsk_L"))
+            self.assertFalse(a.mark_dispatch_lost("tsk_S"))
+            self.assertEqual(a.fence("tsk_S", {"error_code": "stale_execution_generation"}),
+                             {"new": False, "cancel": False, "unsaved": True})
+            self.assertFalse(a.request_stop("tsk_S", {"error_code": "task_cancelled"}))
+            self.assertFalse(a.cancel_ack("tsk_C"), "posted, but retried until it is recorded")
+        self.assertEqual(a.get("tsk_C")["fenced"], "task_cancelled")
+        self.assertTrue(a.cancel_ack("tsk_C"))
+        self.assertTrue(a.ack_settled("tsk_L"))
+        self.assertEqual(a.fence("tsk_S", {"error_code": "stale_execution_generation"})["new"], True)
+        (self.state / "relay-task-attempts.json").write_text("{x")
+        self.assertFalse(a.ack_settled("tsk_L"), "unreadable is not settled")
+
+    def test_a_legacy_ack_wait_that_cannot_be_ended_still_holds(self):
+        clock = [1000.0]
+        a = self.mk(now=lambda: clock[0])
+        a.remember_task("tsk_L", {})
+        clock[0] += task_attempts.ACK_HOLD_MAX_S + 1
+        self.assertFalse(a.broker_names_leases())
+        with unittest.mock.patch.object(a, "_save_json", return_value=False):
+            self.assertIsNotNone(a.result_hold("tsk_L"), "an unrecorded end of the wait still holds")
+        self.assertIsNone(a.result_hold("tsk_L"))
+
+    def test_a_worker_id_that_cannot_be_saved_is_kept_for_the_process(self):
+        a = self.mk()
+        with unittest.mock.patch.object(a, "_save_text", return_value=False):
+            first = a.worker_id()
+        self.assertEqual(a.worker_id(), first, "acks and results agree")
+        self.assertTrue(any("worker id was not saved" in m for m in self.logs))
+
     def test_a_wake_episode_runs_once_and_its_result_rides_its_own_item(self):
         a = self.mk(turn_context=True)
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
