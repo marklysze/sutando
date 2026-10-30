@@ -272,7 +272,18 @@ class StopInterrupt(unittest.TestCase):
         tmux = FakeTmux(CRON_TURN)
         self.assertFalse(self.run_it(tmux), "the pane is mid-turn, but on an unbound turn after T")
         self.assertEqual(tmux.escapes(), [])
-        self.assertIn("its turn already ended", self.logs[-1])
+        self.assertIn("its newest row (done) was not written mid-turn", self.logs[-1])
+
+    def test_a_turn_that_ended_on_a_thinking_row_is_not_escaped_later(self):
+        # A T turn that ends without a result (waiting on a background subagent) gets only a Stop-hook row.
+        for kind in ("thinking", "notice"):
+            with self.subTest(kind=kind):
+                (self.ws / "state" / "agent-activity.jsonl").unlink(missing_ok=True)
+                self.row(TARGET, age=25 * 60, kind=kind)
+                tmux = FakeTmux(CRON_TURN)
+                self.assertFalse(self.run_it(tmux), "the pane is mid-turn on a cron turn, not T")
+                self.assertEqual(tmux.escapes(), [])
+                self.assertIn("was not written mid-turn", self.logs[-1])
 
     def test_a_task_with_its_result_is_never_escaped(self):
         self.row(TARGET)

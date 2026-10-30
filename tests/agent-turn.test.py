@@ -421,6 +421,13 @@ class ResultFileDecision(unittest.TestCase):
                 self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
         state = Path(tempfile.mkdtemp())
         turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"))
+        failed = {"operation_id": f"op_{turn}_1", "operation_status": "failed", "turn_id": turn, "seq": 1}
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked",
+                                                 reconciled=[failed]).fields,
+                         {"status": "completed"}, "reconciliation shows the ask failed: nothing is open")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
         _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
         self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "the answer").fields,
                          {"status": "completed"}, "a lost message send is not a question")
@@ -473,6 +480,30 @@ class ResultFileDecision(unittest.TestCase):
         other = at.read_turn_records(self.state, "tsk_B_g2_Y", task_id="tsk_B")
         self.assertEqual(at.result_file_decision(other, "final answer").fields, {"status": "completed"},
                          "another task's send never counts")
+
+    def test_an_earlier_generations_failed_send_does_not_silence_the_new_reply(self):
+        g1 = _ctx(self.state, gen=1)["turn_id"]
+        g2 = _ctx(self.state, gen=2)["turn_id"]
+        sent = {**_intent(g1, 1), "body_sha256": at.body_sha256("final answer")}
+        for status, silenced in (("failed", False), ("rejected", False), ("succeeded", True),
+                                 ("dispatched_unknown", True), (None, True)):
+            with self.subTest(status=status):
+                at.room_actions_path(self.state).unlink(missing_ok=True)
+                _journal(self.state, sent, *([_outcome(g1, 1, op_status=status)] if status else []))
+                d = at.result_file_decision(at.read_turn_records(self.state, g2, task_id="tsk_A"), "final answer")
+                self.assertEqual(d.fields, {"status": "completed", "no_send": True} if silenced
+                                 else {"status": "completed"})
+
+    def test_a_stale_torn_line_with_no_turn_is_skipped_not_a_crash(self):
+        path = at.room_actions_path(self.state)
+        path.write_text('{"record_type": "dispatch_intent", "turn_id": "other_g1_X", "task_id": "oth\n')
+        old = time.time() - at.PARTIAL_LINE_GRACE_S - 5
+        os.utime(path, (old, old))
+        recs = at.read_turn_records(self.state, None, None, task_id="tsk_A")
+        self.assertTrue(recs.readable, "no turn of its own: another task's torn line is skipped")
+        path.write_text('{"record_type": "dispatch_intent", "task_id": "tsk_A", "x\n')
+        os.utime(path, (old, old))
+        self.assertFalse(at.read_turn_records(self.state, None, None, task_id="tsk_A").readable)
 
     def test_another_tasks_torn_line_is_skipped(self):
         torn = json.dumps({"ts": 1.0, **_intent("other_g1_X", 1), "task_id": "other"})[:-2]
@@ -533,9 +564,9 @@ class ResultFileDecision(unittest.TestCase):
 class AnswerOutcomes(unittest.TestCase):
     """An answer to another task's question never rules this task's turn."""
 
-    def recs(self, *outcomes):
+    def recs(self, *outcomes, action="room.question.answer"):
         intents = [{"record_type": at.INTENT, "turn_id": "t", "seq": o["seq"],
-                    "operation_id": o["operation_id"], "action": "room.question.answer"} for o in outcomes]
+                    "operation_id": o["operation_id"], "action": action} for o in outcomes]
         return at.TurnRecords(intents, list(outcomes), True, (), False)
 
     def test_another_tasks_input_ready_does_not_suspend_this_one(self):
@@ -555,11 +586,22 @@ class AnswerOutcomes(unittest.TestCase):
                 d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
                 self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
 
-    def test_its_own_input_ready_still_suspends_it(self):
+    def test_an_answer_outcome_without_its_own_action_field_still_never_rules_it(self):
+        # The action may sit on the intent only; the outcome is matched to it by operation_id.
+        ans = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        self.assertNotIn("action", ans)
+        v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_its_own_ask_still_suspends_it(self):
         own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
-        self.assertEqual(at.classify_turn(self.recs(own), task_id="tsk_me").outcome, at.DURABLY_SUSPENDED)
+        ask = "room.question.ask"
+        self.assertEqual(at.classify_turn(self.recs(own, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED)
         untagged = _outcome("t", 1, phase="input_ready")
-        self.assertEqual(at.classify_turn(self.recs(untagged), task_id="tsk_me").outcome,
+        self.assertEqual(at.classify_turn(self.recs(untagged, action=ask), task_id="tsk_me").outcome,
                          at.DURABLY_SUSPENDED, "an outcome without a task_id is the turn's own")
 
     def test_another_tasks_terminal_or_reconciled_outcome_does_not_settle_this_one(self):

@@ -247,8 +247,8 @@ def _release_journal_lock(held: "tuple[Path, str] | None") -> None:
 def close_turn(state_dir: Path, turn_id: str) -> bool:
     """Fence the turn: later calls carrying it are refused, and only its own file goes. Only under
     the proxy's journal lock, so a close never lands between the proxy's check and its intent
-    append. False, with nothing changed, when the lock was not had in time: the still-open turn
-    file is the record a later close_turn retries from."""
+    append. False, with nothing changed, when the lock was not had in time: the turn stays open
+    (unfenced) until a later close_turn, retried from its still-open file, lands."""
     closed = _turn_path(state_dir, turn_id, ".closed")
     closed.parent.mkdir(parents=True, exist_ok=True)
     held = _take_journal_lock(state_dir)
@@ -287,10 +287,13 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
     could not bind, written since `issued_at` (None: all), count as this turn's when they name
     `task_id`; other unbound intents are kept apart. A fresh unterminated last line marks the
     journal `partial`. Any other line that does not parse makes it unreadable for this turn only
-    when the line names this turn or task; the journal is shared, so another task's torn line is skipped."""
+    when the line names this turn or task; the journal is shared, so another task's torn line is skipped,
+    and so is one torn before its ids (nothing was dispatched for it). `sibling_sends` are the same
+    task's other turns' room.message.send intents whose outcome is not a failure."""
     path = room_actions_path(state_dir)
     intents, outcomes, unbound, readable, partial = [], [], [], True, False
     siblings: list = []
+    sibling_failed: set = set()
     sibling_prefix = f"{task_id}_g" if task_id else None
     for p in (path.with_name(path.name + ".1"), path):
         try:
@@ -312,7 +315,7 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
             if not isinstance(rec, dict):
                 if p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S:
                     partial = True
-                elif turn_id in line or (task_id and task_id in line):
+                elif (turn_id and turn_id in line) or (task_id and task_id in line):
                     readable = False
                 continue
             if rec.get("turn_id") is None:
@@ -324,15 +327,44 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
                         unbound.append(rec)
                     continue
             elif rec.get("turn_id") != turn_id:
-                if (sibling_prefix and str(rec.get("turn_id")).startswith(sibling_prefix)
-                        and rec.get("record_type") == INTENT and rec.get("action") == "room.message.send"):
-                    siblings.append(rec)
+                if sibling_prefix and str(rec.get("turn_id")).startswith(sibling_prefix):
+                    if rec.get("record_type") == INTENT and rec.get("action") == "room.message.send":
+                        siblings.append(rec)
+                    elif rec.get("record_type") == OUTCOME and rec.get("operation_status") not in (
+                            None, "succeeded", "dispatched_unknown"):
+                        sibling_failed.add(rec.get("operation_id"))
                 continue
             if rec.get("record_type") == INTENT:
                 intents.append(rec)
             elif rec.get("record_type") == OUTCOME:
                 outcomes.append(rec)
-    return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, tuple(siblings))
+    # A send whose outcome failed delivered nothing; one with no outcome yet may have been sent.
+    sent = tuple(s for s in siblings if s.get("operation_id") not in sibling_failed)
+    return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, sent)
+
+
+def answered_in_journal(state_dir: Path, task_id: str) -> bool:
+    """Whether any turn of this task already answered a room question: a room.question.answer intent
+    the proxy tagged with this task whose outcome succeeded. Durable before the result is decided."""
+    path = room_actions_path(state_dir)
+    ops, ok = set(), set()
+    for p in (path.with_name(path.name + ".1"), path):
+        try:
+            lines = p.read_text().split("\n")
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("task_id") != task_id:
+                continue
+            if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
+                ops.add(rec.get("operation_id"))
+            elif rec.get("record_type") == OUTCOME and rec.get("operation_status") == "succeeded":
+                ok.add(rec.get("operation_id"))
+    return bool(ops & ok)
 
 
 def unmatched_intents(records: TurnRecords) -> list:
@@ -388,7 +420,9 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
         by_op[op] = merged
     # The proxy tags an outcome with the caller's own task, but an answer's applied state is the
     # asker's: a room.question.answer never rules this turn's terminal or suspended state.
-    outcomes = sorted((o for o in by_op.values() if o.get("action") != "room.question.answer"), key=_seq)
+    outcomes = sorted((o for op, o in by_op.items()
+                       if (o.get("action") or intent_by_op.get(op, {}).get("action")) != "room.question.answer"),
+                      key=_seq)
     n = len(records.intents)
 
     if any(o.get("operation_status") == "succeeded" and _applied_terminal(o) for o in outcomes):
@@ -456,7 +490,10 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
         return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
-    if any(i.get("action") == "room.question.ask" for i in unmatched_intents(records)):
+    settled = {r.get("operation_id") for r in reconciled
+               if r.get("operation_status") not in (None, "dispatched_unknown")}
+    if any(i.get("action") == "room.question.ask" and i.get("operation_id") not in settled
+           for i in unmatched_intents(records)):
         # The note says "I asked X": never the final reply. A broker with no open question refuses it.
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True},
                               "a question was asked and its outcome is unknown")

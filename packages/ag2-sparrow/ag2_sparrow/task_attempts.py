@@ -57,7 +57,8 @@ ASK_IN_ROOM_RULE = (
     "For a question that blocks THIS task, ask it in this task's room when everyone there should "
     "read it; a question about something the owner asked for themselves (their own errand, or "
     "data from their accounts or device) goes to the owner's DM with `ask-owner.py` instead, even "
-    "from a shared room. To ask in the room: call `room.action.execute` "
+    "from a shared room; then end this task with a result file starting `[no-send]` and a one-line "
+    "note that you asked the owner directly. To ask in the room: call `room.action.execute` "
     "with action `room.question.ask`, top-level `task_id` `{task_id}`, and `arguments` `prompt` "
     "(plus `options` when the answer is a choice). Anything the room should read besides the "
     "question, send first with `room.message.send`. Then write this task's result file with a "
@@ -183,7 +184,9 @@ class TaskAttempts:
         if not rule:
             return None
         qid = _question_id(question)
-        if qid in self._load_answered():
+        # The journal holds a succeeded answer before any result is decided: a crash or redelivery in
+        # between still sees it.
+        if qid in self._load_answered() or agent_turn.answered_in_journal(self.state_dir, task_id):
             return ANSWERED_HERE_NOTE
         self._update(task_id, answer_offered=qid)
         return rule
@@ -546,7 +549,9 @@ class TaskAttempts:
             current = (data.get(task) or {}).get("turn_id")
             if task not in live or (current and current != p.stem):
                 self._close_turn(p.stem)
-                closed += not p.exists()
+                if p.exists():
+                    break                   # the lock is busy: one wait per pass, the rest next pass
+                closed += 1
         return closed
 
     def sweep(self, live_wire_tids) -> int:
@@ -608,7 +613,7 @@ class TaskAttempts:
 def write_if_absent(path: Path, text: str) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file already
     was (it wins). Raises OSError on a failure, with nothing left at `path`, so a retry can write it."""
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(text.encode("utf-8"))
@@ -617,6 +622,7 @@ def write_if_absent(path: Path, text: str) -> "bool | None":
             os.fsync(fh.fileno())
         # link() publishes the complete file and never replaces one already there.
         os.link(tmp, path)
+        agent_turn._fsync_dir(path.parent)
         return True
     except FileExistsError:
         return None
