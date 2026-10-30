@@ -856,6 +856,9 @@ class Hooks(unittest.TestCase):
             self.assertIsNone(gw._core_motion(), "Sparrow's own fill-in never counts as the core moving")
             cmd.row.return_value = {"motion": "moving"}
             self.assertEqual(gw._core_motion(), "moving")
+            for wedged in ({"condition": "abnormal"}, {"alive": False}):
+                cmd.row.return_value = {"motion": "moving", **wedged}
+                self.assertEqual(gw._core_motion(), "idle", f"{wedged}: a wedged core is not working")
         with mock.patch.object(gw, "_HEALTH_COMMAND", None), \
                 mock.patch.object(gw, "_health_snapshot", return_value={"agents": [
                     {"role": "core", "motion": "idle", "alive": True}]}):
