@@ -192,9 +192,11 @@ def _run(argv: list) -> str | None:
 
 
 def _socket(run: Callable) -> str | None:
-    """The core's tmux socket, resolved as the launcher resolves it."""
-    if os.environ.get("SUTANDO_TMUX_SOCK"):
-        return os.environ["SUTANDO_TMUX_SOCK"]
+    """The core's tmux socket, resolved as the launcher resolves it: the canonical
+    SUTANDO_TMUX_SOCKET, then the legacy SUTANDO_TMUX_SOCK, then the config helper."""
+    for name in ("SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SOCK"):
+        if os.environ.get(name):
+            return os.environ[name]
     out = run(["bash", str(CONFIG_SH), "tmux-socket"])
     return (out.strip() or None) if out else None
 
