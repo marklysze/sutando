@@ -194,6 +194,59 @@ class Attempts(unittest.TestCase):
         self.assertTrue(a.holds("tsk_A"), "unknown is not released")
         self.assertEqual(a.path.read_text(), "{not json")
 
+    def test_a_queue_that_cannot_be_read_leaves_the_records_unmigrated(self):
+        a = self.mk()
+        base = {"stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None}}
+        a.path.write_text(json.dumps(base))
+        queue = self.state / "queue"
+
+        def migrate():
+            return task_attempt_migrations.migrate(a, queue, local_tid=lambda t: t, new_ctl=lambda: "c",
+                                                   failure_of=lambda t: ("b", None), log=self.logs.append)
+        queue.write_text("not a directory")
+        self.assertIsNone(migrate(), "a queue that is a file cannot be read")
+        queue.unlink()
+        (queue / "task-ctl-1-aaaaaa.txt").mkdir(parents=True)
+        self.assertIsNone(migrate(), "nor one whose control cannot be read")
+        self.assertEqual(a._load(), base)
+        (queue / "task-ctl-1-aaaaaa.txt").rmdir()
+        queue.rmdir()
+        self.assertTrue(migrate(), "no queue at all: nothing can be live")
+
+    def test_a_control_that_cannot_be_withdrawn_stops_the_migration(self):
+        a = self.mk()
+        base = {"moved": {"execution_generation": 2}}
+        a.path.write_text(json.dumps(base))
+        self.queue_ctl("task-ctl-5-eeeeee", "moved")
+        (self.tasks / ".task-ctl-5-eeeeee.withdrawn" / "x").mkdir(parents=True)  # the aside is taken
+        self.assertIs(self.migrate(a), False)
+        self.assertEqual(a._load(), base)
+        self.assertTrue((self.tasks / "task-ctl-5-eeeeee.txt").exists())
+
+    def test_a_control_answered_while_the_queue_is_listed_is_skipped(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"moved": {"execution_generation": 2}}))
+        self.queue_ctl("task-ctl-6-ffffff", "moved")
+        real = Path.read_text
+
+        def read(path, *args, **kw):
+            if path.name == "task-ctl-6-ffffff.txt":
+                path.unlink()
+            return real(path, *args, **kw)
+        with unittest.mock.patch.object(Path, "read_text", read):
+            self.assertTrue(self.migrate(a))
+        self.assertIsNone(a.get("moved").get("taken_ctl"))
+
+    def test_older_marker_shapes_carry_the_records_generation(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"t": {
+            "execution_generation": 3, "dispatch_lost": 1, "owed_close": "closed",
+            "owed_ctl": {"id": "task-ctl-7-a", "reason": "r"}}}))
+        self.assertTrue(self.migrate(a))
+        rec = a.get("t")
+        self.assertEqual((rec["dispatch_lost"], rec["owed_close"], rec["owed_ctl"]["gen"]),
+                         (None, {"why": "closed", "gen": 3}, 3))
+
     def test_the_migration_lives_apart_from_the_live_writer(self):
         live = (PKG_ROOT / "ag2_sparrow" / "task_attempts.py").read_text()
         for word in ("def upgrade", "def _upgraded", "CLOSED_FENCES", "dispatch_lost is True or"):

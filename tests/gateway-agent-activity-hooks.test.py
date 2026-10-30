@@ -1801,6 +1801,67 @@ class Hooks(unittest.TestCase):
         self.assertEqual(len(post), 1)
         self.assertNotEqual(post[0].get("status"), "failed", "the bridge did not write this file")
 
+    def test_a_failure_result_the_base_wrote_is_adopted_and_posted_once(self):
+        tid = "task-base-lost-written"
+        self.assertIsNotNone(gw._write_task(_task(tid)))
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text(gw.STALLED_RESULT)        # base wrote it, then crashed
+        self.seed(tid, {"execution_generation": 1, "attempt": 1, "acked_at": time.time(),
+                        "awaiting_ack": False, "dispatch_lost": True})
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, "/v1/tasks/heartbeat": {"ok": True}}))
+        inflight: set = set()
+        gw._close_stale_turns(inflight)
+        self.assertEqual(gw._ATTEMPTS.get(tid)["dispatch_lost"]["body"], gw.STALLED_RESULT)
+        gw._post_task_beats(inflight, force=True)
+        gw._post_ready_results(inflight)
+        self.assertEqual([(p.get("status"), p.get("no_send")) for p in fake.posted("/v1/results")
+                          if p["id"] == tid], [("failed", True)], "its own file, posted once as failed")
+
+    def test_a_core_answer_that_replaced_the_failure_survives_a_newer_generation(self):
+        tid = "task-owed-replaced"
+        self.owed_failure(tid)
+        gw._post_task_beats({tid}, force=True)
+        tmp = gw.RESULTS_DIR / f".{tid}.core"
+        tmp.write_text("the core's answer")
+        os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")                        # the core's own file, same name
+        (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), "the core's answer",
+                         "only the file the bridge created is withdrawn")
+
+    def test_an_attempt_awaiting_its_migration_is_neither_acked_nor_woken(self):
+        tid = "task-base-unmigrated"
+        task = {"id": tid, "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.seed(tid, {"execution_generation": 1, "attempt": 1, "acked_at": time.time()})
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertFalse(gw._post_task_ack(tid, durable=True), "held until migrated")
+        self.assertIn(tid, gw._load_pending_acks())
+        wake = {"blocker_episode_id": "e1", "resolved_blockers": []}
+        self.assertIsNone(gw._write_task({**task, "wake": wake}), "its wake is left unacked")
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("execution_generation"), 1)
+        self.assertTrue(any("awaits its migration" in m for m in self.logs))
+
+    def test_a_start_that_cannot_read_or_hold_its_attempts_retires_none(self):
+        tid = "task-start-unknown"
+        self.held_then_archived(tid)
+        (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
+        saved = gw._ATTEMPTS.path.read_bytes()
+        self.addCleanup(lambda: gw._ATTEMPTS.path.write_bytes(saved))
+        gw._ATTEMPTS.path.write_text("{not json")
+        gw._close_stale_turns(set())
+        self.assertEqual(gw._ATTEMPTS.path.read_text(), "{not json", "an unreadable ledger is not touched")
+        self.assertTrue(any("nothing settled or retired at start" in m for m in self.logs))
+        gw._ATTEMPTS.path.write_bytes(saved)
+        with mock.patch.object(gw, "_save_inflight", return_value=False), \
+                mock.patch.object(gw._ATTEMPTS, "sweep") as sweep:
+            gw._close_stale_turns(set())
+        sweep.assert_not_called()
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("execution_generation"), 1)
+
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
         self.assertIsNotNone(gw._write_task(dict(task)))
