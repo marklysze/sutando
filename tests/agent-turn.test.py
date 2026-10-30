@@ -545,6 +545,16 @@ class AnswerOutcomes(unittest.TestCase):
         d = at.result_file_decision(self.recs(other), "Answered blue.", task_id="tsk_me")
         self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
 
+    def test_an_answer_outcome_tagged_with_this_task_still_never_rules_it(self):
+        # The proxy tags the record with the caller's task, while the applied state is the asker's.
+        for applied in ({"phase": "input_ready"}, {"phase": "completed", "terminal": True}):
+            with self.subTest(applied=applied):
+                ans = {**_outcome("t", 1, **applied), "task_id": "tsk_me", "action": "room.question.answer"}
+                v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+                self.assertNotIn(v.outcome, (at.DURABLY_SUSPENDED, at.TERMINAL_CONFIRMED))
+                d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
     def test_its_own_input_ready_still_suspends_it(self):
         own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
         self.assertEqual(at.classify_turn(self.recs(own), task_id="tsk_me").outcome, at.DURABLY_SUSPENDED)

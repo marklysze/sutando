@@ -386,7 +386,9 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
         merged = {**intent_by_op.get(op, {}), **by_op.get(op, {}), **r}
         merged["record_type"] = OUTCOME
         by_op[op] = merged
-    outcomes = sorted(by_op.values(), key=_seq)
+    # The proxy tags an outcome with the caller's own task, but an answer's applied state is the
+    # asker's: a room.question.answer never rules this turn's terminal or suspended state.
+    outcomes = sorted((o for o in by_op.values() if o.get("action") != "room.question.answer"), key=_seq)
     n = len(records.intents)
 
     if any(o.get("operation_status") == "succeeded" and _applied_terminal(o) for o in outcomes):
