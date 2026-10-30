@@ -5,6 +5,7 @@ Run:
 """
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -218,6 +219,29 @@ class Attempts(unittest.TestCase):
         self.assertFalse(agent_turn.is_closed(self.state, live))
         self.assertEqual(a.get("tsk_B"), {})
 
+    def lock_held(self):
+        lock = self.state / (agent_turn.ROOM_ACTIONS_NAME + ".lock")
+        lock.write_text(f"{os.getpid()} proxy 1")
+        return lock
+
+    def test_a_close_the_journal_lock_deferred_is_retried(self):
+        a = self.mk(turn_context=True)
+        old = a.record_ack("tsk_A", _ack(1))["turn_id"]
+        done = a.record_ack("tsk_B", {**_ack(1), "task_id": "tsk_B"})["turn_id"]
+        lock = self.lock_held()
+        with unittest.mock.patch.object(agent_turn, "JOURNAL_LOCK_WAIT_S", 0.05):
+            new = a.record_ack("tsk_A", _ack(2))["turn_id"]
+            a.finish("tsk_B")
+            self.assertEqual(a.close_finished_turns({"tsk_A"}), 0, "still held: nothing closes")
+        self.assertFalse(agent_turn.is_closed(self.state, old))
+        self.assertFalse(agent_turn.is_closed(self.state, done))
+        self.assertTrue(any("not closed yet" in m for m in self.logs))
+        lock.unlink()
+        self.assertEqual(a.close_finished_turns({"tsk_A"}), 2)
+        self.assertTrue(agent_turn.is_closed(self.state, old), "a superseded generation's turn")
+        self.assertTrue(agent_turn.is_closed(self.state, done), "a settled task's turn")
+        self.assertFalse(agent_turn.is_closed(self.state, new), "the live turn stays open")
+
     def test_tasks_md_server_reconciliation(self):
         clock = [1000.0]
         a = self.mk(now=lambda: clock[0])
@@ -226,15 +250,17 @@ class Attempts(unittest.TestCase):
         clock[0] += 60
         a.record_ack("tsk_new", {**_ack(2), "task_id": "tsk_new"})
         clock[0] += task_attempts.RECONCILE_GRACE_S
-        pages = iter([{"tasks": [{"task_id": "tsk_live"}], "next_cursor": "c1"},
-                      {"tasks": [{"task_id": "tsk_server_only", "execution_phase": "working"}],
-                       "next_cursor": None}])
-        self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = lambda _: next(pages)
+        self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = {
+            "tasks": [{"task_id": "tsk_live"}, {"task_id": "tsk_server_only", "execution_phase": "working"}],
+            "next_cursor": None}
         server = a.active_tasks()
         self.assertEqual([t["task_id"] for t in server], ["tsk_live", "tsk_server_only"])
-        self.assertIn("cursor=c1", self.gw.calls[-1][1])
+        self.assertIn("limit=200", self.gw.calls[-1][1])
+        self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = {"tasks": [{"task_id": "tsk_live"}], "next_cursor": "c1"}
+        self.assertIsNone(a.active_tasks(), "more than one page: a cursor walk can miss a task, so skip")
+        self.assertTrue(any("more than 200 outstanding" in m for m in self.logs))
         found = a.compare_with_server({"tsk_old", "tsk_new", "tsk_live"}, server)
-        self.assertEqual(found["closed_on_server"], ["tsk_old"], "a just-acked attempt waits")
+        self.assertEqual(found["not_listed"], ["tsk_old"], "a just-acked attempt waits")
         self.assertEqual([t["task_id"] for t in found["missing_locally"]], ["tsk_server_only"])
 
     def test_a_task_whose_ack_never_answered_ages_into_reconciliation(self):
@@ -243,18 +269,19 @@ class Attempts(unittest.TestCase):
         a.record_ack("tsk_known", _ack(1))
         self.assertTrue(a.broker_names_leases())
         a.remember_task("tsk_unacked", {"source_room_id": "!r:x"})
-        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [])["closed_on_server"], [],
+        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [])["not_listed"], [],
                          "within the grace it is not judged yet")
         clock[0] += max(task_attempts.ACK_HOLD_MAX_S, task_attempts.RECONCILE_GRACE_S) + 1
         self.assertIsNotNone(a.result_hold("tsk_unacked"), "held: this broker names leases")
         found = a.compare_with_server({"tsk_unacked"}, [])
-        self.assertEqual(found["closed_on_server"], ["tsk_unacked"], "aged from its publication")
+        self.assertEqual(found["not_listed"], ["tsk_unacked"], "aged from its publication")
+        self.assertIsNotNone(a.result_hold("tsk_unacked"), "not being listed fences nothing")
         a.fence("tsk_unacked", {"error_code": "task_already_terminal"})
         self.assertIsNone(a.result_hold("tsk_unacked"), "the fence ends the hold")
         self.assertEqual(a.result_decision("tsk_unacked", "x", False).action, agent_turn.SETTLE,
                          "and the result is settled, never sent ungated")
-        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [{"task_id": "tsk_unacked"}])["closed_on_server"],
-                         [], "a task the server still lists is never closed")
+        self.assertEqual(a.compare_with_server({"tsk_unacked"}, [{"task_id": "tsk_unacked"}])["not_listed"],
+                         [], "a task the server still lists is never reported")
 
     def test_an_incomplete_listing_skips_reconciliation(self):
         a = self.mk()
@@ -262,7 +289,7 @@ class Attempts(unittest.TestCase):
             self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = ans
             self.assertIsNone(a.active_tasks())
         self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = {"tasks": [], "next_cursor": "again"}
-        self.assertIsNone(a.active_tasks(max_pages=3), "a listing that never ends is not complete")
+        self.assertIsNone(a.active_tasks(), "a listing past one page is not complete")
 
     def test_a_wake_episode_runs_once_and_its_result_rides_its_own_item(self):
         a = self.mk(turn_context=True)
@@ -364,7 +391,7 @@ class FailurePaths(unittest.TestCase):
         turn = a.record_ack("tsk_L", _ack(1))["turn_id"]
         with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
             a._close_turn(turn)
-        self.assertTrue(any("closed without the journal lock" in m for m in self.logs))
+        self.assertTrue(any("not closed yet" in m for m in self.logs))
 
     def test_beats_carry_phase_and_a_bounded_step_and_survive_errors(self):
         gw = Gateway()

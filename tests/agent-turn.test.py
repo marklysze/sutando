@@ -192,14 +192,18 @@ class CloseUnderJournalLock(unittest.TestCase):
         self.assertTrue(done.wait(2))
         self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
 
-    def test_a_live_holder_past_the_wait_leaves_its_lock_and_the_turn_is_still_fenced(self):
+    def test_a_live_holder_past_the_wait_changes_nothing_and_a_later_close_lands(self):
         self.hold(os.getpid())
         start = time.monotonic()
         with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.2):
             self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
         self.assertLess(time.monotonic() - start, 1.5)
-        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
+        self.assertFalse(at.is_closed(self.state, self.ctx["turn_id"]), "never closed outside the lock")
+        self.assertTrue(at._turn_path(self.state, self.ctx["turn_id"], ".json").exists(), "the retry record")
         self.assertIn("proxytoken", self.lock.read_text(), "a live holder's lock is never broken")
+        self.lock.unlink()
+        self.assertTrue(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
 
     def test_lock_edges(self):
         with mock.patch.object(at.os, "kill", side_effect=PermissionError):
@@ -242,6 +246,7 @@ class CloseUnderJournalLock(unittest.TestCase):
         with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.1):
             self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
         self.assertTrue(self.lock.exists())
+        self.assertFalse(at.is_closed(self.state, self.ctx["turn_id"]))
 
 
 class TurnGate(unittest.TestCase):
@@ -438,6 +443,33 @@ class ResultFileDecision(unittest.TestCase):
         self.assertEqual(d.fields, {"status": "failed", "no_send": True}, "never read as no send")
         path.write_text(line[:-2] + "\n" + json.dumps({"ts": 1.0, **_intent("other_g1_X", 1)}) + "\n")
         self.assertEqual(self._decide().fields, {"status": "failed", "no_send": True}, "mid-file too")
+
+    def test_a_reply_sent_under_an_earlier_generation_is_not_sent_again(self):
+        g1 = _ctx(self.state, gen=1)["turn_id"]
+        g2 = _ctx(self.state, gen=2)["turn_id"]
+        _journal(self.state, {**_intent(g1, 1), "body_sha256": at.body_sha256("final answer")},
+                 {**_intent("tsk_B_g1_X", 1), "body_sha256": at.body_sha256("other answer")})
+        records = at.read_turn_records(self.state, g2, task_id="tsk_A")
+        self.assertEqual(at.result_file_decision(records, "final answer").fields,
+                         {"status": "completed", "no_send": True})
+        self.assertEqual(at.result_file_decision(records, "a new answer").fields, {"status": "completed"})
+        other = at.read_turn_records(self.state, "tsk_B_g2_Y", task_id="tsk_B")
+        self.assertEqual(at.result_file_decision(other, "final answer").fields, {"status": "completed"},
+                         "another task's send never counts")
+
+    def test_another_tasks_torn_line_is_skipped(self):
+        torn = json.dumps({"ts": 1.0, **_intent("other_g1_X", 1), "task_id": "other"})[:-2]
+        valid = json.dumps({"ts": 1.0, **_intent(self.turn, 1), "body_sha256": at.body_sha256("final answer")})
+        path = at.room_actions_path(self.state)
+        path.write_text(torn + "\n" + valid + "\n")
+        old = time.time() - at.PARTIAL_LINE_GRACE_S - 5
+        os.utime(path, (old, old))
+        self.assertEqual(self._decide().fields, {"status": "completed", "no_send": True},
+                         "one task's torn append never fails every other task")
+        self.assertTrue(at.read_turn_records(self.state, self.turn).readable)
+        path.write_text(json.dumps({"ts": 1.0, "task_id": "tsk_A", "record_type": at.INTENT})[:-3] + "\n" + valid + "\n")
+        self.assertFalse(at.read_turn_records(self.state, self.turn, task_id="tsk_A").readable,
+                         "a torn line naming this task still fails it closed")
 
     def test_an_append_in_progress_defers_and_a_stale_one_is_corruption(self):
         path = at.room_actions_path(self.state)

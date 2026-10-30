@@ -386,7 +386,8 @@ Sutando checkout around it sends neither field.
   task file has left the queue with no result, no claim and no turn activity for 10 min is never
   going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
   one still queued whose task file the core took up (a turn row newer than the file) and then left
-  with no turn activity and no result for 30 min; a task file the core has not reached yet keeps
+  with no turn activity and no result for 30 min while the core's health row reads it idle (2 h when
+  that reading is unknown; never while it reads moving, i.e. mid-turn on a long tool call); a task file the core has not reached yet keeps
   beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
   dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
@@ -394,7 +395,7 @@ Sutando checkout around it sends neither field.
   also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
   generation of the task is acked here. If the core took it already, the newer attempt it then
   leaves with no result and no queued task file is posted as `status: failed` with `no_send`. The other
-  two, from a beat, an ack or the active-list reconcile, withdraw the task file if the core has not
+  two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
   broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
@@ -412,12 +413,14 @@ Sutando checkout around it sends neither field.
   task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
   task_cancelled` or `400 waiting_input_without_blocker` is settled, not quarantined.
 - **`GET /v1/tasks/active?status=outstanding`** is read every five minutes, fully paged. An attempt
-  the server no longer lists (acked, or first published when no ack ever answered, more than
-  120 s ago) is fenced and its core work cancelled;
-  server tasks this node does not hold are written to `state/relay-outstanding-tasks.json`.
-- A served task carrying `wake` is never closed as a redelivery, and never run without its
-  answer. Without turn context, for an `ack_first` wake, or for an episode already run here, it
-  is left unacked, whether or not this node saw its first attempt.
+  the server does not list (acked, or first published when no ack ever answered, more than 120 s
+  ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
+  answers with one. Server tasks this node does not hold are written to
+  `state/relay-outstanding-tasks.json`.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is never closed as a redelivery, and never
+  run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
+  here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
+  ordinary task, as before.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
