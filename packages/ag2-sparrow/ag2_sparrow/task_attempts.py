@@ -179,14 +179,18 @@ class TaskAttempts:
 
     def answer_rule(self, task_id: str, question) -> "str | None":
         """The answer rule for a question not yet answered here, the already-answered note for
-        one that was, None when this agent may not answer."""
+        one that was, None when this agent may not answer. Answered here means recorded by question
+        id at a settle, or, before any settle, this task offered this question and its journal holds a
+        succeeded answer. The server's expected_revision only guards a concurrent answer: the rule
+        re-reads it before answering, so it does not stop a second one; this record does."""
         rule = answer_in_room_rule(task_id, question)
         if not rule:
             return None
         qid = _question_id(question)
         # The journal holds a succeeded answer before any result is decided: a crash or redelivery in
         # between still sees it.
-        if qid in self._load_answered() or agent_turn.answered_in_journal(self.state_dir, task_id):
+        offered = self.get(task_id).get("answer_offered")
+        if qid in self._load_answered() or (offered == qid and agent_turn.answered_in_journal(self.state_dir, task_id)):
             return ANSWERED_HERE_NOTE
         self._update(task_id, answer_offered=qid)
         return rule
