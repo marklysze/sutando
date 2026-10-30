@@ -82,8 +82,57 @@ class Attempts(unittest.TestCase):
         a.mark_dispatch_lost("tsk_A", "failed")
         self.assertFalse(a.beating({"tsk_A"}))
         self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "decided once")
-        d = a.result_decision("tsk_A", "x", True)
+        d = a.result_decision("tsk_A", "failed", True)
         self.assertEqual((d.action, d.fields), (agent_turn.POST, {"status": "failed", "no_send": True}))
+        self.assertIsNone(a.result_decision("tsk_A", "the core's own answer", False),
+                          "the marker rules only on the failure result it owes")
+
+    def test_owed_work_carries_its_generation_and_a_new_generation_drops_it(self):
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(1))
+        a.mark_dispatch_lost("tsk_A", "failed")
+        a._set("tsk_A", owed_close={"why": "closed"})
+        rec = a.get("tsk_A")
+        self.assertEqual((rec["schema"], rec["dispatch_lost"]["gen"], rec["owed_close"]["gen"]), (2, 1, 1))
+        self.assertEqual(a.owing(), {"tsk_A"})
+        a.record_ack("tsk_A", _ack(2))
+        rec = a.get("tsk_A")
+        self.assertEqual((rec.get("dispatch_lost"), rec.get("owed_close")), (None, None))
+        self.assertEqual(a.owing(), set())
+
+    def test_the_sweep_never_drops_a_record_that_owes(self):
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(1))
+        a.mark_dispatch_lost("tsk_A", "failed")
+        a.record_ack("tsk_B", _ack(1))
+        a.sweep(set())
+        self.assertEqual((bool(a.get("tsk_A")), bool(a.get("tsk_B"))), (True, False))
+
+    def test_base_records_are_upgraded_once(self):
+        a = self.mk()
+        ids = iter(f"ctl-{i}" for i in range(10))
+        a.path.write_text(json.dumps({
+            "lost": {"execution_generation": 1, "dispatch_lost": True},
+            "stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None},
+            "stale": {"execution_generation": 1, "fenced": "stale_execution_generation"},
+            "closed": {"execution_generation": 1, "fenced": "task_not_found"},
+            "done": {"execution_generation": 1, "fenced": "cancel_confirmed"}}))
+        self.assertEqual(a.upgrade(lambda: next(ids), lambda t: f"body of {t}"), 5)
+        got = a._load()
+        self.assertEqual(got["lost"]["dispatch_lost"], {"body": "body of lost", "gen": 1})
+        self.assertEqual((got["stop"]["stop_ctl"], got["stop"]["owed_ctl"]["id"]), ("ctl-0", "ctl-0"))
+        self.assertEqual((got["stale"]["fence_ctl"], got["stale"]["owed_ctl"]["id"]), ("ctl-1", "ctl-1"))
+        self.assertEqual(got["closed"]["owed_close"]["gen"], 1)
+        self.assertFalse(task_attempts._owes(got["done"]), "a confirmed cancel owes nothing")
+        self.assertEqual(a.upgrade(lambda: next(ids), lambda t: "x"), 0, "idempotent")
+        self.assertEqual(a._load(), got)
+
+    def test_an_unreadable_ledger_is_never_upgraded_or_owing(self):
+        a = self.mk()
+        a.path.write_text("{not json")
+        self.assertEqual(a.upgrade(lambda: "c", lambda t: "x"), 0)
+        self.assertEqual(a.owing(), set())
+        self.assertEqual(a.path.read_text(), "{not json")
 
     def test_last_activity_reads_only_the_sessions_own_rows(self):
         self.assertIsNone(task_attempts.last_activity(self.state, "t1"), "no log")

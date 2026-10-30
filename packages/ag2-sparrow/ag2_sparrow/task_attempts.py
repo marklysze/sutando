@@ -76,6 +76,11 @@ WAKE_TURN_RULE = (
 _MUTEX = threading.Lock()
 # wake_item() when its records cannot be read: no delivery is attempted and nothing is decided.
 UNKNOWN = "<unknown>"
+# A record without it was written before owed work carried its generation: upgrade() normalises it.
+SCHEMA = 2
+# Work a record owes until it is done; each is stamped with the generation it belongs to.
+DEBTS = ("owed_ctl", "owed_close", "dispatch_lost")
+CLOSED_FENCES = ("task_already_terminal", "task_not_found", "task_cancelled")
 
 
 def http_error_code(e: urllib.error.HTTPError) -> "tuple[str, dict]":
@@ -165,13 +170,17 @@ class TaskAttempts:
 
     def _merge(self, wire_tid: str, fields: dict) -> "tuple[dict, bool]":
         """Merge `fields` into the record; the record and whether it was saved. An unreadable
-        ledger is left as it is, never rewritten."""
+        ledger is left as it is, never rewritten. Owed work is stamped with the record's generation."""
         with _MUTEX:
             data = self._read_json(self.path)
             if data is None:
                 self.log(f"task {wire_tid}: {self.path.name} unreadable — not written")
                 return {}, False
-            rec = {**data.get(wire_tid, {}), **fields}
+            old = data.get(wire_tid)
+            rec = {**(old or {"schema": SCHEMA}), **fields}
+            for k in DEBTS:
+                if isinstance(fields.get(k), dict) and "gen" not in fields[k]:
+                    rec[k] = {**fields[k], "gen": rec.get("execution_generation")}
             data[wire_tid] = rec
             return rec, self._save(data)
 
@@ -236,10 +245,12 @@ class TaskAttempts:
             return self._update(wire_tid, awaiting_ack=False)
         if rec.get("turn_id") and rec.get("execution_generation") != gen:
             self._close_turn(rec["turn_id"])
+        # The caller has already retracted the older generation's controls and failure file.
         fields = {"execution_generation": gen, "attempt": response.get("attempt"),
                   "lease_expires_at": response.get("lease_expires_at"),
                   "acked_at": self.now(), "turn_id": None, "issued_at": None, "fenced": None,
-                  "awaiting_ack": False}
+                  "awaiting_ack": False, "dispatch_lost": None, "owed_close": None,
+                  "stop_requested": None, "stop_confirmed": None, "missing_since": None}
         if self.turn_context and open_turn:
             fields.update(self._open_turn(wire_tid, gen, rec, agent_mxid))
         return self._update(wire_tid, **fields)
@@ -339,7 +350,29 @@ class TaskAttempts:
 
     def mark_dispatch_lost(self, wire_tid: str, body: str) -> bool:
         """Stop the attempt's beats; `body` is the failure result it owes until one is written."""
-        return self._set(wire_tid, dispatch_lost=body)
+        return self._set(wire_tid, dispatch_lost={"body": body})
+
+    def owing(self) -> "set[str]":
+        """Every task whose record still owes work; empty when the ledger cannot be read."""
+        data = self._read_json(self.path) or {}
+        return {t for t, r in data.items() if isinstance(r, dict) and _owes(r)}
+
+    def upgrade(self, new_ctl: Callable[[], str], lost_body: Callable[[str], str]) -> int:
+        """Normalise records written before owed work carried its generation, once each: a Stop or
+        a fence whose control was never queued owes it, and a lost attempt owes its failure result.
+        Idempotent; the number of records upgraded. An unreadable ledger is left as it is."""
+        with _MUTEX:
+            data = self._read_json(self.path)
+            if data is None:
+                return 0
+            old = [t for t, r in data.items() if isinstance(r, dict) and r.get("schema") != SCHEMA]
+            for t in old:
+                data[t] = _upgraded(t, data[t], new_ctl, lost_body)
+            if old and not self._save(data):
+                return 0
+        for t in old:
+            self.log(f"task {t}: attempt record upgraded")
+        return len(old)
 
     def beating(self, wire_tids) -> bool:
         """Whether any of these attempts is due per-task beats."""
@@ -454,13 +487,14 @@ class TaskAttempts:
                  "is gated on its own journal records and goes without lease fields")
         return None
 
-    def result_decision(self, wire_tid: str, body: str, no_send: bool):
-        """The turn gate's ruling on this result, or None when the attempt has no turn."""
+    def result_decision(self, wire_tid: str, body: str, no_send: bool, published: "str | None" = None):
+        """The turn gate's ruling on this result, or None when the attempt has no turn. `published` is
+        the result file's own text when delivery rewrote it into `body`."""
         rec = self.get(wire_tid)
         if rec.get("fenced") in ("task_cancelled", "cancel_confirmed", "stale_execution_generation",
                                  "task_already_terminal", "task_not_found"):
             return agent_turn.ResultDecision(agent_turn.SETTLE, {}, f"attempt fenced ({rec['fenced']})")
-        if rec.get("dispatch_lost"):
+        if owns_result(rec, body if published is None else published):
             return agent_turn.ResultDecision(agent_turn.POST, {"status": "failed", "no_send": True},
                                              "the task left the queue unanswered")
         if not self.turn_context:
@@ -541,9 +575,9 @@ class TaskAttempts:
                 if data is None:
                     self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
                     return None
-                data[wire_tid] = {**data.get(wire_tid, {}), "wake_episode": episode, "turn_id": None,
-                                  "issued_at": None, "execution_generation": None, "fenced": None,
-                                  "published_at": None, "hold_reported": None}
+                data[wire_tid] = {**data.get(wire_tid, {"schema": SCHEMA}), "wake_episode": episode,
+                                  "turn_id": None, "issued_at": None, "execution_generation": None,
+                                  "fenced": None, "published_at": None, "hold_reported": None}
                 if not self._save(data):
                     self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
                     return None
@@ -590,7 +624,7 @@ class TaskAttempts:
                 closed += not p.exists()
         with _MUTEX:
             data = self._read_json(self.path) or {}
-            stale = [t for t in data if t not in live]
+            stale = [t for t in data if t not in live and not _owes(data[t])]
             for t in stale:
                 data.pop(t)
             if stale:
@@ -702,6 +736,50 @@ def wake_turn_rule(episode: str) -> str:
 
 def ask_in_room_rule(task_id: str) -> str:
     return ASK_IN_ROOM_RULE.format(task_id=task_id)
+
+
+def owns_result(rec: dict, body: str) -> bool:
+    """Whether `body` is the failure result this attempt's record owes: one the core wrote first is
+    its own answer. A boolean marker predates the body and claims any result, as it did then."""
+    lost = rec.get("dispatch_lost")
+    if lost is True:
+        return True
+    return failure_body_of(lost, body) and lost.get("gen") == rec.get("execution_generation")
+
+
+def failure_body_of(lost, body: str) -> bool:
+    """Whether `body` is the failure result the dispatch-lost marker `lost` writes."""
+    return (isinstance(lost, dict) and isinstance(lost.get("body"), str)
+            and body.strip() == lost["body"].strip())
+
+
+def _owes(rec) -> bool:
+    return isinstance(rec, dict) and (any(rec.get(k) for k in DEBTS) or bool(rec.get("taken_ctl")))
+
+
+def _upgraded(wire_tid: str, rec: dict, new_ctl: Callable[[], str],
+              lost_body: Callable[[str], str]) -> dict:
+    gen = rec.get("execution_generation")
+    out = {**rec, "schema": SCHEMA}
+    lost = rec.get("dispatch_lost")
+    if lost is True or isinstance(lost, str):
+        out["dispatch_lost"] = {"body": lost if isinstance(lost, str) else lost_body(wire_tid), "gen": gen}
+    elif lost is not None and not isinstance(lost, dict):
+        out["dispatch_lost"] = None
+    if isinstance(rec.get("owed_close"), str):
+        out["owed_close"] = {"why": rec["owed_close"], "gen": gen}
+    if isinstance(rec.get("owed_ctl"), dict) and "gen" not in rec["owed_ctl"]:
+        out["owed_ctl"] = {**rec["owed_ctl"], "gen": gen}
+    fenced = rec.get("fenced")
+    if rec.get("stop_requested") and not rec.get("stop_ctl") and not fenced:
+        ctl = new_ctl()
+        out.update(stop_ctl=ctl, owed_ctl={"id": ctl, "reason": "task_cancelled", "gen": gen})
+    elif fenced == "stale_execution_generation" and not (rec.get("fence_ctl") or rec.get("owed_ctl")):
+        ctl = new_ctl()
+        out.update(fence_ctl=ctl, owed_ctl={"id": ctl, "reason": fenced, "gen": gen})
+    elif fenced in CLOSED_FENCES and not (rec.get("owed_close") or rec.get("owed_ctl")):
+        out["owed_close"] = {"why": f"closed on the server ({fenced})", "gen": gen}
+    return out
 
 
 def _beats(rec: dict) -> bool:
