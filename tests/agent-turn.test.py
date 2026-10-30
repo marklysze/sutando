@@ -192,14 +192,18 @@ class CloseUnderJournalLock(unittest.TestCase):
         self.assertTrue(done.wait(2))
         self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
 
-    def test_a_live_holder_past_the_wait_leaves_its_lock_and_the_turn_is_still_fenced(self):
+    def test_a_live_holder_past_the_wait_changes_nothing_and_a_later_close_lands(self):
         self.hold(os.getpid())
         start = time.monotonic()
         with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.2):
             self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
         self.assertLess(time.monotonic() - start, 1.5)
-        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
+        self.assertFalse(at.is_closed(self.state, self.ctx["turn_id"]), "never closed outside the lock")
+        self.assertTrue(at._turn_path(self.state, self.ctx["turn_id"], ".json").exists(), "the retry record")
         self.assertIn("proxytoken", self.lock.read_text(), "a live holder's lock is never broken")
+        self.lock.unlink()
+        self.assertTrue(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
 
     def test_lock_edges(self):
         with mock.patch.object(at.os, "kill", side_effect=PermissionError):
@@ -242,6 +246,7 @@ class CloseUnderJournalLock(unittest.TestCase):
         with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.1):
             self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
         self.assertTrue(self.lock.exists())
+        self.assertFalse(at.is_closed(self.state, self.ctx["turn_id"]))
 
 
 class TurnGate(unittest.TestCase):
@@ -403,6 +408,23 @@ class ResultFileDecision(unittest.TestCase):
                 d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
                 self.assertEqual((d.action, d.fields), (at.SETTLE, {}))
 
+    def test_a_lost_or_unknown_ask_outcome_is_never_posted_as_the_reply(self):
+        for outcome in (None, "dispatched_unknown"):
+            with self.subTest(outcome=outcome):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                recs = [_intent(turn, 1, action="room.question.ask")]
+                if outcome:
+                    recs.append(_outcome(turn, 1, op_status=outcome))
+                _journal(state, *recs)
+                d = at.result_file_decision(at.read_turn_records(state, turn), "I asked which colour")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "the answer").fields,
+                         {"status": "completed"}, "a lost message send is not a question")
+
     def test_an_outcome_whose_task_the_ledger_does_not_know_is_unknown_not_terminal_or_suspended(self):
         def unknown(turn, seq, action="room.message.send", status="done"):
             return {"record_type": at.OUTCOME, "turn_id": turn, "seq": seq, "action": action,
@@ -438,6 +460,33 @@ class ResultFileDecision(unittest.TestCase):
         self.assertEqual(d.fields, {"status": "failed", "no_send": True}, "never read as no send")
         path.write_text(line[:-2] + "\n" + json.dumps({"ts": 1.0, **_intent("other_g1_X", 1)}) + "\n")
         self.assertEqual(self._decide().fields, {"status": "failed", "no_send": True}, "mid-file too")
+
+    def test_a_reply_sent_under_an_earlier_generation_is_not_sent_again(self):
+        g1 = _ctx(self.state, gen=1)["turn_id"]
+        g2 = _ctx(self.state, gen=2)["turn_id"]
+        _journal(self.state, {**_intent(g1, 1), "body_sha256": at.body_sha256("final answer")},
+                 {**_intent("tsk_B_g1_X", 1), "body_sha256": at.body_sha256("other answer")})
+        records = at.read_turn_records(self.state, g2, task_id="tsk_A")
+        self.assertEqual(at.result_file_decision(records, "final answer").fields,
+                         {"status": "completed", "no_send": True})
+        self.assertEqual(at.result_file_decision(records, "a new answer").fields, {"status": "completed"})
+        other = at.read_turn_records(self.state, "tsk_B_g2_Y", task_id="tsk_B")
+        self.assertEqual(at.result_file_decision(other, "final answer").fields, {"status": "completed"},
+                         "another task's send never counts")
+
+    def test_another_tasks_torn_line_is_skipped(self):
+        torn = json.dumps({"ts": 1.0, **_intent("other_g1_X", 1), "task_id": "other"})[:-2]
+        valid = json.dumps({"ts": 1.0, **_intent(self.turn, 1), "body_sha256": at.body_sha256("final answer")})
+        path = at.room_actions_path(self.state)
+        path.write_text(torn + "\n" + valid + "\n")
+        old = time.time() - at.PARTIAL_LINE_GRACE_S - 5
+        os.utime(path, (old, old))
+        self.assertEqual(self._decide().fields, {"status": "completed", "no_send": True},
+                         "one task's torn append never fails every other task")
+        self.assertTrue(at.read_turn_records(self.state, self.turn).readable)
+        path.write_text(json.dumps({"ts": 1.0, "task_id": "tsk_A", "record_type": at.INTENT})[:-3] + "\n" + valid + "\n")
+        self.assertFalse(at.read_turn_records(self.state, self.turn, task_id="tsk_A").readable,
+                         "a torn line naming this task still fails it closed")
 
     def test_an_append_in_progress_defers_and_a_stale_one_is_corruption(self):
         path = at.room_actions_path(self.state)
@@ -495,6 +544,16 @@ class AnswerOutcomes(unittest.TestCase):
         self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
         d = at.result_file_decision(self.recs(other), "Answered blue.", task_id="tsk_me")
         self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_an_answer_outcome_tagged_with_this_task_still_never_rules_it(self):
+        # The proxy tags the record with the caller's task, while the applied state is the asker's.
+        for applied in ({"phase": "input_ready"}, {"phase": "completed", "terminal": True}):
+            with self.subTest(applied=applied):
+                ans = {**_outcome("t", 1, **applied), "task_id": "tsk_me", "action": "room.question.answer"}
+                v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+                self.assertNotIn(v.outcome, (at.DURABLY_SUSPENDED, at.TERMINAL_CONFIRMED))
+                d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
 
     def test_its_own_input_ready_still_suspends_it(self):
         own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
