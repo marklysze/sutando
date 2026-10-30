@@ -314,7 +314,9 @@ class Attempts(unittest.TestCase):
         self.assertEqual(rec["wake_episode"], "ep1", "the ack keeps the wake")
         a.finish("tsk_A")
         self.assertIsNone(a.open_wake("tsk_A", wake), "a settled wake is never run again")
-        self.assertIsNone(a.wake_item("tsk_A"))
+        self.assertEqual(self.mk().wake_item("tsk_A"), "tsk_A.wake-ep1", "kept across a restart until archival")
+        a.sweep(set())
+        self.assertIsNone(a.wake_item("tsk_A"), "forgotten once the task left flight")
         self.assertEqual(self.mk().open_wake("tsk_A", wake), None, "remembered across restarts")
         self.assertEqual(a.open_wake("tsk_A", {**wake, "blocker_episode_id": "ep2"}), "ep2")
         for bad in ({}, {"blocker_episode_id": "../x"}, {"blocker_episode_id": 7}, None):

@@ -7654,7 +7654,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     ruled = live if result_file is not None else body
     source = ({"source_ready_sha256": source_digest(live)}
               if live is not None and getattr(core.backend, "records_source_digest", False) else {})
-    if item_id != broker_tid:
+    if item_id != broker_tid and not (woken_item and not (attempt or {}).get("wake_episode")):
+        # A settled wake's item (kept until archival) is already delivered: re-offered, it is not re-sent.
         core.backend.publish(item_id, payload, republish_delivered=True, **source)
     else:
         core.backend.publish(item_id, payload, **source)
