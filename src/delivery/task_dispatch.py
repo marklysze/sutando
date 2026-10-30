@@ -24,6 +24,7 @@ cleanup.
 CLI, for bash callers with only an interpreter path:
 
     task_dispatch.py has-result <results_dir> <filename> [--task-file P]  # exit 0/1
+    task_dispatch.py wake-turn <tasks_dir> <filename>                  # exit 0 = a woken task's new turn
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
     task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
@@ -69,7 +70,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import index_result_candidates, iter_result_candidates  # noqa: E402
+from local_task_protocol import (index_result_candidates, iter_result_candidates,  # noqa: E402
+                                 parse_task_headers)
 
 from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
@@ -153,16 +155,25 @@ def has_ready_result(results_dir: "Path | str", filename: str, *,
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
     An empty or whitespace-only file — live or archived — is not a delivery and
-    does not stop the search; `find_ready_result` walks past it. With `task_file`,
-    a result older than that file answered an earlier turn of the same id, not this one.
+    does not stop the search; `find_ready_result` walks past it. With `task_file` a wake
+    turn, a result older than that file answered an earlier turn of the same id, not this one.
     """
     reader = read_ready_result
-    since = _mtime(task_file) if task_file is not None else None
+    since = _mtime(task_file) if task_file is not None and is_wake_turn(task_file) else None
     if since is not None:
         def reader(path):
             written = _mtime(path)
             return None if written is not None and written < since else read_ready_result(path)
     return find_ready_result_for_filename(results_dir, filename, reader=reader) is not None
+
+
+def is_wake_turn(task_file: "Path | str") -> bool:
+    """A queued file a woken task was written to: a new turn of an id an earlier result answered."""
+    try:
+        text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(parse_task_headers(text).headers.get("wake_episode"))
 
 
 def _mtime(path) -> "float | None":
@@ -425,6 +436,7 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 
 _USAGE = (
     "usage: task_dispatch.py has-result <results_dir> <filename> [--task-file P]\n"
+    "       task_dispatch.py wake-turn <tasks_dir> <filename>   # exit 0 a wake turn / 1 not\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
     "       task_dispatch.py head-abandoned <results_dir> <filename> <payload>   # exit 0 drop / 1 keep\n"
     "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
@@ -570,6 +582,11 @@ def _main(argv: list[str]) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return 0 if has_ready_result(first, second, task_file=rest[1] if rest else None) else 1
+    if cmd == "wake-turn":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if is_wake_turn(Path(first) / second) else 1
     if cmd == "head-abandoned":
         if len(rest) != 1:
             print(_USAGE, file=sys.stderr)

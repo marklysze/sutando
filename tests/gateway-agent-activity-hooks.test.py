@@ -885,6 +885,7 @@ class Hooks(unittest.TestCase):
         text = (gw.TASKS_DIR / "task-h8.txt").read_text()
         self.assertIn("top-level `task_id` `task-h8`", text, "every task carries the ask-in-room rule")
         self.assertNotIn("NEW turn", text)
+        self.assertNotIn("wake_episode", text)
         (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
         (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
         (gw.RESULTS_DIR / "archive").mkdir(exist_ok=True)
@@ -901,6 +902,8 @@ class Hooks(unittest.TestCase):
         self.assertIn('chose option "b"', body)
         self.assertIn("This is a NEW turn of this task (question episode e1)",
                       (gw.TASKS_DIR / "task-h8.txt").read_text(), "a wake's file says it is not a re-emit")
+        head = (gw.TASKS_DIR / "task-h8.txt").read_text().split("\ntask: ")[0].splitlines()
+        self.assertIn("wake_episode: e1", head, "the Stop hook reads a wake turn from its header")
         self.assertFalse(gw._result_disposed("task-h8"), "while the wake is open only its item decides")
         self.assertEqual(gw._ATTEMPTS.wake_item("task-h8"), "task-h8.wake-e1")
 
