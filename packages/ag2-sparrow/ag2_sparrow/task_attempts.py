@@ -84,6 +84,11 @@ ANSWER_IN_ROOM_RULE = (
 ANSWERED_HERE_NOTE = (
     "The room question quoted above was already answered by this agent; do not answer it again. "
     "Write this task's result file as `[no-send]` with a one-line note that it was answered.")
+# The answer cannot be undone, so an offer that was not recorded never carries the instruction.
+ANSWER_UNRECORDED_NOTE = (
+    "The room question quoted above cannot be answered from this task: this agent could not record "
+    "that it was offered it. Do not answer it. Write this task's result file as `[no-send]` with a "
+    "one-line note that the question was left unanswered.")
 ANSWERED_KEPT = 500
 ANSWER_OFFERS_PER_Q = 8
 _QUESTION_KEYS = ("question_id", "expected_revision", "prompt", "options", "allow_free_text",
@@ -205,8 +210,12 @@ class TaskAttempts:
             if qid in self._load_answered() or any(agent_turn.answered_in_journal(self.state_dir, t) for t in tasks):
                 return ANSWERED_HERE_NOTE
             offers[qid] = (tasks + [task_id] if task_id not in tasks else tasks)[-ANSWER_OFFERS_PER_Q:]
-            self._save_json(self._offers_path, dict(list(offers.items())[-ANSWERED_KEPT:]))
-        self._update(task_id, answer_offered=qid)
+            if not self._save_json(self._offers_path, dict(list(offers.items())[-ANSWERED_KEPT:])):
+                return ANSWER_UNRECORDED_NOTE
+            data = self._load()
+            data[task_id] = {**data.get(task_id, {}), "answer_offered": qid}
+            if not self._save(data):
+                return ANSWER_UNRECORDED_NOTE
         return rule
 
     def _note_answered(self, rec: dict, records) -> None:

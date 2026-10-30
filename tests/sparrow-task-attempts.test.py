@@ -446,6 +446,17 @@ class AnsweredOnce(unittest.TestCase):
         self.assertEqual(again.answer_rule("tsk_B", self.Q), task_attempts.ANSWERED_HERE_NOTE)
         self.assertIn("`room.question.answer`", again.answer_rule("tsk_B", {**self.Q, "question_id": "rq_2"}))
 
+    def test_an_offer_that_cannot_be_recorded_never_carries_the_answer_instruction(self):
+        for failing in ("relay-answer-offers", "relay-task-attempts"):
+            with self.subTest(failing=failing):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk(turn_context=True)
+                real = a._save_json
+                with unittest.mock.patch.object(a, "_save_json", side_effect=lambda p, d: (
+                        False if p.name.startswith(failing) else real(p, d))):
+                    self.assertEqual(a.answer_rule("tsk_U", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+                self.assertIn("`room.question.answer`", a.answer_rule("tsk_U", self.Q), "recorded: the rule")
+
     def test_a_redelivery_after_a_crash_sees_the_answer_in_the_journal(self):
         a = self.mk(turn_context=True)
         self.assertIn("`room.question.answer`", a.answer_rule("tsk_R", self.Q))
