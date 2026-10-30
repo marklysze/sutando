@@ -4992,7 +4992,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
                 card = {k: str(pc[k]) for k in _PLATFORM_CARD_KEYS}
                 lines.append(f"platform_card: {json.dumps(card, separators=(',', ':'))}")
         elif f == "room_question":
-            rq_line = task_attempts.render_room_question(task.get(f))
+            rq_line = task_attempts.render_room_question(task.get(f)) if TURN_CONTEXT else None
             if rq_line:
                 lines.append(rq_line)
         elif f == "picker_command":
@@ -5019,7 +5019,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         if woken:
             lines.append(task_attempts.wake_turn_rule(woken))
         lines.append(task_attempts.ask_in_room_rule(broker_tid))
-        answer_rule = task_attempts.answer_in_room_rule(broker_tid, task.get("room_question"))
+        answer_rule = _ATTEMPTS.answer_rule(broker_tid, task.get("room_question"))
         if answer_rule:
             lines.append(answer_rule)
     # A relay-stamped Signal task may attach from ITS OWN output directory only;
