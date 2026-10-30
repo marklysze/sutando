@@ -51,6 +51,7 @@ RECONCILE_GRACE_S = 120.0
 # on the task's own journal records and posted without lease fields.
 ACK_HOLD_MAX_S = 120.0
 WAKE_EPISODES_KEPT = 20
+WAKE_ITEMS_KEPT = 200
 _EPISODE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Kept in one place so its wording and placement can change together.
 ASK_IN_ROOM_RULE = (
@@ -107,6 +108,8 @@ class TaskAttempts:
         self.path = self.state_dir / f"relay-task-attempts{suffix}.json"
         self._worker_path = self.state_dir / f"relay-lease-worker-id{suffix}"
         self._wakes_path = self.state_dir / f"relay-wake-episodes{suffix}.json"
+        # A settled wake's outbox item, kept until its task leaves flight: its result is archived after.
+        self._wake_items_path = self.state_dir / f"relay-wake-items{suffix}.json"
         self._contract_path = self.state_dir / f"relay-broker-contract{suffix}.json"
         self._task_beat_disabled = False
 
@@ -136,8 +139,12 @@ class TaskAttempts:
             return False
 
     def _load_wakes(self) -> dict:
+        return self._load_json(self._wakes_path)
+
+    @staticmethod
+    def _load_json(path: Path) -> dict:
         try:
-            data = json.loads(self._wakes_path.read_text())
+            data = json.loads(path.read_text())
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -460,6 +467,9 @@ class TaskAttempts:
                 seen = [e for e in wakes.get(wire_tid, []) if e != rec["wake_episode"]]
                 wakes[wire_tid] = (seen + [rec["wake_episode"]])[-WAKE_EPISODES_KEPT:]
                 self._save_json(self._wakes_path, wakes)
+                items = self._load_json(self._wake_items_path)
+                items[wire_tid] = f"{wire_tid}.wake-{rec['wake_episode']}"
+                self._save_json(self._wake_items_path, dict(list(items.items())[-WAKE_ITEMS_KEPT:]))
         if rec.get("turn_id"):
             self._close_turn(rec["turn_id"])
         return True
@@ -484,9 +494,13 @@ class TaskAttempts:
         return episode
 
     def wake_item(self, wire_tid: str) -> "str | None":
-        """The outbox item for a woken attempt's result, distinct from the first attempt's."""
+        """The outbox item for a woken attempt's result, distinct from the first attempt's: the open
+        wake's, else a settled wake's until its task leaves flight (its result may still be live)."""
         episode = self.get(wire_tid).get("wake_episode")
-        return f"{wire_tid}.wake-{episode}" if episode else None
+        if episode:
+            return f"{wire_tid}.wake-{episode}"
+        item = self._load_json(self._wake_items_path).get(wire_tid)
+        return item if isinstance(item, str) else None
 
     def close_finished_turns(self, live_wire_tids) -> int:
         """Close every open turn whose task is no longer in flight, or which a newer generation of its
@@ -518,6 +532,9 @@ class TaskAttempts:
                 data.pop(t)
             if stale:
                 self._save(data)
+            items = self._load_json(self._wake_items_path)
+            if any(t not in live for t in items):
+                self._save_json(self._wake_items_path, {t: i for t, i in items.items() if t in live})
         return closed
 
     # ── reconciliation with the server ledger ────────────────────────────
