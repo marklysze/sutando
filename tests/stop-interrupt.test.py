@@ -37,10 +37,17 @@ class FakeTmux:
             return "0\n"
         if "capture-pane" in argv:
             return self.pane_text
+        if argv[-1] == "tmux-socket":
+            return "/run/core.sock\n"
         return ""
 
     def escapes(self):
         return [c for c in self.calls if c[-1] == "Escape"]
+
+
+class NoSocket(FakeTmux):
+    def __call__(self, argv):
+        return "" if argv[-1] == "tmux-socket" else super().__call__(argv)
 
 
 class StopInterrupt(unittest.TestCase):
@@ -54,7 +61,7 @@ class StopInterrupt(unittest.TestCase):
         self.now = time.time()
         self.logs = []
         env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_TMUX")}
-        mock.patch.dict(os.environ, env, clear=True).start()
+        mock.patch.dict(os.environ, {**env, si.ENABLE_ENV: "1"}, clear=True).start()
         self.addCleanup(mock.patch.stopall)
 
     def tearDown(self):
@@ -81,6 +88,8 @@ class StopInterrupt(unittest.TestCase):
         self.assertEqual(len(esc), 1)
         self.assertIn("tmux-pane-keys.sh", esc[0][1])
         self.assertEqual(esc[0][esc[0].index("-t") + 1], "=sutando-core:0")
+        self.assertEqual(esc[0][esc[0].index("-S") + 1], "/run/core.sock", "the launcher's socket, via the config helper")
+        self.assertIn(["bash", str(si.CONFIG_SH), "tmux-socket"], tmux.calls)
         self.assertIn("interrupted the running turn", self.owner_rows()[-1]["line"])
         self.assertEqual(self.owner_rows()[-1]["room"], "!room:x")
 
@@ -253,25 +262,64 @@ class StopInterrupt(unittest.TestCase):
         with mock.patch.object(si, "interrupt", side_effect=RuntimeError("boom")):
             self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks)]), 0, "advisory: never fails")
 
+    def test_an_explicit_socket_wins_and_no_socket_sends_no_key(self):
+        self.row(TARGET)
+        os.environ["SUTANDO_TMUX_SOCK"] = "/explicit.sock"
+        tmux = FakeTmux()
+        self.assertTrue(self.run_it(tmux))
+        self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-S") + 1], "/explicit.sock")
+        del os.environ["SUTANDO_TMUX_SOCK"]
+        silent = NoSocket()
+        self.assertFalse(self.run_it(silent))
+        self.assertEqual(silent.escapes(), [])
+        self.assertIn("no tmux socket", self.logs[-1])
+
+    def emit(self, switch):
+        ctl = self.tasks / "task-ctl-1.txt"
+        ctl.write_text(f"id: task-ctl-1\ntask: CANCEL_INSTRUCTION: stop processing {TARGET}\n")
+        stub = self.ws / "py"
+        record = self.ws / "calls"
+        record.unlink(missing_ok=True)
+        stub.write_text(f'#!/bin/bash\necho "$*" >> "{record}"\n')
+        stub.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != si.ENABLE_ENV}
+        if switch is not None:
+            env[si.ENABLE_ENV] = switch
+        subprocess.run(["bash", "-c", f'source "{REPO}/src/task-emit.sh"; activity_cancel_target "{ctl.name}"; wait'],
+                       env={**env, "SUTANDO_PY_BIN": str(stub), "TASKS_DIR": str(self.tasks)}, check=True)
+        want = ("stop-requested", "stop_interrupt.py") if switch and switch.lower() in si.TRUE else ("CANCELLED",)
+        for _ in range(100):
+            if record.exists() and all(w in record.read_text() for w in want):
+                break
+            time.sleep(0.05)
+        return ctl, [c.split("/src/", 1)[-1] for c in record.read_text().splitlines()]
+
+    def test_with_the_switch_off_a_cancel_is_cancelled_at_once_as_before(self):
+        for switch in (None, "", "0", "no", "off", "maybe"):
+            _, calls = self.emit(switch)
+            self.assertEqual(calls, [f"activity_bus.py transition CANCELLED --task-id {TARGET} --reason cancel requested"],
+                             f"switch {switch!r}: no Escape, no confirm poller")
+            self.assertFalse(si.enabled({si.ENABLE_ENV: switch} if switch is not None else {}))
+
+    def test_the_shell_and_python_read_the_switch_alike(self):
+        for switch in ("1", "true", "YES", "On"):
+            _, calls = self.emit(switch)
+            self.assertTrue([c for c in calls if c.startswith("stop_interrupt.py")], switch)
+            self.assertTrue(si.enabled({si.ENABLE_ENV: switch}))
+
+    def test_the_cli_does_nothing_with_the_switch_off(self):
+        os.environ.pop(si.ENABLE_ENV)
+        with mock.patch.object(si, "interrupt", side_effect=AssertionError("must not run")), \
+                mock.patch.object(si, "confirm_stop", side_effect=AssertionError("must not run")):
+            self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks), "--control-file", "x"]), 0)
+
     def test_run_returns_stdout_only_on_success(self):
         self.assertEqual(si._run(["echo", "hi"]), "hi\n")
         self.assertIsNone(si._run(["false"]))
         self.assertIsNone(si._run(["/nonexistent/tmux"]))
 
     def test_the_watcher_emit_hands_the_cancelled_task_to_stop_interrupt(self):
-        ctl = self.tasks / "task-ctl-1.txt"
-        ctl.write_text(f"id: task-ctl-1\ntask: CANCEL_INSTRUCTION: stop processing {TARGET}\n")
-        stub = self.ws / "py"
-        record = self.ws / "calls"
-        stub.write_text(f'#!/bin/bash\necho "$*" >> "{record}"\n')
-        stub.chmod(0o755)
-        subprocess.run(["bash", "-c", f'source "{REPO}/src/task-emit.sh"; activity_cancel_target "{ctl.name}"; wait'],
-                       env={**os.environ, "SUTANDO_PY_BIN": str(stub), "TASKS_DIR": str(self.tasks)}, check=True)
-        for _ in range(50):
-            if record.exists() and "stop_interrupt.py" in record.read_text() and "stop-requested" in record.read_text():
-                break
-            time.sleep(0.05)
-        calls = [c.split("/src/", 1)[-1] for c in record.read_text().splitlines()]
+        ctl, calls = self.emit("1")
         self.assertIn(f"stop_interrupt.py {TARGET} --tasks-dir {self.tasks} --control-file {ctl}", calls)
         self.assertIn(f"activity_bus.py stop-requested --task-id {TARGET}", calls)
         self.assertFalse([c for c in calls if "CANCELLED" in c], "nothing is cancelled before the stop is confirmed")
@@ -352,7 +400,7 @@ class ConfirmStop(unittest.TestCase):
         self.store.apply(activity_bus.StopRequest(voice))
         self.assertEqual(self.phase(voice), "RUNNING", "the request alone does not cancel it")
         (self.ws / "results" / f"{ctl}.txt").write_text("Cancelled task-1793057400000 (was in progress)")
-        with mock.patch.object(si, "interrupt"):
+        with mock.patch.object(si, "interrupt"), mock.patch.dict(os.environ, {si.ENABLE_ENV: "1"}):
             self.assertEqual(si.main([voice, "--tasks-dir", str(self.ws / "tasks"), "--workspace", str(self.ws),
                                       "--control-file", str(cancel)]), 0)
         self.assertEqual(self.phase(voice), "CANCELLED")

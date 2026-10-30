@@ -4919,6 +4919,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         elif f == "task" and task.get("task") not in (None, ""):
             # Keep the established id/timestamp prefix stable, but place this
             # trusted execution-policy header before all untrusted body text.
+            if woken:
+                lines.append(f"wake_episode: {_one_line(woken)}")
             if collaborator_enabled:
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
