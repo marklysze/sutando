@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -152,6 +153,95 @@ class Edges(unittest.TestCase):
                           "applied_execution_phase": "responded"}) + "\n")
         v = at.classify_turn(at.read_turn_records(self.state, turn))
         self.assertEqual(v.outcome, at.TERMINAL_CONFIRMED, "a phase alone says terminal")
+
+
+class CloseUnderJournalLock(unittest.TestCase):
+    """The .closed marker is written under the proxy's room-actions.jsonl.lock."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.ctx = _ctx(self.state)
+        at.write_turn_context(self.state, self.ctx)
+        self.lock = self.state / (at.ROOM_ACTIONS_NAME + ".lock")
+
+    def hold(self, pid):
+        self.lock.write_text(f"{pid} proxytoken {int(time.time() * 1000)}")
+
+    def test_a_close_takes_and_releases_the_lock(self):
+        seen = []
+        real_open = os.open
+
+        def spy(path, flags, *a):
+            if str(path).endswith(".closed"):
+                seen.append(self.lock.read_text().split()[0])
+            return real_open(path, flags, *a)
+        with mock.patch.object(at.os, "open", spy):
+            self.assertTrue(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertEqual(seen, [str(os.getpid())], "the marker is written while this process holds the lock")
+        self.assertFalse(self.lock.exists())
+        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
+
+    def test_a_live_holder_is_waited_on_and_the_marker_lands_after_its_release(self):
+        self.hold(os.getpid())
+        done = threading.Event()
+        threading.Thread(target=lambda: (at.close_turn(self.state, self.ctx["turn_id"]), done.set()),
+                         daemon=True).start()
+        time.sleep(0.3)
+        self.assertFalse(at.is_closed(self.state, self.ctx["turn_id"]), "no close inside the proxy's section")
+        self.lock.unlink()
+        self.assertTrue(done.wait(2))
+        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
+
+    def test_a_live_holder_past_the_wait_leaves_its_lock_and_the_turn_is_still_fenced(self):
+        self.hold(os.getpid())
+        start = time.monotonic()
+        with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.2):
+            self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertLess(time.monotonic() - start, 1.5)
+        self.assertTrue(at.is_closed(self.state, self.ctx["turn_id"]))
+        self.assertIn("proxytoken", self.lock.read_text(), "a live holder's lock is never broken")
+
+    def test_lock_edges(self):
+        with mock.patch.object(at.os, "kill", side_effect=PermissionError):
+            self.assertTrue(at._pid_alive(1), "another user's live process is alive")
+        at._unlink_if_holding(self.lock, "1 t 2")          # already gone
+        self.hold(4242)
+        at._unlink_if_holding(self.lock, "1 t 2")
+        self.assertTrue(self.lock.exists(), "another holder's lock stays")
+        at._release_journal_lock(None)
+        self.lock.unlink()
+        self.lock.mkdir()                                   # unreadable: waited on, never broken
+        with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.05):
+            self.assertIsNone(at._take_journal_lock(self.state))
+        self.lock.rmdir()
+        real_open, calls = os.open, []
+
+        def vanishing(path, flags, *a):              # released between the O_EXCL refusal and the read
+            calls.append(path)
+            if len(calls) == 1:
+                raise FileExistsError(path)
+            return real_open(path, flags, *a)
+        with mock.patch.object(at.os, "open", vanishing):
+            held = at._take_journal_lock(self.state)
+        self.assertIsNotNone(held)
+        at._release_journal_lock(held)
+        self.assertFalse(self.lock.exists())
+
+    def test_the_default_wait_is_two_seconds(self):
+        self.assertEqual(at.JOURNAL_LOCK_WAIT_S, 2.0)
+
+    def test_a_dead_holder_is_broken(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.hold(proc.pid)
+        self.assertTrue(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertFalse(self.lock.exists())
+
+    def test_a_half_written_lock_is_waited_on_not_broken(self):
+        self.lock.write_text("")
+        with mock.patch.object(at, "JOURNAL_LOCK_WAIT_S", 0.1):
+            self.assertFalse(at.close_turn(self.state, self.ctx["turn_id"]))
+        self.assertTrue(self.lock.exists())
 
 
 class TurnGate(unittest.TestCase):
