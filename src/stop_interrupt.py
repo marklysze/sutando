@@ -33,7 +33,7 @@ from activity_rows import append as append_row
 from activity_rows import task_from_file
 from delivery.pane_gate import AWAIT_HINT, live_tail
 from delivery.task_dispatch import worker_holds
-from local_task_protocol import find_archived_result
+from local_task_protocol import find_archived_result, valid_local_task_id
 from result_markers import parse_markers
 from skill_config import TRUE
 from workspace_default import resolve_workspace
@@ -268,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace")
     ap.add_argument("--control-file", help="the CANCEL_INSTRUCTION task: its answer confirms the stop")
     a = ap.parse_args(argv)
-    if not enabled():
+    if not enabled() or not valid_local_task_id(a.target):
         return 0
     tasks_dir = Path(a.tasks_dir)
     workspace = Path(a.workspace) if a.workspace else resolve_workspace()
