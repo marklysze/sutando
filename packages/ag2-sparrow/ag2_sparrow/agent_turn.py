@@ -453,11 +453,13 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
         return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
-    settled = {r.get("operation_id") for r in reconciled
-               if r.get("operation_status") not in (None, "dispatched_unknown")}
-    if any(i.get("action") == "room.question.ask" and i.get("operation_id") not in settled
-           for i in unmatched_intents(records)):
-        # The note says "I asked X": never the final reply. A broker with no open question refuses it.
+    asks = {i.get("operation_id") for i in records.intents if i.get("action") == "room.question.ask"}
+    status = {o.get("operation_id"): o.get("operation_status") for o in (*records.outcomes, *reconciled)}
+    if any(status.get(op) not in (None, "dispatched_unknown", "succeeded", *ASYNC_STATUSES) for op in asks):
+        # The note says "I asked X", but no question exists: never post it as the reply.
+        return ResultDecision(POST, {"status": "failed", "no_send": True}, "the question could not be asked")
+    if any(status.get(op) in (None, "dispatched_unknown") for op in asks):
+        # Its outcome is unknown: never the final reply. A broker with no open question refuses it.
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True},
                               "a question was asked and its outcome is unknown")
     if no_send:
