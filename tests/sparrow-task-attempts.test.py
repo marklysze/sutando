@@ -9,6 +9,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import urllib.error
 from pathlib import Path
 
@@ -310,6 +311,13 @@ class FailurePaths(unittest.TestCase):
         self.assertTrue(any("could not save" in m for m in self.logs))
         self.assertTrue(any("turn file not written" in m for m in self.logs))
         self.assertTrue(any("could not close" in m for m in self.logs))
+
+    def test_a_close_past_the_journal_lock_wait_is_logged(self):
+        a = self.mk(Gateway(), turn_context=True)
+        turn = a.record_ack("tsk_L", _ack(1))["turn_id"]
+        with unittest.mock.patch.object(agent_turn, "close_turn", return_value=False):
+            a._close_turn(turn)
+        self.assertTrue(any("closed without the journal lock" in m for m in self.logs))
 
     def test_beats_carry_phase_and_a_bounded_step_and_survive_errors(self):
         gw = Gateway()

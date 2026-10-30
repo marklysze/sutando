@@ -420,8 +420,12 @@ Sutando checkout around it sends neither field.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
-actions to and journals in `state/room-actions.jsonl`. When the result settles the turn gets a
-`.closed` fence, and at start every turn whose task is no longer in flight is closed. The result is
+actions to and journals in `state/room-actions.jsonl`. The file is written to a temp file, fsynced and
+`link()`ed into place, so it is never seen half-written or replaced. When the result settles the turn
+gets a `.closed` fence, written while holding the proxy's `room-actions.jsonl.lock` (an `O_EXCL` file
+of `<pid> <token> <start_ms>`; a dead pid's lock is broken, a live one is waited on up to 2 s), so a
+close never lands between the proxy's check and its intent append. At start every turn whose task
+is no longer in flight is closed. The result is
 then decided by the turn's journal: skipped when a room action already closed the task; posted as
 `status: waiting_input` + `no_send` while the task waits for a human; posted with `no_send` when a
 `room.message.send` in the turn carried the same text (`body_sha256`); otherwise posted as

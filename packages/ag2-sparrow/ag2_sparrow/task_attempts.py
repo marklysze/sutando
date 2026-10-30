@@ -205,7 +205,9 @@ class TaskAttempts:
 
     def _close_turn(self, turn_id: str) -> None:
         try:
-            agent_turn.close_turn(self.state_dir, turn_id)
+            if not agent_turn.close_turn(self.state_dir, turn_id):
+                self.log(f"turn {turn_id}: closed without the journal lock (held past "
+                         f"{agent_turn.JOURNAL_LOCK_WAIT_S:.0f} s by a live process)")
         except (OSError, ValueError) as e:
             self.log(f"turn {turn_id}: could not close ({e})")
 
