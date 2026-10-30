@@ -27,6 +27,7 @@ from typing import Callable
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from file_lock import locked_file
+from local_task_protocol import valid_local_task_id
 from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
@@ -261,7 +262,7 @@ def reduce(state: TaskActivityState, item: "LifecycleTransition | RuntimeEvent |
     return state, rows
 
 
-# `~` joins a gateway instance to its broker id (task-<instance>~task-<id>).
+# `~` joins a gateway instance to its broker id (task-<instance>~<broker id>).
 CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-9._~-]+)")
 
 
@@ -269,7 +270,8 @@ def cancel_target(task_text: str | None) -> str | None:
     """The task a CANCEL_INSTRUCTION names, else None: a stop is requested on arrival, and the task
     is CANCELLED only once the core has handled the instruction without answering it."""
     m = CANCEL_RE.search(task_text or "")
-    return m.group(1) if m else None
+    tid = m.group(1) if m else None
+    return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
 
 
 def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
@@ -399,6 +401,9 @@ def main(argv: list[str] | None = None) -> int:
                 item = transition_from_file(a.to_phase, Path(a.task_file), reason=a.reason, into_task=a.into_task,
                                             worker=a.worker, ws=ws, ts=a.ts)
             elif a.task_id:
+                if "~" in a.task_id and not valid_local_task_id(a.task_id):
+                    print(f"not a task id: {a.task_id!r}", file=sys.stderr)
+                    return 2
                 item = LifecycleTransition(a.task_id, a.to_phase, reason=a.reason, worker=a.worker, ts=a.ts)
             else:
                 return 0
