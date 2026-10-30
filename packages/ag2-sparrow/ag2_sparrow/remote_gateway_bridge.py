@@ -677,23 +677,12 @@ def _durable_write(path: Path, text: str) -> bool:
 
 def _write_if_absent(path: Path, text: str) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file
-    already was (it wins), False on an error. One small write; its reader rules on the ledger."""
+    already was (it wins), False on an error, with nothing left at `path` for the retry."""
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        return None
-    except OSError as exc:
-        _log(f"could not create {path.name} ({diagnostics.describe(exc)})")
-        return False
-    try:
-        os.write(fd, text.encode("utf-8"))
-        os.fsync(fd)
-        return True
+        return task_attempts.write_if_absent(path, text)
     except OSError as exc:
         _log(f"could not write {path.name} ({diagnostics.describe(exc)})")
-        return True                         # the file exists: the ledger already rules it failed
-    finally:
-        os.close(fd)
+        return False
 
 
 def _read_review_json(path: Path) -> "dict | None":
@@ -4137,11 +4126,20 @@ def _watch_dispatch(wire_tid: str) -> None:
     if _ATTEMPTS.dispatch_lost_due(wire_tid, pending or answered, activity):
         _fail_unanswered(wire_tid, tid, DISPATCH_LOST_RESULT, "its task file left the queue unanswered, "
                          f"with no turn activity for {task_attempts.DISPATCH_LOST_S // 60} min")
-    elif pending and not answered and _ATTEMPTS.stalled_due(wire_tid, _queued_at(tid), activity):
+    elif pending and not answered and _ATTEMPTS.stalled_due(wire_tid, _queued_at(tid), activity,
+                                                               (motion := _core_motion())):
+        window = task_attempts.STALLED_S if motion == "idle" else task_attempts.STALLED_UNOBSERVED_S
         if _fail_unanswered(wire_tid, tid, STALLED_RESULT, "the core took it up, then wrote no turn "
-                            f"activity or result for {task_attempts.STALLED_S // 60} min"):
+                            f"activity or result for {window // 60} min and is not mid-turn"):
             # A turn parked on a terminal prompt is answered by the Stop path's Escape.
             _queue_cancel_instruction(tid, "stalled")
+
+
+def _core_motion() -> "str | None":
+    """The core's own motion reading (moving while its pane is mid-turn), not Sparrow's fill-in."""
+    row = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
+    motion = row.get("motion") if isinstance(row, dict) else None
+    return motion if motion in ("moving", "idle") else None
 
 
 def _queued_at(tid: str) -> "float | None":
@@ -4212,13 +4210,28 @@ def _close_stale_turns(inflight: "set[str]") -> None:
             _log(f"closed {closed} turn file(s) whose task is no longer in flight")
 
 
+_last_turn_close_pass = 0.0
+
+
+def _retry_turn_closes(inflight: "set[str]") -> None:
+    """Close the turns a busy journal lock left open once their task settled or was re-served."""
+    global _last_turn_close_pass
+    if _ATTEMPTS is None or time.time() - _last_turn_close_pass < task_attempts.TASK_HEARTBEAT_INTERVAL_S:
+        return
+    _last_turn_close_pass = time.time()
+    closed = _ATTEMPTS.close_finished_turns({_broker_tid(t) for t in inflight})
+    if closed:
+        _log(f"closed {closed} finished turn file(s) a busy journal lock had left open")
+
+
 _LEDGER_RECONCILE_EVERY_S = 300.0
 _last_ledger_reconcile = 0.0
 OUTSTANDING_TASKS_FILE = _STATE / f"relay-outstanding-tasks{_INST_SUFFIX}.json"
 
 
 def _reconcile_ledger(inflight: "set[str]") -> None:
-    """Close local attempts the server has closed; list server tasks this node does not hold."""
+    """Log local attempts the server does not list as outstanding (their beats or acks fence them on an
+    explicit terminal answer); list server tasks this node does not hold."""
     global _last_ledger_reconcile
     if _ATTEMPTS is None or time.time() - _last_ledger_reconcile < _LEDGER_RECONCILE_EVERY_S:
         return
@@ -4228,8 +4241,9 @@ def _reconcile_ledger(inflight: "set[str]") -> None:
         return
     wire = {_broker_tid(t) for t in inflight}
     found = _ATTEMPTS.compare_with_server(wire, server)
-    for wire_tid in found["closed_on_server"]:
-        _fence_attempt(wire_tid, {"error_code": "task_already_terminal", "reason": "no longer listed active"})
+    for wire_tid in found["not_listed"]:
+        _log_backoff((wire_tid, "not-listed"), f"ledger: {wire_tid} is not listed as outstanding — "
+                     "left to its beats and acks, which fence it only on an explicit terminal answer")
     _durable_write(OUTSTANDING_TASKS_FILE, json.dumps(
         {"checked_at": _last_ledger_reconcile, "tasks": found["missing_locally"]}, sort_keys=True))
     if found["missing_locally"]:
@@ -4835,7 +4849,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     tid = _local_tid(broker_tid)
     task = {**task, "id": tid}
     woken = None
-    if task.get("wake") is not None:
+    if task.get("wake") is not None and LIFECYCLE_V2:
         # Decided before any local shortcut: running a wake without its answer, or closing it as a
         # redelivery, would lose the answer.
         settling = False
@@ -8884,6 +8898,7 @@ def main() -> None:
                 wake_outbound()
             _reconcile_orphan_results(inflight)
             _reconcile_ledger(inflight)
+            _retry_turn_closes(inflight)
             _post_heartbeat(inflight)
             # The pool's advertisement rides the same beat: push-on-change, never
             # raising, so a broker without the endpoints costs one deferred log.
