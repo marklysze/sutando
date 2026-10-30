@@ -115,11 +115,7 @@ class TaskAttempts:
 
     # ── storage ──────────────────────────────────────────────────────────
     def _load(self) -> dict:
-        try:
-            data = json.loads(self.path.read_text())
-        except (OSError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        return self._load_json(self.path)
 
     def _save(self, data: dict) -> bool:
         return self._save_json(self.path, data)
@@ -138,16 +134,21 @@ class TaskAttempts:
             self.log(f"task attempts: could not save {path.name} ({e})")
             return False
 
-    def _load_wakes(self) -> dict:
-        return self._load_json(self._wakes_path)
+    @classmethod
+    def _load_json(cls, path: Path) -> dict:
+        data = cls._read_json(path)
+        return {} if data is None else data
 
     @staticmethod
-    def _load_json(path: Path) -> dict:
+    def _read_json(path: Path) -> "dict | None":
+        """A missing file is empty; None when the file is there but unreadable or malformed."""
         try:
             data = json.loads(path.read_text())
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {}
-        return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     def _update(self, wire_tid: str, **fields) -> dict:
         with _MUTEX:
@@ -453,9 +454,13 @@ class TaskAttempts:
         (the record read before the result was posted), a record that has moved on to another
         turn or wake since is kept; only the settled attempt's own turn is closed. A wake's episode
         (as seen) and then its item are saved before the attempt is retired. False only when one of
-        those writes failed: the attempt is kept, and the caller keeps its result live to retry."""
+        those writes failed or a record could not be read: the attempt is kept, and the caller keeps
+        its result live to retry."""
         with _MUTEX:
-            data = self._load()
+            data = self._read_json(self.path)
+            if data is None:
+                self.log(f"task {wire_tid}: {self.path.name} unreadable — attempt kept")
+                return False
             rec = data.get(wire_tid) or {}
             if attempt is not None and any(rec.get(k) != attempt.get(k)
                                            for k in ("turn_id", "wake_episode")):
@@ -463,12 +468,15 @@ class TaskAttempts:
                     self._close_turn(attempt["turn_id"])
                 return True                 # nothing of the settled attempt is left to retire
             if rec.get("wake_episode"):
-                wakes = self._load_wakes()
+                wakes = self._read_json(self._wakes_path)
+                items = self._read_json(self._wake_items_path)
+                if wakes is None or items is None:
+                    self.log(f"task {wire_tid}: wake records unreadable — attempt kept")
+                    return False
                 seen = [e for e in wakes.get(wire_tid, []) if e != rec["wake_episode"]]
                 wakes[wire_tid] = (seen + [rec["wake_episode"]])[-WAKE_EPISODES_KEPT:]
                 if not self._save_json(self._wakes_path, wakes):
                     return False
-                items = self._load_json(self._wake_items_path)
                 items[wire_tid] = f"{wire_tid}.wake-{rec['wake_episode']}"
                 if not self._save_json(self._wake_items_path, dict(list(items.items())[-WAKE_ITEMS_KEPT:])):
                     return False
@@ -487,7 +495,12 @@ class TaskAttempts:
         if not isinstance(episode, str) or not _EPISODE_RE.fullmatch(episode):
             self.log(f"task {wire_tid}: wake without a usable blocker_episode_id — not run")
             return None
-        if episode in self._load_wakes().get(wire_tid, []):
+        wakes = self._read_json(self._wakes_path)
+        if wakes is None:
+            self.log(f"task {wire_tid}: wake {episode} not checked, its record is unreadable "
+                     "— left unacked for a re-serve")
+            return None
+        if episode in wakes.get(wire_tid, []):
             return None
         rec = self.get(wire_tid)
         if rec.get("wake_episode") != episode:
@@ -495,7 +508,10 @@ class TaskAttempts:
             if rec.get("turn_id"):
                 self._close_turn(rec["turn_id"])
             with _MUTEX:
-                data = self._load()
+                data = self._read_json(self.path)
+                if data is None:
+                    self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
+                    return None
                 data[wire_tid] = {**data.get(wire_tid, {}), "wake_episode": episode, "turn_id": None,
                                   "issued_at": None, "execution_generation": None, "fenced": None,
                                   "published_at": None, "hold_reported": None}

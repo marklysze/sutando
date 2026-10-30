@@ -324,6 +324,39 @@ class Attempts(unittest.TestCase):
                 self.assertEqual(a.get("tsk_W"), {})
                 self.assertEqual(self.mk().wake_item("tsk_W"), "tsk_W.wake-ep1")
 
+    def test_an_unreadable_record_is_never_read_as_a_moved_attempt(self):
+        wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
+        for name in ("relay-task-attempts", "relay-wake-episodes", "relay-wake-items"):
+            for broken in ("malformed", "unreadable", "not-a-dict"):
+                with self.subTest(name=name, broken=broken):
+                    self.state = Path(tempfile.mkdtemp())
+                    a = self.mk()
+                    self.assertEqual(a.open_wake("tsk_W", wake), "ep1")
+                    attempt = a.record_ack("tsk_W", _ack(1))
+                    path = self.state / f"{name}.json"
+                    good = path.read_bytes() if path.exists() else b"{}"
+                    path.unlink(missing_ok=True)
+                    {"malformed": lambda: path.write_text("{x"), "unreadable": path.mkdir,
+                     "not-a-dict": lambda: path.write_text("[]")}[broken]()
+                    self.assertFalse(a.finish("tsk_W", attempt), "unread is not moved: the attempt is kept")
+                    if name != "relay-wake-items":
+                        self.assertIsNone(a.open_wake("tsk_W", {**wake, "blocker_episode_id": "ep2"}),
+                                          "nor opened over")
+                    path.rmdir() if path.is_dir() else path.unlink()
+                    path.write_bytes(good)
+                    self.assertEqual(a.get("tsk_W").get("wake_episode"), "ep1")
+                    self.assertTrue(a.finish("tsk_W", attempt))
+                    self.assertEqual(a.get("tsk_W"), {})
+                    self.assertIsNone(a.open_wake("tsk_W", wake), "the settled episode is not run again")
+                    self.assertEqual(a.wake_item("tsk_W"), "tsk_W.wake-ep1")
+        self.state = Path(tempfile.mkdtemp())
+        a = self.mk()
+        a.open_wake("tsk_M", wake)
+        attempt = a.record_ack("tsk_M", _ack(1))
+        self.assertEqual(a.open_wake("tsk_M", {**wake, "blocker_episode_id": "ep2"}), "ep2")
+        self.assertTrue(a.finish("tsk_M", attempt), "a record read and moved on: nothing to retire")
+        self.assertEqual(a.get("tsk_M")["wake_episode"], "ep2", "the newer wake is kept")
+
     def test_a_wake_episode_runs_once_and_its_result_rides_its_own_item(self):
         a = self.mk(turn_context=True)
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}

@@ -1002,6 +1002,43 @@ class Hooks(unittest.TestCase):
                 self.assertEqual(len(fake.posted("/v1/results")), 1, "posted once across both passes")
                 self.assertEqual(gw._ATTEMPTS.wake_item(tid), f"{tid}.wake-e1")
 
+    def test_a_wake_result_whose_records_cannot_be_read_at_retirement_stays_live(self):
+        for record in ("relay-task-attempts", "relay-wake-episodes"):
+            for broken in ("malformed", "unreadable"):
+                with self.subTest(record=record, broken=broken):
+                    tid = f"task-wrd-{record.rsplit('-', 1)[-1]}-{broken}"
+                    wake = self.answered_task(tid)
+                    self.assertEqual(gw._write_task(dict(wake)), (tid, True))
+                    path, good = gw._ATTEMPTS.state_dir / f"{record}.json", []
+
+                    def break_it(_payload, path=path, broken=broken, good=good):
+                        good.append(path.read_bytes() if path.exists() else b"{}")
+                        path.unlink(missing_ok=True)
+                        path.write_text("{not json") if broken == "malformed" else path.mkdir()
+                        return {"ok": True}
+
+                    fake = self.use(FakeGateway(**{"/v1/results": break_it, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+                    self.assertTrue(gw._post_task_ack(tid, durable=True))
+                    (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+                    (gw.RESULTS_DIR / f"{tid}.txt").write_text("went with b")
+                    inflight = {tid}
+                    gw._post_ready_results(inflight)
+                    self.assertEqual(len(fake.posted("/v1/results")), 1)
+                    self.assertTrue((gw.RESULTS_DIR / f"{tid}.txt").exists(), "not archived: still live")
+                    self.assertIn(tid, inflight, "still in flight")
+                    self.assertTrue(any(f"result {tid}: settled, but its attempt could not be retired" in m
+                                        for m in self.logs))
+
+                    path.rmdir() if path.is_dir() else path.unlink()
+                    path.write_bytes(good[0])
+                    gw._post_ready_results(inflight)
+                    self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "the retry archives it")
+                    self.assertNotIn(tid, inflight)
+                    self.assertEqual(len(fake.posted("/v1/results")), 1, "never posted a second time")
+                    self.assertIn("e1", gw._ATTEMPTS._load_json(gw._ATTEMPTS._wakes_path)[tid])
+                    self.assertEqual(gw._ATTEMPTS.wake_item(tid), f"{tid}.wake-e1")
+                    self.assertIsNone(gw._write_task(dict(wake)), "the replay is refused")
+
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
         self.assertIsNotNone(gw._write_task(dict(task)))
