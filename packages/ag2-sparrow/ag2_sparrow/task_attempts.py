@@ -33,10 +33,13 @@ TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
 TASK_HEARTBEAT_INTERVAL_S = 15
 # An attempt whose task file left the queue unanswered, with no turn activity this long, is failed.
 DISPATCH_LOST_S = 600
-# A queued attempt the core engaged and then left with no turn activity or result this long is failed.
+# An engaged task's silence that fails it: when the core reads idle; never while it reads moving
+# (mid-turn: a long tool call or a subagent wait); unobserved, far past one tool call's silence.
 STALLED_S = 1800
+STALLED_UNOBSERVED_S = 7200
 ACTIVITY_TAIL_BYTES = 256 * 1024
 ACTIVE_TASKS_PATH = "/v1/tasks/active"
+ACTIVE_TASKS_LIMIT = 200
 PROTOCOL_VERSION = 2
 STEP_SUMMARY_MAX = 140
 CONTROL_SOURCE = "relay-control"
@@ -51,7 +54,10 @@ WAKE_EPISODES_KEPT = 20
 _EPISODE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Kept in one place so its wording and placement can change together.
 ASK_IN_ROOM_RULE = (
-    "For a question that blocks THIS task, ask it in this task's room: call `room.action.execute` "
+    "For a question that blocks THIS task, ask it in this task's room when everyone there should "
+    "read it; a question about something the owner asked for themselves (their own errand, or "
+    "data from their accounts or device) goes to the owner's DM with `ask-owner.py` instead, even "
+    "from a shared room. To ask in the room: call `room.action.execute` "
     "with action `room.question.ask`, top-level `task_id` `{task_id}`, and `arguments` `prompt` "
     "(plus `options` when the answer is a choice). Anything the room should read besides the "
     "question, send first with `room.message.send`. Then write this task's result file with a "
@@ -280,8 +286,8 @@ class TaskAttempts:
     def _close_turn(self, turn_id: str) -> None:
         try:
             if not agent_turn.close_turn(self.state_dir, turn_id):
-                self.log(f"turn {turn_id}: closed without the journal lock (held past "
-                         f"{agent_turn.JOURNAL_LOCK_WAIT_S:.0f} s by a live process)")
+                self.log(f"turn {turn_id}: not closed yet — the journal lock was held past "
+                         f"{agent_turn.JOURNAL_LOCK_WAIT_S:.0f} s; retried by the next close pass")
         except (OSError, ValueError) as e:
             self.log(f"turn {turn_id}: could not close ({e})")
 
@@ -338,12 +344,17 @@ class TaskAttempts:
             return False
         return self.now() - max(float(since), last_activity or 0.0) >= DISPATCH_LOST_S
 
-    def stalled_due(self, wire_tid: str, queued_at: "float | None", last_activity: "float | None") -> bool:
+    def stalled_due(self, wire_tid: str, queued_at: "float | None", last_activity: "float | None",
+                    core_motion: "str | None" = None) -> bool:
         """True once the core engaged this attempt's queued task file (a turn row newer than the file)
-        and then wrote no turn row or result for STALLED_S: its turn ended without answering it."""
+        and then wrote no turn row or result while it is not mid-turn: STALLED_S when the core reads
+        idle, STALLED_UNOBSERVED_S when its motion is unknown, never while it reads moving."""
         if not _beats(self.get(wire_tid)) or queued_at is None or last_activity is None:
             return False
-        return last_activity >= queued_at and self.now() - last_activity >= STALLED_S
+        if core_motion == "moving":
+            return False
+        window = STALLED_S if core_motion == "idle" else STALLED_UNOBSERVED_S
+        return last_activity >= queued_at and self.now() - last_activity >= window
 
     def mark_dispatch_lost(self, wire_tid: str, lost: bool = True) -> None:
         self._update(wire_tid, dispatch_lost=lost)
@@ -526,6 +537,18 @@ class TaskAttempts:
         episode = self.get(wire_tid).get("wake_episode")
         return f"{wire_tid}.wake-{episode}" if episode else None
 
+    def close_finished_turns(self, live_wire_tids) -> int:
+        """Close every open turn whose task is no longer in flight, or which a newer generation of its
+        task replaced: the retry for a close the journal lock deferred. Attempts are left as they are."""
+        live, data, closed = set(live_wire_tids), self._load(), 0
+        for p in agent_turn.open_turns(self.state_dir):
+            task = (agent_turn.read_turn_context(p) or {}).get("task_id")
+            current = (data.get(task) or {}).get("turn_id")
+            if task not in live or (current and current != p.stem):
+                self._close_turn(p.stem)
+                closed += not p.exists()
+        return closed
+
     def sweep(self, live_wire_tids) -> int:
         """Close every open turn and drop every attempt whose task is no longer in flight."""
         live = set(live_wire_tids)
@@ -534,7 +557,7 @@ class TaskAttempts:
             ctx = agent_turn.read_turn_context(p) or {}
             if ctx.get("task_id") not in live:
                 self._close_turn(p.stem)
-                closed += 1
+                closed += not p.exists()
         with _MUTEX:
             data = self._load()
             stale = [t for t in data if t not in live]
@@ -545,45 +568,63 @@ class TaskAttempts:
         return closed
 
     # ── reconciliation with the server ledger ────────────────────────────
-    def active_tasks(self, max_pages: int = 20) -> "list | None":
-        """Every outstanding server task for this agent, or None when the list is incomplete."""
-        tasks, cursor = [], None
-        for _ in range(max_pages):
-            q = {"status": "outstanding", "limit": 200}
-            if cursor:
-                q["cursor"] = cursor
-            try:
-                resp = self.request("GET", f"{ACTIVE_TASKS_PATH}?{urllib.parse.urlencode(q)}",
-                                    None, timeout=15)
-            except urllib.error.HTTPError as e:
-                if e.code not in (404, 405):
-                    code, _ = http_error_code(e)
-                    self.log(f"active tasks: HTTP {e.code} {code} — reconcile skipped")
-                return None
-            except (OSError, ValueError) as e:
-                self.log(f"active tasks unreadable ({e}) — reconcile skipped")
-                return None
-            page = resp.get("tasks") if isinstance(resp, dict) else None
-            if not isinstance(page, list):
-                return None
-            tasks.extend(t for t in page if isinstance(t, dict) and t.get("task_id"))
-            cursor = resp.get("next_cursor")
-            if not cursor:
-                return tasks
-        return None
+    def active_tasks(self) -> "list | None":
+        """Every outstanding server task for this agent, or None when the list is incomplete. One page
+        only: the broker pages by update time, so a task that changes mid-walk can drop off a later page."""
+        q = {"status": "outstanding", "limit": ACTIVE_TASKS_LIMIT}
+        try:
+            resp = self.request("GET", f"{ACTIVE_TASKS_PATH}?{urllib.parse.urlencode(q)}", None, timeout=15)
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 405):
+                code, _ = http_error_code(e)
+                self.log(f"active tasks: HTTP {e.code} {code} — reconcile skipped")
+            return None
+        except (OSError, ValueError) as e:
+            self.log(f"active tasks unreadable ({e}) — reconcile skipped")
+            return None
+        page = resp.get("tasks") if isinstance(resp, dict) else None
+        if not isinstance(page, list):
+            return None
+        if resp.get("next_cursor"):
+            self.log(f"active tasks: more than {ACTIVE_TASKS_LIMIT} outstanding — reconcile skipped")
+            return None
+        return [t for t in page if isinstance(t, dict) and t.get("task_id")]
 
     def compare_with_server(self, local_wire_tids, server_tasks: list) -> dict:
-        """Local attempts the server no longer lists, and server tasks this node does not hold. An
-        attempt is aged from its ack, or from its first publication when no ack ever answered."""
+        """Local attempts the server does not list as outstanding, and server tasks this node does not
+        hold. An attempt is aged from its ack, or from its first publication when no ack answered.
+        Not being listed is never a terminal status: only a beat's or an ack's answer fences."""
         listed = {t["task_id"]: t for t in server_tasks}
         data = self._load()
         now = self.now()
-        closed = sorted(t for t in local_wire_tids if t not in listed and t in data
+        unlisted = sorted(t for t in local_wire_tids if t not in listed and t in data
                         and now - float(data[t].get("acked_at", data[t].get("published_at", now)))
                         > RECONCILE_GRACE_S
                         and not data[t].get("fenced"))
         missing = [listed[t] for t in sorted(listed) if t not in set(local_wire_tids)]
-        return {"closed_on_server": closed, "missing_locally": missing}
+        return {"not_listed": unlisted, "missing_locally": missing}
+
+
+def write_if_absent(path: Path, text: str) -> "bool | None":
+    """Create `path` holding `text` only if nothing is there: True written, None when a file already
+    was (it wins). Raises OSError on a failure, with nothing left at `path`, so a retry can write it."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fchmod(fh.fileno(), 0o644)
+            os.fsync(fh.fileno())
+        # link() publishes the complete file and never replaces one already there.
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def cancel_task_text(local_tid: str, task_id: str, timestamp: str, reason: str) -> str:
@@ -674,14 +715,21 @@ def last_activity(state_dir: Path, task_id: str) -> "float | None":
     newest = None
     for line in lines:
         try:
-            rec = json.loads(line)
+            row = session_row(json.loads(line))
         except ValueError:
             continue
-        # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
-        if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
-            continue
-        task, ts = rec.get("task"), rec.get("ts")
-        if isinstance(task, dict) and task.get("id") == task_id and isinstance(ts, (int, float)) \
-                and not isinstance(ts, bool):
-            newest = ts if newest is None else max(newest, ts)
+        if row and row[0] == task_id:
+            newest = row[1] if newest is None else max(newest, row[1])
     return newest
+
+
+def session_row(rec) -> "tuple[str, float, str] | None":
+    """(task id, ts, kind) of a row the session's own hooks wrote, else None; the same rule as
+    src/stop_interrupt.session_row, which a parity test holds it to."""
+    # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
+    if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+        return None
+    task, ts = rec.get("task"), rec.get("ts")
+    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return task.get("id"), ts, rec.get("kind")

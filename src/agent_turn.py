@@ -245,22 +245,25 @@ def _release_journal_lock(held: "tuple[Path, str] | None") -> None:
 
 
 def close_turn(state_dir: Path, turn_id: str) -> bool:
-    """Fence the turn: later calls carrying it are refused, and only its own file goes. The marker
-    is written under the proxy's journal lock, so it never lands between the proxy's check and its
-    intent append. False when the lock was not had in time; the turn is fenced all the same."""
+    """Fence the turn: later calls carrying it are refused, and only its own file goes. Only under
+    the proxy's journal lock, so a close never lands between the proxy's check and its intent
+    append. False, with nothing changed, when the lock was not had in time: the still-open turn
+    file is the record a later close_turn retries from."""
     closed = _turn_path(state_dir, turn_id, ".closed")
     closed.parent.mkdir(parents=True, exist_ok=True)
     held = _take_journal_lock(state_dir)
+    if held is None:
+        return False
     try:
         fd = os.open(closed, os.O_WRONLY | os.O_CREAT, 0o400)
         os.close(fd)
+        try:
+            _turn_path(state_dir, turn_id, ".json").unlink()
+        except FileNotFoundError:
+            pass
     finally:
         _release_journal_lock(held)
-    try:
-        _turn_path(state_dir, turn_id, ".json").unlink()
-    except FileNotFoundError:
-        pass
-    return held is not None
+    return True
 
 
 @dataclass(frozen=True)
@@ -270,6 +273,8 @@ class TurnRecords:
     readable: bool
     unbound_intents: tuple = ()
     partial: bool = False
+    # room.message.send intents of the same task's other turns (an earlier generation's reply).
+    sibling_sends: tuple = ()
 
 
 # An unterminated last line younger than this is an append in progress, not corruption.
@@ -280,10 +285,13 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
                       task_id: str | None = None) -> TurnRecords:
     """Both record types for one turn across the rotated and live journal. Records the proxy
     could not bind, written since `issued_at` (None: all), count as this turn's when they name
-    `task_id`; other unbound intents are kept apart. A line that does not parse makes the
-    journal unreadable, except a fresh unterminated last line, which marks it `partial`."""
+    `task_id`; other unbound intents are kept apart. A fresh unterminated last line marks the
+    journal `partial`. Any other line that does not parse makes it unreadable for this turn only
+    when the line names this turn or task; the journal is shared, so another task's torn line is skipped."""
     path = room_actions_path(state_dir)
     intents, outcomes, unbound, readable, partial = [], [], [], True, False
+    siblings: list = []
+    sibling_prefix = f"{task_id}_g" if task_id else None
     for p in (path.with_name(path.name + ".1"), path):
         try:
             text = p.read_text()
@@ -302,8 +310,10 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
             except ValueError:
                 rec = None
             if not isinstance(rec, dict):
-                in_progress = p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S
-                partial, readable = (True, readable) if in_progress else (partial, False)
+                if p == path and i == len(lines) - 1 and age < PARTIAL_LINE_GRACE_S:
+                    partial = True
+                elif turn_id in line or (task_id and task_id in line):
+                    readable = False
                 continue
             if rec.get("turn_id") is None:
                 ts = rec.get("ts")
@@ -314,12 +324,15 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
                         unbound.append(rec)
                     continue
             elif rec.get("turn_id") != turn_id:
+                if (sibling_prefix and str(rec.get("turn_id")).startswith(sibling_prefix)
+                        and rec.get("record_type") == INTENT and rec.get("action") == "room.message.send"):
+                    siblings.append(rec)
                 continue
             if rec.get("record_type") == INTENT:
                 intents.append(rec)
             elif rec.get("record_type") == OUTCOME:
                 outcomes.append(rec)
-    return TurnRecords(intents, outcomes, readable, tuple(unbound), partial)
+    return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, tuple(siblings))
 
 
 def unmatched_intents(records: TurnRecords) -> list:
@@ -430,7 +443,8 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
                          server_state: dict | None = None,
                          task_id: str | None = None) -> ResultDecision:
     """What to do with a result file the agent wrote on purpose (not inferred stdout):
-    post it unless the task is already closed or the same text was sent as a room message."""
+    post it unless the task is already closed or the same text was sent as a room message, in this
+    turn or an earlier one of the same task (a re-serve under a new generation)."""
     verdict = classify_turn(records, stdout=body, reconciled=reconciled, server_state=server_state,
                             task_id=task_id)
     if verdict.outcome == TERMINAL_CONFIRMED or (server_state or {}).get("terminal") is True:
@@ -440,13 +454,17 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
         return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
+    if any(i.get("action") == "room.question.ask" for i in unmatched_intents(records)):
+        # The note says "I asked X": never the final reply. A broker with no open question refuses it.
+        return ResultDecision(POST, {"status": "waiting_input", "no_send": True},
+                              "a question was asked and its outcome is unknown")
     if no_send:
         return ResultDecision(POST, {"status": "no_action_needed"}, "result marked no-send")
     if not records.readable:
         return ResultDecision(POST, {"status": "failed", "no_send": True}, "journal unreadable")
     digest = body_sha256(body) if body.strip() else None
     if digest and any(i.get("action") == "room.message.send" and i.get("body_sha256") == digest
-                      for i in (*records.intents, *records.unbound_intents)):
+                      for i in (*records.intents, *records.unbound_intents, *records.sibling_sends)):
         return ResultDecision(POST, {"status": "completed", "no_send": True},
                               "the same text was already sent as a room message")
     return ResultDecision(POST, {"status": "completed"}, "deliberate result file")
