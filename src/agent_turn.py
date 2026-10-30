@@ -187,16 +187,80 @@ def open_turns(state_dir: Path) -> list:
             if _TURN_RE.fullmatch(p.stem) and not is_closed(state_dir, p.stem)]
 
 
-def close_turn(state_dir: Path, turn_id: str) -> None:
-    """Fence the turn: later calls carrying it are refused, and only its own file goes."""
+JOURNAL_LOCK_WAIT_S = 2.0
+_LOCK_POLL_S = 0.02
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _take_journal_lock(state_dir: Path, wait_s: "float | None" = None) -> "tuple[Path, str] | None":
+    """The proxy's journal lock: an O_EXCL file holding "<pid> <token> <start_ms>". A holder whose
+    pid is dead is broken; a live or half-written one is waited on. None when the wait runs out."""
+    lock = room_actions_path(state_dir).with_name(ROOM_ACTIONS_NAME + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    body = f"{os.getpid()} {secrets.token_hex(8)} {int(time.time() * 1000)}"
+    deadline = time.monotonic() + (JOURNAL_LOCK_WAIT_S if wait_s is None else wait_s)
+    while True:
+        try:
+            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                held = lock.read_text().split()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                held = []
+            if len(held) == 3 and held[0].isdigit() and not _pid_alive(int(held[0])):
+                _unlink_if_holding(lock, " ".join(held))
+                continue
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(_LOCK_POLL_S)
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(body)
+        return lock, body
+
+
+def _unlink_if_holding(lock: Path, body: str) -> None:
+    """Remove the lock only while it still holds `body`: another holder's lock is never removed."""
+    try:
+        if lock.read_text().split() == body.split():
+            lock.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _release_journal_lock(held: "tuple[Path, str] | None") -> None:
+    if held is not None:
+        _unlink_if_holding(*held)
+
+
+def close_turn(state_dir: Path, turn_id: str) -> bool:
+    """Fence the turn: later calls carrying it are refused, and only its own file goes. The marker
+    is written under the proxy's journal lock, so it never lands between the proxy's check and its
+    intent append. False when the lock was not had in time; the turn is fenced all the same."""
     closed = _turn_path(state_dir, turn_id, ".closed")
     closed.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(closed, os.O_WRONLY | os.O_CREAT, 0o400)
-    os.close(fd)
+    held = _take_journal_lock(state_dir)
+    try:
+        fd = os.open(closed, os.O_WRONLY | os.O_CREAT, 0o400)
+        os.close(fd)
+    finally:
+        _release_journal_lock(held)
     try:
         _turn_path(state_dir, turn_id, ".json").unlink()
     except FileNotFoundError:
         pass
+    return held is not None
 
 
 @dataclass(frozen=True)
