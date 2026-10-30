@@ -4134,9 +4134,12 @@ def _watch_dispatch(wire_tid: str) -> None:
 
 
 def _core_motion() -> "str | None":
-    """The core's own motion reading (moving while its pane is mid-turn), not Sparrow's fill-in."""
+    """The core's own motion reading (moving while its pane is mid-turn), not Sparrow's fill-in. A
+    core read as dead or abnormal is not trusted to be working, so it counts as idle."""
     row = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
     motion = row.get("motion") if isinstance(row, dict) else None
+    if motion == "moving" and (row.get("alive") is False or row.get("condition") == "abnormal"):
+        return "idle"
     return motion if motion in ("moving", "idle") else None
 
 

@@ -474,6 +474,30 @@ class ResultFileDecision(unittest.TestCase):
         self.assertEqual(at.result_file_decision(other, "final answer").fields, {"status": "completed"},
                          "another task's send never counts")
 
+    def test_an_earlier_generations_failed_send_does_not_silence_the_new_reply(self):
+        g1 = _ctx(self.state, gen=1)["turn_id"]
+        g2 = _ctx(self.state, gen=2)["turn_id"]
+        sent = {**_intent(g1, 1), "body_sha256": at.body_sha256("final answer")}
+        for status, silenced in (("failed", False), ("rejected", False), ("succeeded", True),
+                                 ("dispatched_unknown", True), (None, True)):
+            with self.subTest(status=status):
+                at.room_actions_path(self.state).unlink(missing_ok=True)
+                _journal(self.state, sent, *([_outcome(g1, 1, op_status=status)] if status else []))
+                d = at.result_file_decision(at.read_turn_records(self.state, g2, task_id="tsk_A"), "final answer")
+                self.assertEqual(d.fields, {"status": "completed", "no_send": True} if silenced
+                                 else {"status": "completed"})
+
+    def test_a_stale_torn_line_with_no_turn_is_skipped_not_a_crash(self):
+        path = at.room_actions_path(self.state)
+        path.write_text('{"record_type": "dispatch_intent", "turn_id": "other_g1_X", "task_id": "oth\n')
+        old = time.time() - at.PARTIAL_LINE_GRACE_S - 5
+        os.utime(path, (old, old))
+        recs = at.read_turn_records(self.state, None, None, task_id="tsk_A")
+        self.assertTrue(recs.readable, "no turn of its own: another task's torn line is skipped")
+        path.write_text('{"record_type": "dispatch_intent", "task_id": "tsk_A", "x\n')
+        os.utime(path, (old, old))
+        self.assertFalse(at.read_turn_records(self.state, None, None, task_id="tsk_A").readable)
+
     def test_another_tasks_torn_line_is_skipped(self):
         torn = json.dumps({"ts": 1.0, **_intent("other_g1_X", 1), "task_id": "other"})[:-2]
         valid = json.dumps({"ts": 1.0, **_intent(self.turn, 1), "body_sha256": at.body_sha256("final answer")})
