@@ -1024,6 +1024,15 @@ class Hooks(unittest.TestCase):
         self.assertEqual(fake.posted("/v1/results")[0]["id"], "task-h8")
         root = gw._delivery_core().backend.root
         self.assertEqual((gw.read_item(root, "task-h8.wake-e1") or {}).get("status"), "DELIVERED")
+        # Confirmed, not yet archived: a restart re-offers the live result through the wake's own item.
+        self.assertEqual(gw._ATTEMPTS.wake_item("task-h8"), "task-h8.wake-e1", "kept until it leaves flight")
+        posted = len(fake.posted("/v1/results"))
+        self.assertTrue(gw._deliver_result_payload("task-h8", "task-h8", "went with b"))
+        self.assertEqual(len(fake.posted("/v1/results")), posted, "already delivered: not posted again")
+        self.assertEqual((gw.read_item(root, "task-h8.wake-e1") or {}).get("status"), "DELIVERED")
+        self.assertFalse(any((gw.RESULTS_DIR / "undelivered").glob("*task-h8*")), "never quarantined")
+        gw._ATTEMPTS.sweep(set())
+        self.assertIsNone(gw._ATTEMPTS.wake_item("task-h8"), "forgotten once the task left flight")
 
         (gw.TASKS_DIR / "task-h8.txt").rename(gw.TASKS_DIR / "archive" / "task-h8.txt")
         self.assertIsNone(gw._write_task({**task, "wake": wake}), "a wake already run is not run again")

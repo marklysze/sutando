@@ -331,7 +331,13 @@ class StopInterrupt(unittest.TestCase):
         tmux = FakeTmux()
         self.assertTrue(self.run_it(tmux))
         self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-S") + 1], "/explicit.sock")
-        del os.environ["SUTANDO_TMUX_SOCK"]
+        os.environ["SUTANDO_TMUX_SOCKET"] = "/canonical.sock"
+        both = FakeTmux()
+        (self.ws / "state" / "stop-interrupts" / TARGET).unlink()
+        self.assertTrue(self.run_it(both))
+        self.assertEqual(both.escapes()[0][both.escapes()[0].index("-S") + 1], "/canonical.sock",
+                         "with both set, the canonical name the launchers use wins")
+        del os.environ["SUTANDO_TMUX_SOCK"], os.environ["SUTANDO_TMUX_SOCKET"]
         silent = NoSocket()
         self.assertFalse(self.run_it(silent))
         self.assertEqual(silent.escapes(), [])

@@ -314,7 +314,9 @@ class Attempts(unittest.TestCase):
         self.assertEqual(rec["wake_episode"], "ep1", "the ack keeps the wake")
         a.finish("tsk_A")
         self.assertIsNone(a.open_wake("tsk_A", wake), "a settled wake is never run again")
-        self.assertIsNone(a.wake_item("tsk_A"))
+        self.assertEqual(self.mk().wake_item("tsk_A"), "tsk_A.wake-ep1", "kept across a restart until archival")
+        a.sweep(set())
+        self.assertIsNone(a.wake_item("tsk_A"), "forgotten once the task left flight")
         self.assertEqual(self.mk().open_wake("tsk_A", wake), None, "remembered across restarts")
         self.assertEqual(a.open_wake("tsk_A", {**wake, "blocker_episode_id": "ep2"}), "ep2")
         for bad in ({}, {"blocker_episode_id": "../x"}, {"blocker_episode_id": 7}, None):
@@ -434,12 +436,11 @@ class AnsweredOnce(unittest.TestCase):
                          "operation_id": "op_r", "operation_status": "succeeded"}):
                 fh.write(json.dumps(rec) + "\n")
         again = self.mk(turn_context=True)    # crashed before the result was decided
-        self.assertIn("`room.question.answer`", again.answer_rule("tsk_R", {**self.Q, "question_id": "rq_9"}),
-                      "a different question on the same task is not the one answered")
-        again._update("tsk_R", answer_offered="rq_1")
         self.assertEqual(again.answer_rule("tsk_R", self.Q), task_attempts.ANSWERED_HERE_NOTE)
-        self.assertIn("`room.question.answer`", again.answer_rule("tsk_S", self.Q),
-                      "another task's journal says nothing about this one")
+        self.assertEqual(again.answer_rule("tsk_B", self.Q), task_attempts.ANSWERED_HERE_NOTE,
+                         "another task carrying the same question, before any settle")
+        self.assertIn("`room.question.answer`", again.answer_rule("tsk_B", {**self.Q, "question_id": "rq_9"}),
+                      "a question no answering task was offered still gets the rule")
 
     def test_a_failed_or_other_action_does_not_record_an_answer(self):
         for kw in ({"status": "failed"}, {"action": "room.message.send"}):
