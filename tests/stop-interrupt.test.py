@@ -45,6 +45,11 @@ class FakeTmux:
         return [c for c in self.calls if c[-1] == "Escape"]
 
 
+CRON_TURN = "  ⎿  ran the cron\n✻ Running… (3s · esc to interrupt)\n> "
+PRINTED = ("  ⎿  diff: - the footer says (esc to interrupt) while busy\n✻ Worked for 3m 2s\n"
+           "> \n  ⏵⏵ bypass permissions on")
+
+
 class NoSocket(FakeTmux):
     def __call__(self, argv):
         return "" if argv[-1] == "tmux-socket" else super().__call__(argv)
@@ -262,6 +267,53 @@ class StopInterrupt(unittest.TestCase):
         with mock.patch.object(si, "interrupt", side_effect=RuntimeError("boom")):
             self.assertEqual(si.main([TARGET, "--tasks-dir", str(self.tasks)]), 0, "advisory: never fails")
 
+    def test_a_stop_after_the_task_finished_never_escapes_the_turn_that_followed(self):
+        self.row(TARGET, kind="done")
+        tmux = FakeTmux(CRON_TURN)
+        self.assertFalse(self.run_it(tmux), "the pane is mid-turn, but on an unbound turn after T")
+        self.assertEqual(tmux.escapes(), [])
+        self.assertIn("its turn already ended", self.logs[-1])
+
+    def test_a_task_with_its_result_is_never_escaped(self):
+        self.row(TARGET)
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / f"{TARGET}.txt").write_text("the answer")
+        tmux = FakeTmux()
+        self.assertFalse(self.run_it(tmux))
+        self.assertEqual(tmux.escapes(), [])
+        self.assertIn("it already has its result", self.logs[-1])
+
+    def test_esc_to_interrupt_counts_only_on_the_live_status_line(self):
+        self.row(TARGET)
+        tmux = FakeTmux(PRINTED)
+        self.assertFalse(self.run_it(tmux), "printed above a finished turn, at an idle prompt")
+        self.assertEqual(tmux.escapes(), [])
+        self.assertFalse(si.mid_turn("esc to interrupt\n> "), "no turn row: not provably mid-turn")
+        self.assertTrue(si.mid_turn(BUSY))
+        self.assertTrue(si.mid_turn("✻ Thinking… (4s)\n> \n  esc to interrupt"), "the footer below the spinner")
+
+    def test_the_launchers_window_is_used_over_the_lowest_one(self):
+        self.row(TARGET)
+        os.environ["SUTANDO_TMUX_WINDOW"] = "2"
+        tmux = FakeTmux()
+        self.assertTrue(self.run_it(tmux))
+        self.assertEqual(tmux.escapes()[0][tmux.escapes()[0].index("-t") + 1], "=sutando-core:2")
+        self.assertFalse([c for c in tmux.calls if "list-windows" in c])
+
+    def test_the_session_rows_are_read_alike_by_the_stall_watch_and_the_stop(self):
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import task_attempts
+        self.assertEqual(task_attempts.ACTIVITY_TAIL_BYTES, si.TAIL_BYTES)
+        rows = [{"ts": 1.0, "kind": "working", "task": {"id": "t"}},
+                {"ts": 2.0, "kind": "done", "task": {"id": "t"}},
+                {"ts": 3.0, "kind": "notice", "task": {"id": "t"}, "audience": "owner"},
+                {"ts": 4.0, "kind": "notice", "task": {"id": "t"}, "projection": "TASK_STATUS"},
+                {"ts": True, "task": {"id": "t"}}, {"ts": 5.0, "task": "t"}, {"ts": 6.0}, [1], "x", None,
+                {"ts": 7, "kind": "thinking", "task": {"id": "u"}}]
+        for rec in rows:
+            with self.subTest(rec=rec):
+                self.assertEqual(si.session_row(rec), task_attempts.session_row(rec))
+
     def test_an_explicit_socket_wins_and_no_socket_sends_no_key(self):
         self.row(TARGET)
         os.environ["SUTANDO_TMUX_SOCK"] = "/explicit.sock"
@@ -345,6 +397,15 @@ class ConfirmStop(unittest.TestCase):
 
     def phase(self, tid):
         return json.loads(self.store.path(tid).read_text())["phase"]
+
+    def test_a_stop_is_not_confirmed_while_a_worker_holds_the_task(self):
+        self.running(TARGET)
+        (self.ws / "results" / "task-ctl-w.txt").write_text("Cancelled")
+        (self.ws / "deliveries" / "w1").mkdir(parents=True)
+        (self.ws / "deliveries" / "w1" / f"{TARGET}.claimed").write_text("")
+        self.assertIsNone(self.confirm(TARGET, "task-ctl-w"))
+        self.assertEqual(self.phase(TARGET), "RUNNING", "the worker may still post its answer")
+        self.assertIn("a pool worker still holds it", self.logs[-1])
 
     def confirm(self, tid, ctl, **kw):
         return si.confirm_stop(tid, ctl, workspace=self.ws, sleep=lambda s: None, log=self.logs.append, **kw)

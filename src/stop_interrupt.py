@@ -31,7 +31,7 @@ from typing import Callable
 from activity_bus import ActivityStore, LifecycleTransition
 from activity_rows import append as append_row
 from activity_rows import task_from_file
-from delivery.pane_gate import AWAIT_HINT, live_tail
+from delivery.pane_gate import AWAIT_HINT, live_tail, turn_status
 from delivery.task_dispatch import worker_holds
 from local_task_protocol import find_archived_result, valid_local_task_id
 from result_markers import parse_markers
@@ -56,32 +56,47 @@ def enabled(environ=None) -> bool:
 
 def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str | None:
     """The task the newest session-hook row names, when that row is fresh; else None."""
-    task, ts = newest_task(workspace)
+    task, ts, _ = newest_task(workspace)
     return task if ts is not None and 0 <= now - ts <= fresh_s else None
 
 
-def newest_task(workspace: Path) -> "tuple[str | None, float | None]":
-    """(task, ts) of the newest session-hook row, at any age; (None, None) when there is none."""
+def session_row(rec) -> "tuple[str, float, str] | None":
+    """(task id, ts, kind) of a row the session's own hooks wrote, else None. task_attempts reads
+    the same rows for its stall watch; a parity test holds the two readers together."""
+    # TASK_STATUS rows mark delivery, and owner rows are this module's own: neither is the session's turn.
+    if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+        return None
+    task, ts = rec.get("task"), rec.get("ts")
+    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return task.get("id"), ts, rec.get("kind")
+
+
+def newest_task(workspace: Path) -> "tuple[str | None, float | None, str | None]":
+    """(task, ts, kind) of the newest session-hook row, at any age; all None when there is none."""
     try:
         with open(workspace / "state" / "agent-activity.jsonl", "rb") as fh:
             fh.seek(0, os.SEEK_END)
             fh.seek(max(0, fh.tell() - TAIL_BYTES))
             lines = fh.read().decode("utf-8", "replace").splitlines()
     except OSError:
-        return None, None
+        return None, None, None
     for line in reversed(lines):
         try:
-            rec = json.loads(line)
+            row = session_row(json.loads(line))
         except ValueError:
             continue
-        # TASK_STATUS rows mark delivery, and owner rows are this module's own: neither is the session's turn.
-        if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
-            continue
-        task, ts = rec.get("task"), rec.get("ts")
-        if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
-            continue
-        return task.get("id"), ts
-    return None, None
+        if row:
+            return row
+    return None, None, None
+
+
+def mid_turn(pane_text: str | None) -> bool:
+    """A turn is running: the pane's last turn row is a live spinner, and its status line (that row
+    or the footer below it) says `esc to interrupt`. The same words printed above it are history."""
+    lines = (pane_text or "").splitlines()
+    status = turn_status(lines)
+    return status is not None and any(ESC_PROMPT.search(ln) for ln in status)
 
 
 def live_dialog(pane_text: str | None) -> bool:
@@ -116,8 +131,11 @@ def _expire(manager, reqs: list) -> int:
 
 
 def decide(target: str, *, current: str | None, held_elsewhere: bool,
-           pane_text: str | None) -> tuple[bool, str]:
-    """(send Escape?, why), before the at-most-once claim."""
+           pane_text: str | None, finished: str | None = None) -> tuple[bool, str]:
+    """(send Escape?, why), before the at-most-once claim. `finished` says why the target's own
+    turn is already over: an Escape then could only land in whatever turn followed it."""
+    if finished:
+        return False, finished
     if held_elsewhere:
         return False, "a pool worker holds it; only that worker's watcher interrupts it"
     if current != target:
@@ -126,7 +144,7 @@ def decide(target: str, *, current: str | None, held_elsewhere: bool,
         return False, "the pane could not be read"
     if live_dialog(pane_text):
         return True, "a dialog in the pane holds this task"
-    if not ESC_PROMPT.search(pane_text):
+    if not mid_turn(pane_text):
         return False, "no turn is running in the pane"
     return True, "the pane is mid-turn on this task"
 
@@ -156,6 +174,9 @@ def _pane_target(sock: str, run: Callable) -> str | None:
     if os.environ.get("SUTANDO_TMUX_PANE"):
         return os.environ["SUTANDO_TMUX_PANE"]
     session = os.environ.get("SUTANDO_TMUX_SESSION") or "sutando-core"
+    window = os.environ.get("SUTANDO_TMUX_WINDOW") or ""
+    if window.isdigit():                    # the launcher names the core's window: a heal may leave a sibling lower
+        return f"={session}:{window}"
     out = run(["tmux", "-S", sock, "list-windows", "-t", f"={session}", "-F", "#{window_index}"])
     idx = sorted(int(x) for x in (out or "").split() if x.isdigit())
     return f"={session}:{idx[0]}" if idx else None
@@ -186,15 +207,18 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     if not sock:
         log(f"stop-interrupt: {target}: no tmux socket resolved; left the turn to finish")
         return False
-    newest, _ = newest_task(workspace)
+    newest, _, kind = newest_task(workspace)
     current = current_task(workspace, now)
+    finished = ("its turn already ended (a done row)" if newest == target and kind == "done"
+                else "it already has its result" if _result_body(workspace / "results", target) is not None
+                else None)
     manager, reqs = _tui_requirements(workspace, _session()) if newest == target else (None, [])
     held = _held_elsewhere(workspace, tasks_dir, target)
     pane = _pane_target(sock, run) if newest == target and not held else None
     text = run(["tmux", "-S", sock, "capture-pane", "-p", "-J", "-t", pane]) if pane else None
     if newest == target and (reqs or live_dialog(text)):
         current = target                    # parked on a prompt: no rows are written, so age is moot
-    send, why = decide(target, current=current, held_elsewhere=held, pane_text=text)
+    send, why = decide(target, current=current, held_elsewhere=held, pane_text=text, finished=finished)
     if send and not _claim(workspace, target):
         send, why = False, "already interrupted once for this task"
     if send:
@@ -256,6 +280,9 @@ def confirm_stop(target: str, control_id: str, *, workspace: Path, sleep: Callab
     if not _stopped(_result_body(results, target)):
         log(f"stop-interrupt: {target}: the core finished it despite the Stop")
         return "finished"
+    if _held_elsewhere(workspace, workspace / "tasks", target):
+        log(f"stop-interrupt: {target}: a pool worker still holds it; its own answer decides, no ruling")
+        return None
     ActivityStore(workspace).apply(LifecycleTransition(target, "CANCELLED", reason="stopped"))
     log(f"stop-interrupt: {target}: stop confirmed")
     return "cancelled"

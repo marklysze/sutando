@@ -637,14 +637,21 @@ def last_activity(state_dir: Path, task_id: str) -> "float | None":
     newest = None
     for line in lines:
         try:
-            rec = json.loads(line)
+            row = session_row(json.loads(line))
         except ValueError:
             continue
-        # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
-        if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
-            continue
-        task, ts = rec.get("task"), rec.get("ts")
-        if isinstance(task, dict) and task.get("id") == task_id and isinstance(ts, (int, float)) \
-                and not isinstance(ts, bool):
-            newest = ts if newest is None else max(newest, ts)
+        if row and row[0] == task_id:
+            newest = row[1] if newest is None else max(newest, row[1])
     return newest
+
+
+def session_row(rec) -> "tuple[str, float, str] | None":
+    """(task id, ts, kind) of a row the session's own hooks wrote, else None; the same rule as
+    src/stop_interrupt.session_row, which a parity test holds it to."""
+    # Delivery (TASK_STATUS) and owner rows are written for the task, not by its turn.
+    if not isinstance(rec, dict) or rec.get("projection") or rec.get("audience"):
+        return None
+    task, ts = rec.get("task"), rec.get("ts")
+    if not isinstance(task, dict) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return task.get("id"), ts, rec.get("kind")
