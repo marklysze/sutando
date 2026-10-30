@@ -564,9 +564,9 @@ class ResultFileDecision(unittest.TestCase):
 class AnswerOutcomes(unittest.TestCase):
     """An answer to another task's question never rules this task's turn."""
 
-    def recs(self, *outcomes):
+    def recs(self, *outcomes, action="room.question.answer"):
         intents = [{"record_type": at.INTENT, "turn_id": "t", "seq": o["seq"],
-                    "operation_id": o["operation_id"], "action": "room.question.answer"} for o in outcomes]
+                    "operation_id": o["operation_id"], "action": action} for o in outcomes]
         return at.TurnRecords(intents, list(outcomes), True, (), False)
 
     def test_another_tasks_input_ready_does_not_suspend_this_one(self):
@@ -586,11 +586,22 @@ class AnswerOutcomes(unittest.TestCase):
                 d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
                 self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
 
-    def test_its_own_input_ready_still_suspends_it(self):
+    def test_an_answer_outcome_without_its_own_action_field_still_never_rules_it(self):
+        # The action may sit on the intent only; the outcome is matched to it by operation_id.
+        ans = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        self.assertNotIn("action", ans)
+        v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_its_own_ask_still_suspends_it(self):
         own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
-        self.assertEqual(at.classify_turn(self.recs(own), task_id="tsk_me").outcome, at.DURABLY_SUSPENDED)
+        ask = "room.question.ask"
+        self.assertEqual(at.classify_turn(self.recs(own, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED)
         untagged = _outcome("t", 1, phase="input_ready")
-        self.assertEqual(at.classify_turn(self.recs(untagged), task_id="tsk_me").outcome,
+        self.assertEqual(at.classify_turn(self.recs(untagged, action=ask), task_id="tsk_me").outcome,
                          at.DURABLY_SUSPENDED, "an outcome without a task_id is the turn's own")
 
     def test_another_tasks_terminal_or_reconciled_outcome_does_not_settle_this_one(self):

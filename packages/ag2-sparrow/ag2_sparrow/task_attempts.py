@@ -184,7 +184,9 @@ class TaskAttempts:
         if not rule:
             return None
         qid = _question_id(question)
-        if qid in self._load_answered():
+        # The journal holds a succeeded answer before any result is decided: a crash or redelivery in
+        # between still sees it.
+        if qid in self._load_answered() or agent_turn.answered_in_journal(self.state_dir, task_id):
             return ANSWERED_HERE_NOTE
         self._update(task_id, answer_offered=qid)
         return rule

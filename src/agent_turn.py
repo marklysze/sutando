@@ -343,6 +343,30 @@ def read_turn_records(state_dir: Path, turn_id: str, issued_at: float | None = N
     return TurnRecords(intents, outcomes, readable, tuple(unbound), partial, sent)
 
 
+def answered_in_journal(state_dir: Path, task_id: str) -> bool:
+    """Whether any turn of this task already answered a room question: a room.question.answer intent
+    the proxy tagged with this task whose outcome succeeded. Durable before the result is decided."""
+    path = room_actions_path(state_dir)
+    ops, ok = set(), set()
+    for p in (path.with_name(path.name + ".1"), path):
+        try:
+            lines = p.read_text().split("\n")
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict) or rec.get("task_id") != task_id:
+                continue
+            if rec.get("record_type") == INTENT and rec.get("action") == "room.question.answer":
+                ops.add(rec.get("operation_id"))
+            elif rec.get("record_type") == OUTCOME and rec.get("operation_status") == "succeeded":
+                ok.add(rec.get("operation_id"))
+    return bool(ops & ok)
+
+
 def unmatched_intents(records: TurnRecords) -> list:
     """Intents whose server outcome is unknown and must be reconciled with core-api."""
     known = {o.get("operation_id") for o in records.outcomes
@@ -396,7 +420,9 @@ def classify_turn(records: TurnRecords, *, stdout: str = "", reconciled: Iterabl
         by_op[op] = merged
     # The proxy tags an outcome with the caller's own task, but an answer's applied state is the
     # asker's: a room.question.answer never rules this turn's terminal or suspended state.
-    outcomes = sorted((o for o in by_op.values() if o.get("action") != "room.question.answer"), key=_seq)
+    outcomes = sorted((o for op, o in by_op.items()
+                       if (o.get("action") or intent_by_op.get(op, {}).get("action")) != "room.question.answer"),
+                      key=_seq)
     n = len(records.intents)
 
     if any(o.get("operation_status") == "succeeded" and _applied_terminal(o) for o in outcomes):

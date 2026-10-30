@@ -423,6 +423,21 @@ class AnsweredOnce(unittest.TestCase):
         self.assertEqual(again.answer_rule("tsk_B", self.Q), task_attempts.ANSWERED_HERE_NOTE)
         self.assertIn("`room.question.answer`", again.answer_rule("tsk_B", {**self.Q, "question_id": "rq_2"}))
 
+    def test_a_redelivery_after_a_crash_sees_the_answer_in_the_journal(self):
+        a = self.mk(turn_context=True)
+        self.assertIn("`room.question.answer`", a.answer_rule("tsk_R", self.Q))
+        turn = a.record_ack("tsk_R", _ack(1))["turn_id"]
+        with open(agent_turn.room_actions_path(self.state), "a") as fh:
+            for rec in ({"record_type": "dispatch_intent", "turn_id": turn, "task_id": "tsk_R",
+                         "operation_id": "op_r", "action": "room.question.answer"},
+                        {"record_type": "dispatch_outcome", "turn_id": turn, "task_id": "tsk_R",
+                         "operation_id": "op_r", "operation_status": "succeeded"}):
+                fh.write(json.dumps(rec) + "\n")
+        again = self.mk(turn_context=True)    # crashed before the result was decided
+        self.assertEqual(again.answer_rule("tsk_R", self.Q), task_attempts.ANSWERED_HERE_NOTE)
+        self.assertIn("`room.question.answer`", again.answer_rule("tsk_S", self.Q),
+                      "another task's journal says nothing about this one")
+
     def test_a_failed_or_other_action_does_not_record_an_answer(self):
         for kw in ({"status": "failed"}, {"action": "room.message.send"}):
             self.state = Path(tempfile.mkdtemp())
