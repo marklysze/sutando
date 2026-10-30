@@ -3278,8 +3278,11 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             time.sleep(ACK_DROP_RETRY_S)
             doc = _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
+        if not _record_attempt(wire_tid, doc, open_turn=_task_pending(tid)):
+            _log_backoff((tid, "ack-unrecorded"), f"task ack for {tid}: accepted, but its generation "
+                         "could not be recorded — the pending ack is kept and retried")
+            return False
         _forget_pending_ack(tid, lease_id)
-        _record_attempt(wire_tid, doc, open_turn=_task_pending(tid))
         return True
     except urllib.error.HTTPError as e:
         raw = _http_error_body(e) if e.code in (404, 409) else ""
@@ -3965,11 +3968,17 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
 
 
-def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> None:
-    if _ATTEMPTS is not None:
-        before = _ATTEMPTS.get(wire_tid)
-        _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
-        _withdraw_stale_cancel(wire_tid, before)
+def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> bool:
+    """False when the ack named a generation that is not on disk afterwards."""
+    if _ATTEMPTS is None:
+        return True
+    before = _ATTEMPTS.get(wire_tid)
+    _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
+    gen = doc.get("execution_generation") if isinstance(doc, dict) else None
+    if type(gen) is int and gen >= 1 and _ATTEMPTS.get(wire_tid).get("execution_generation") != gen:
+        return False
+    _withdraw_stale_cancel(wire_tid, before)
+    return True
 
 
 def _withdraw_stale_cancel(wire_tid: str, before: dict) -> None:
@@ -4865,8 +4874,10 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
             return None
         task = {**task, "task": task_attempts.render_wake(str(task.get("task") or ""), task["wake"])}
         _log(f"wake for {tid}: episode {woken} queued as a new turn")
-    if _ATTEMPTS is not None:
-        _ATTEMPTS.remember_task(broker_tid, task)
+    if _ATTEMPTS is not None and not _ATTEMPTS.remember_task(broker_tid, task):
+        _log_backoff((tid, "unrecorded"), f"task {tid}: its attempt could not be recorded "
+                     "— left unacked for a re-serve")
+        return None
     dest = TASKS_DIR / f"{tid}.txt"
     # Idempotent: don't re-write a task already queued, claimed, or archived —
     # but a pre-S1 queue file still has to earn its durability before the ack.

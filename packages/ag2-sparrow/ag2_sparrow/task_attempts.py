@@ -153,16 +153,19 @@ class TaskAttempts:
         return data if isinstance(data, dict) else None
 
     def _update(self, wire_tid: str, **fields) -> dict:
-        """Merge `fields` into the record. An unreadable ledger is left as it is, never rewritten."""
+        return self._merge(wire_tid, fields)[0]
+
+    def _merge(self, wire_tid: str, fields: dict) -> "tuple[dict, bool]":
+        """Merge `fields` into the record; the record and whether it was saved. An unreadable
+        ledger is left as it is, never rewritten."""
         with _MUTEX:
             data = self._read_json(self.path)
             if data is None:
                 self.log(f"task {wire_tid}: {self.path.name} unreadable — not written")
-                return {}
+                return {}, False
             rec = {**data.get(wire_tid, {}), **fields}
             data[wire_tid] = rec
-            self._save(data)
-            return rec
+            return rec, self._save(data)
 
     def get(self, wire_tid: str) -> dict:
         return dict(self._load().get(wire_tid) or {})
@@ -187,21 +190,21 @@ class TaskAttempts:
     def ack_fields(self) -> dict:
         return {"worker_id": self.worker_id(), "protocol_version": PROTOCOL_VERSION}
 
-    def remember_task(self, wire_tid: str, task: dict) -> None:
+    def remember_task(self, wire_tid: str, task: dict) -> bool:
         """Room context for the turn file, and the moment the task was published: until the ack
-        names the generation, the task's result waits and its room actions are unbound."""
+        names the generation, the task's result waits and its room actions are unbound. False when
+        it could not be saved: the task is not queued or acked."""
         def s(*keys):
             for k in keys:
                 v = task.get(k)
                 if isinstance(v, str) and v:
                     return v
             return None
-        self._update(wire_tid, room_id=s("source_room_id", "channel_id"),
-                     thread_root_id=s("thread_root"),
-                     source_event_id=s("source_event_id", "source_message_id", "event_id"),
-                     source_kind=s("source_kind", "interaction_type"),
-                     awaiting_ack=True,
-                     published_at=self.get(wire_tid).get("published_at") or self.now())
+        return self._merge(wire_tid, dict(
+            room_id=s("source_room_id", "channel_id"), thread_root_id=s("thread_root"),
+            source_event_id=s("source_event_id", "source_message_id", "event_id"),
+            source_kind=s("source_kind", "interaction_type"), awaiting_ack=True,
+            published_at=self.get(wire_tid).get("published_at") or self.now()))[1]
 
     def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None,
                    open_turn: bool = True) -> dict | None:

@@ -1061,7 +1061,7 @@ class Hooks(unittest.TestCase):
                 gw._post_ready_results(inflight)
                 broken_bytes = None if path.is_dir() else path.read_bytes()
 
-                self.assertIsNotNone(gw._write_task(_task(f"{tid}-other")), "another task is still queued")
+                self.assertIsNone(gw._write_task(_task(f"{tid}-other")), "another task is left for a re-serve")
                 self.assertEqual(None if path.is_dir() else path.read_bytes(), broken_bytes,
                                  "the unreadable ledger is left as it was")
                 root = gw._delivery_core().backend.root
@@ -1083,6 +1083,67 @@ class Hooks(unittest.TestCase):
                 self.assertIn("e1", gw._ATTEMPTS._load_json(gw._ATTEMPTS._wakes_path)[tid])
                 self.assertEqual(gw._ATTEMPTS.wake_item(tid), f"{tid}.wake-e1")
                 self.assertIsNone(gw._write_task(dict(wake)), "the replay is refused")
+
+    def ran(self, tid):
+        (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text("done")
+
+    def posted_once_under_its_generation(self, fake, tid, inflight):
+        gw._post_ready_results(inflight)
+        posted = fake.posted("/v1/results")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual((posted[0]["execution_generation"], posted[0]["worker_id"]),
+                         (1, gw._ATTEMPTS.worker_id()), "posted under its generation, not as legacy")
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+
+    def test_a_task_whose_attempt_cannot_be_recorded_is_not_queued_or_acked(self):
+        tid, path = "task-adm1", gw._ATTEMPTS.path
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+        good = path.read_bytes() if path.exists() else b"{}"
+        path.write_text("{not json")
+        inflight, fates = set(), {}
+        gw._take_served_round([_task(tid)], inflight, [], fates, [])
+        self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "not queued")
+        self.assertEqual(fake.posted("/ack"), [], "not acked: the broker serves it again")
+        self.assertNotIn(tid, inflight)
+        self.assertEqual(path.read_text(), "{not json", "left as it was")
+        self.assertTrue(any(f"task {tid}: its attempt could not be recorded" in m for m in self.logs))
+
+        path.write_bytes(good)
+        gw._take_served_round([_task(tid)], inflight, [], fates, [])
+        self.assertEqual(len(fake.posted("/ack")), 1)
+        self.assertIn(tid, inflight)
+        self.ran(tid)
+        self.posted_once_under_its_generation(fake, tid, inflight)
+
+    def test_an_ack_whose_generation_cannot_be_recorded_keeps_its_pending_ack(self):
+        tid, path, good = "task-adm2", gw._ATTEMPTS.path, []
+
+        def ack(_payload):
+            good.append(path.read_bytes())
+            path.write_text("{not json")
+            return _ack(tid, 1)
+
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": ack}))
+        inflight, fates = set(), {}
+        gw._take_served_round([_task(tid)], inflight, [], fates, [])
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists())
+        self.assertIn(tid, gw._load_pending_acks(), "the pending ack is kept to retry from")
+        self.assertNotEqual(fates.get(tid), "acked")
+        self.assertTrue(any(f"task ack for {tid}: accepted, but its generation" in m for m in self.logs))
+        self.ran(tid)
+        gw._post_ready_results(inflight)
+        self.assertEqual(fake.posted("/v1/results"), [], "unknown: nothing posted")
+
+        path.write_bytes(good[0])
+        gw._post_ready_results(inflight)
+        self.assertEqual(fake.posted("/v1/results"), [], "still waiting for its generation")
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _ack(tid, 1)
+        gw._retry_pending_acks(inflight)
+        self.assertNotIn(tid, gw._load_pending_acks(), "retired once the generation is on disk")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
+        self.posted_once_under_its_generation(fake, tid, inflight)
 
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}
