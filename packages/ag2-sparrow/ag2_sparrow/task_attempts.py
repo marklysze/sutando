@@ -514,7 +514,9 @@ class TaskAttempts:
     def finish(self, wire_tid: str, attempt: "dict | None" = None) -> bool:
         """The result is settled: close the attempt's turn and forget the attempt. With `attempt`
         (the record read before the result was posted), a record that has moved on to another
-        turn or wake since is kept; only the settled attempt's own turn is closed."""
+        turn or wake since is kept; only the settled attempt's own turn is closed. A wake's episode
+        (as seen) and then its item are saved before the attempt is retired; False, with the attempt
+        kept, when any of those writes fails, so a later finish retries it."""
         with _MUTEX:
             data = self._load()
             rec = data.get(wire_tid) or {}
@@ -523,16 +525,19 @@ class TaskAttempts:
                 if attempt.get("turn_id"):
                     self._close_turn(attempt["turn_id"])
                 return False
-            data.pop(wire_tid, None)
-            self._save(data)
             if rec.get("wake_episode"):
                 wakes = self._load_wakes()
                 seen = [e for e in wakes.get(wire_tid, []) if e != rec["wake_episode"]]
                 wakes[wire_tid] = (seen + [rec["wake_episode"]])[-WAKE_EPISODES_KEPT:]
-                self._save_json(self._wakes_path, wakes)
+                if not self._save_json(self._wakes_path, wakes):
+                    return False
                 items = self._load_json(self._wake_items_path)
                 items[wire_tid] = f"{wire_tid}.wake-{rec['wake_episode']}"
-                self._save_json(self._wake_items_path, dict(list(items.items())[-WAKE_ITEMS_KEPT:]))
+                if not self._save_json(self._wake_items_path, dict(list(items.items())[-WAKE_ITEMS_KEPT:])):
+                    return False
+            data.pop(wire_tid, None)
+            if not self._save(data):
+                return False
         if rec.get("turn_id"):
             self._close_turn(rec["turn_id"])
         return True

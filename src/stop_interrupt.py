@@ -210,7 +210,8 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     if not sock:
         log(f"stop-interrupt: {target}: no tmux socket resolved; left the turn to finish")
         return False
-    newest, _, kind = newest_task(workspace)
+    snapshot = newest_task(workspace)
+    newest, _, kind = snapshot
     current = current_task(workspace, now)
     # Only a row written mid-turn says the pane may still be on T: a Stop-hook `thinking` or a `done`
     # row closes T's turn, so a later turn in the pane is not T's.
@@ -224,6 +225,9 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
     if newest == target and (reqs or live_dialog(text)):
         current = target                    # parked on a prompt: no rows are written, so age is moot
     send, why = decide(target, current=current, held_elsewhere=held, pane_text=text, finished=finished)
+    if send and (newest_task(workspace) != snapshot or _result_body(workspace / "results", target) is not None):
+        # Rows or a result written while the pane was read: the turn may have moved on.
+        send, why = False, "its turn changed while the pane was read"
     if send and not _claim(workspace, target):
         send, why = False, "already interrupted once for this task"
     if send:
