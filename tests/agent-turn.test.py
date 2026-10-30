@@ -425,7 +425,12 @@ class ResultFileDecision(unittest.TestCase):
         failed = {"operation_id": f"op_{turn}_1", "operation_status": "failed", "turn_id": turn, "seq": 1}
         self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked",
                                                  reconciled=[failed]).fields,
-                         {"status": "completed"}, "reconciliation shows the ask failed: nothing is open")
+                         {"status": "failed", "no_send": True}, "the ask failed: 'I asked' is never the reply")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"), _outcome(turn, 1, op_status="failed"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked").fields,
+                         {"status": "failed", "no_send": True}, "a failed ask in the journal itself")
         state = Path(tempfile.mkdtemp())
         turn = _ctx(state)["turn_id"]
         _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
