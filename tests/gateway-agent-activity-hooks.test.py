@@ -734,7 +734,8 @@ class Hooks(unittest.TestCase):
         self.assertFalse(gw._write_if_absent(gw.RESULTS_DIR / "no-such-dir" / "task-x.txt", "x"))
         target = gw.RESULTS_DIR / "task-y.txt"
         for fault in ("fsync", "link"):
-            with self.subTest(fault=fault), mock.patch.object(gw.os, fault, side_effect=OSError("disk full")):
+            with self.subTest(fault=fault), \
+                    mock.patch.object(gw.task_attempts.os, fault, side_effect=OSError("disk full")):
                 self.assertFalse(gw._write_if_absent(target, "x"), "a failed write is a failure")
             self.assertFalse(target.exists(), "no empty placeholder blocks the retry")
         self.assertEqual([p.name for p in gw.RESULTS_DIR.iterdir() if p.name.startswith(".task-y")], [],

@@ -1177,7 +1177,7 @@ class BridgeDelegates(unittest.TestCase):
               "_append_log_file", "_archive_task_file", "_archive_resolved_review",
               "_retry_review_control_results", "_post_proactive", "_recover_orphan_proactive",
               "_retire_proactive", "_send_proactive", "_drop_staged", "_withdraw_stale_cancel",
-              "_withdraw_closed", "_write_if_absent"}
+              "_withdraw_closed"}
 
     def movers(self):
         out = {}

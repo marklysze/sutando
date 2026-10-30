@@ -32,9 +32,8 @@ TASK_HEARTBEAT_PATH = "/v1/tasks/heartbeat"
 TASK_HEARTBEAT_INTERVAL_S = 15
 # An attempt whose task file left the queue unanswered, with no turn activity this long, is failed.
 DISPATCH_LOST_S = 600
-# A queued attempt the core engaged and then left with no turn activity or result this long is failed.
-# Silence after which an engaged task is abandoned, when the core reads idle; while it reads moving
-# (mid-turn: a long tool call or a subagent wait) never. Unobserved, far past one tool call's silence.
+# An engaged task's silence that fails it: when the core reads idle; never while it reads moving
+# (mid-turn: a long tool call or a subagent wait); unobserved, far past one tool call's silence.
 STALLED_S = 1800
 STALLED_UNOBSERVED_S = 7200
 ACTIVITY_TAIL_BYTES = 256 * 1024
@@ -487,6 +486,28 @@ class TaskAttempts:
                         and not data[t].get("fenced"))
         missing = [listed[t] for t in sorted(listed) if t not in set(local_wire_tids)]
         return {"not_listed": unlisted, "missing_locally": missing}
+
+
+def write_if_absent(path: Path, text: str) -> "bool | None":
+    """Create `path` holding `text` only if nothing is there: True written, None when a file already
+    was (it wins). Raises OSError on a failure, with nothing left at `path`, so a retry can write it."""
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fchmod(fh.fileno(), 0o644)
+            os.fsync(fh.fileno())
+        # link() publishes the complete file and never replaces one already there.
+        os.link(tmp, path)
+        return True
+    except FileExistsError:
+        return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def cancel_task_text(local_tid: str, task_id: str, timestamp: str, reason: str) -> str:

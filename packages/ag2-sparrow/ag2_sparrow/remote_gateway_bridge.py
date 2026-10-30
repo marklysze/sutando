@@ -677,29 +677,12 @@ def _durable_write(path: Path, text: str) -> bool:
 
 def _write_if_absent(path: Path, text: str) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file
-    already was (it wins), False on an error, with nothing left at `path` so a retry can write it.
-    The text is complete and synced before link() publishes it, and link() never replaces a file."""
-    tmp = None
+    already was (it wins), False on an error, with nothing left at `path` for the retry."""
     try:
-        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(text.encode("utf-8"))
-            fh.flush()
-            os.fchmod(fh.fileno(), 0o644)
-            os.fsync(fh.fileno())
-        os.link(tmp, path)
-        return True
-    except FileExistsError:
-        return None
+        return task_attempts.write_if_absent(path, text)
     except OSError as exc:
         _log(f"could not write {path.name} ({diagnostics.describe(exc)})")
         return False
-    finally:
-        if tmp is not None:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
 
 
 def _read_review_json(path: Path) -> "dict | None":
