@@ -236,6 +236,10 @@ class Attempts(unittest.TestCase):
         self.assertFalse(agent_turn.is_closed(self.state, old))
         self.assertFalse(agent_turn.is_closed(self.state, done))
         self.assertTrue(any("not closed yet" in m for m in self.logs))
+        with unittest.mock.patch.object(agent_turn, "JOURNAL_LOCK_WAIT_S", 0.05), \
+                unittest.mock.patch.object(agent_turn, "close_turn", wraps=agent_turn.close_turn) as close:
+            a.close_finished_turns({"tsk_A"})
+        self.assertEqual(close.call_count, 1, "a busy lock costs one wait per pass, not one per turn")
         lock.unlink()
         self.assertEqual(a.close_finished_turns({"tsk_A"}), 2)
         self.assertTrue(agent_turn.is_closed(self.state, old), "a superseded generation's turn")
@@ -262,6 +266,14 @@ class Attempts(unittest.TestCase):
         found = a.compare_with_server({"tsk_old", "tsk_new", "tsk_live"}, server)
         self.assertEqual(found["not_listed"], ["tsk_old"], "a just-acked attempt waits")
         self.assertEqual([t["task_id"] for t in found["missing_locally"]], ["tsk_server_only"])
+
+    def test_a_result_with_no_turn_reads_past_a_stale_torn_line(self):
+        a = self.mk(turn_context=True)
+        a.remember_task("tsk_N", {"source_room_id": "!r:x"})
+        journal = self.state / agent_turn.ROOM_ACTIONS_NAME
+        journal.write_text('{"record_type": "dispatch_intent", "turn_id": "x_g1_Y", "tas\n')
+        os.utime(journal, (1, 1))
+        a.result_decision("tsk_N", "the answer", False)   # raised TypeError with no turn of its own
 
     def test_a_task_whose_ack_never_answered_ages_into_reconciliation(self):
         clock = [1000.0]
@@ -332,6 +344,7 @@ class Attempts(unittest.TestCase):
         self.assertIn("top-level `task_id` `tsk_A`", rule)
         self.assertIn("`room.question.ask`", rule)
         self.assertIn("goes to the owner's DM with `ask-owner.py`", rule, "the same audience test as a reply")
+        self.assertIn("result file starting `[no-send]`", rule, "the DM route says what this task's result is")
         self.assertNotIn("~", rule)
 
     def test_the_ask_in_room_rule_sends_visible_text_before_asking(self):

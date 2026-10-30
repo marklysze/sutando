@@ -45,6 +45,7 @@ CONFIRM_POLL_S = 2.0
 CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
 ENABLE_ENV = "SUTANDO_STOP_INTERRUPT"
+MID_TURN_KINDS = ("working", "processing")
 CONFIG_SH = Path(__file__).resolve().parents[1] / "scripts" / "sutando-config.sh"
 
 
@@ -209,7 +210,9 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
         return False
     newest, _, kind = newest_task(workspace)
     current = current_task(workspace, now)
-    finished = ("its turn already ended (a done row)" if newest == target and kind == "done"
+    # Only a row written mid-turn says the pane may still be on T: a Stop-hook `thinking` or a `done`
+    # row closes T's turn, so a later turn in the pane is not T's.
+    finished = (f"its newest row ({kind}) was not written mid-turn" if newest == target and kind not in MID_TURN_KINDS
                 else "it already has its result" if _result_body(workspace / "results", target) is not None
                 else None)
     manager, reqs = _tui_requirements(workspace, _session()) if newest == target else (None, [])
