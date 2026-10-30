@@ -417,7 +417,7 @@ Sutando checkout around it sends neither field.
   ago) is only logged: absence is not a terminal status, so it is fenced only when its beat or ack
   answers with one. Server tasks this node does not hold are written to
   `state/relay-outstanding-tasks.json`.
-- A served task carrying `wake` is left unacked, whether or not this node saw its first
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, a served task carrying `wake` is left unacked, whether or not this node saw its first
   attempt: running it without its answer, or closing it as a redelivery, would lose the answer.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
