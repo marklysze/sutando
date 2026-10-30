@@ -357,6 +357,7 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from . import task_attempts
+from . import task_attempt_migrations
 from . import task_hold
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -667,11 +668,11 @@ def _durable_write(path: Path, text: str) -> bool:
     return False
 
 
-def _write_if_absent(path: Path, text: str) -> "bool | None":
+def _write_if_absent(path: Path, text: str, claim=None) -> "bool | None":
     """Create `path` holding `text` only if nothing is there: True written, None when a file
-    already was (it wins), False on an error, with nothing left at `path` for the retry."""
+    already was (it wins), False on an error or a refused `claim`, with nothing left at `path`."""
     try:
-        return task_attempts.write_if_absent(path, text)
+        return task_attempts.write_if_absent(path, text, claim)
     except OSError as exc:
         _log(f"could not write {path.name} ({diagnostics.describe(exc)})")
         return False
@@ -3980,37 +3981,45 @@ def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> bool:
         return True
     gen = doc.get("execution_generation") if isinstance(doc, dict) else None
     gen = gen if type(gen) is int and gen >= 1 else None
-    if not _retract_generation(wire_tid, _ATTEMPTS.get(wire_tid), gen):
-        return False
-    _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
-    rec = _ATTEMPTS._read_json(_ATTEMPTS.path)
+    with _ATTEMPTS.lock:
+        before = _ATTEMPTS.records()
+        before = None if before is None else before.get(wire_tid) or {}
+        if before is None or (before and before.get("schema") != task_attempts.SCHEMA):
+            return False                        # unknown, or awaiting its migration: held
+        if gen is not None and gen != before.get("execution_generation") \
+                and not _retract_generation(wire_tid, before):
+            return False
+        _ATTEMPTS.record_ack(wire_tid, doc, _reenroll_identity() or None, open_turn=open_turn)
+        rec = _ATTEMPTS._read_json(_ATTEMPTS.path)
     rec = None if rec is None else rec.get(wire_tid) or {}
     if rec is None or rec.get("awaiting_ack"):
         return False
     return gen is None or (rec.get("execution_generation") == gen and _ATTEMPTS.broker_names_leases())
 
 
-def _retract_generation(wire_tid: str, before: dict, gen: "int | None") -> bool:
-    """Before a newer generation is recorded, undo what the older one left outside the ledger: its
-    queued cancels (one the core took is watched instead) and its own failure result. A cancel is
-    withdrawn by renaming it aside, so after a crash its absence still says who took it."""
+def _retract_generation(wire_tid: str, before: dict) -> bool:
+    """Before the record moves to another generation or a wake's new turn, undo what the attempt it
+    held left outside the ledger: its queued cancels (one the core took is watched instead) and its
+    own failure result. A cancel is withdrawn by renaming it aside, so after a crash its absence
+    still says who took it. Called under the attempts lock."""
     old = before.get("execution_generation")
-    if gen is None or type(old) is not int or gen <= old:
-        return True
     owed = before.get("owed_ctl") if isinstance(before.get("owed_ctl"), dict) else {}
     taken, parked = before.get("taken_ctl"), []
-    for ctl in dict.fromkeys(c for c in (before.get("fence_ctl"), before.get("stop_ctl"), owed.get("id"))
-                             if isinstance(c, str)):
+    named = [c for c in dict.fromkeys((before.get("fence_ctl"), before.get("stop_ctl"), owed.get("id")))
+             if isinstance(c, str)]
+    if not named and not (before.get("dispatch_lost") or {}).get("file"):
+        return True                             # nothing outside the ledger to undo
+    for ctl in named:
         aside = TASKS_DIR / f".{ctl}.withdrawn"
         try:
             os.rename(TASKS_DIR / f"{ctl}.txt", aside)
-            _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — a newer generation "
+            _log(f"task {wire_tid}: cancel {ctl} for generation {old} withdrawn — a newer attempt "
                  "is served here")
         except FileNotFoundError:
             if not aside.exists() and (owed.get("id") != ctl or _ctl_written(ctl)):
                 taken = ctl
                 _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
-                     "the newer generation may be stopped")
+                     "the newer attempt may be stopped")
         except OSError as e:
             _log(f"task {wire_tid}: cancel {ctl} could not be withdrawn ({diagnostics.describe(e)}) — "
                  "the ack is retried")
@@ -4030,12 +4039,20 @@ def _retract_generation(wire_tid: str, before: dict, gen: "int | None") -> bool:
 
 
 def _withdraw_failure(wire_tid: str, lost) -> bool:
-    """Archive the failure result `lost` (a dispatch-lost marker) wrote, if it is still waiting; an
-    answer the core wrote is left. False when it could not be archived."""
+    """Archive the failure result `lost` (a dispatch-lost marker) wrote, if it is still waiting; any
+    other file there is the core's answer and is left. False when it could not be checked or archived."""
     tid = _local_tid(wire_tid)
     path = RESULTS_DIR / f"{tid}.txt"
-    raw, generation = _read_ready_generation(path)
-    if raw is None or not task_attempts.failure_body_of(lost, raw):
+    if not (isinstance(lost, dict) and lost.get("file")):
+        return True
+    try:
+        generation = ResultIdentity(*task_attempts.file_identity(path))
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        _log(f"task {wire_tid}: its result could not be checked ({diagnostics.describe(e)})")
+        return False
+    if list(generation) != lost["file"]:
         return True
     done = disposal.retire_generation(RESULTS_DIR, path, generation, _log, ARCHIVE_RESULTS_DIR,
                                       _names(f"{tid}-{int(time.time())}-withdrawn"))
@@ -4061,14 +4078,15 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         _log(f"task ack for {tid}: an older lease was refused; the newer serve here is acked instead")
         return True
     wire_tid = _broker_tid(tid)
-    owed = _fence_owes(wire_tid, code, {**err, "error_code": code}) if published else {}
-    verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **owed)
-    if verdict.get("unsaved"):
-        return True                             # its pending ack is kept: the retry is fenced again
-    _forget_pending_ack(tid, lease_id)
-    if verdict["new"] and published:
-        _settle_owed(wire_tid)
-    _ATTEMPTS.cancel_ack(wire_tid)
+    with _ATTEMPTS.lock:
+        owed = _fence_owes(wire_tid, code, {**err, "error_code": code}) if published else {}
+        verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **owed)
+        if verdict.get("unsaved"):
+            return True                         # its pending ack is kept: the retry is fenced again
+        _forget_pending_ack(tid, lease_id)
+        if verdict["new"] and published:
+            _settle_owed(wire_tid)
+        _ATTEMPTS.cancel_ack(wire_tid)
     return True
 
 
@@ -4109,52 +4127,80 @@ def _ctl_written(ctl: str) -> bool:
 
 def _settle_ledger(inflight: "set[str]") -> None:
     """The retry owner of owed work is the ledger, not the in-flight set: every record that owes is
-    held in flight (its failure result is posted from there) and settled each pass."""
-    _ATTEMPTS.upgrade(_new_ctl_id, _legacy_failure_body)
+    held in flight (its failure result is posted from there) and settled each pass. One newly held
+    is settled only once the in-flight set naming it is on disk."""
     owing = _ATTEMPTS.owing()
+    if not owing:
+        return
     adopted = {_local_tid(w) for w in owing} - inflight
     if adopted:
-        inflight |= adopted
-        _save_inflight(inflight)
-        _log(f"held in flight while their records owe work: {', '.join(sorted(adopted))}")
-    for wire_tid in owing:
+        if _hold_in_flight(inflight, adopted):
+            _log(f"held in flight while their records owe work: {', '.join(sorted(adopted))}")
+        else:
+            owing = {w for w in owing if _local_tid(w) not in adopted}
+            _log_backoff(("owed", "unheld"), "records that owe work could not be held in flight yet "
+                         f"({', '.join(sorted(adopted))}) — settled once they are")
+    for wire_tid in sorted(owing):
         _settle_owed(wire_tid)
 
 
-def _legacy_failure_body(wire_tid: str) -> str:
-    """The failure result an upgraded record owns: the one already written, else the default."""
+def _hold_in_flight(inflight: "set[str]", tids: "set[str]") -> bool:
+    """Add `tids` to the in-flight set only once a write holding them has committed."""
+    with _INFLIGHT_MUTEX:
+        if not _save_inflight(set(inflight) | tids):
+            return False
+        inflight |= tids
+        return True
+
+
+def _legacy_failure(wire_tid: str) -> "tuple[str, list | None]":
+    """For a record migrated from a boolean failure marker: the failure body it owes, and the result
+    file it already wrote when the live result is one of the bridge's own failure bodies."""
+    path = RESULTS_DIR / f"{_local_tid(wire_tid)}.txt"
     try:
-        text = (RESULTS_DIR / f"{_local_tid(wire_tid)}.txt").read_text()
-    except (OSError, ValueError):
-        return DISPATCH_LOST_RESULT
-    return text if text in (DISPATCH_LOST_RESULT, STALLED_RESULT, STALE_CANCEL_RESULT) else DISPATCH_LOST_RESULT
+        data, identity = identity_of(path)
+    except OSError:
+        return DISPATCH_LOST_RESULT, None
+    body = ready_body_of(data)
+    for own in (DISPATCH_LOST_RESULT, STALLED_RESULT, STALE_CANCEL_RESULT):
+        if body == ready_body_of(own.encode("utf-8")):
+            return own, list(identity)
+    return DISPATCH_LOST_RESULT, None
 
 
 def _settle_owed(wire_tid: str) -> None:
-    """Carry out what a saved fence, Stop or failure still owes. Each marker is cleared only once its
-    work is found done, so any failure or crash repeats the step; work an older generation owed is
-    dropped, never carried out."""
+    """Carry out what a saved fence, Stop or failure still owes, as one transition under the attempts
+    lock: no ack, wake or retirement moves the record between the read, the effect and the marker's
+    clear. Only debts of the generation the record holds are carried out, never while a newer serve
+    awaits its ack (the ack retracts them). Each marker is cleared only once its work is found done,
+    so any failure or crash repeats the step."""
+    with _ATTEMPTS.lock:
+        _settle_current(wire_tid)
+
+
+def _settle_current(wire_tid: str) -> None:
     rec, tid = _ATTEMPTS.get(wire_tid), _local_tid(wire_tid)
+    if rec.get("schema") != task_attempts.SCHEMA or rec.get("awaiting_ack"):
+        return
     gen = rec.get("execution_generation")
-    stale = [k for k in task_attempts.DEBTS if isinstance(rec.get(k), dict) and rec[k].get("gen") != gen]
-    if stale:
-        if not (_withdraw_failure(wire_tid, rec.get("dispatch_lost"))
-                and _ATTEMPTS._set(wire_tid, **dict.fromkeys(stale))):
-            return
-        _log(f"task {wire_tid}: work owed by an earlier generation dropped ({', '.join(stale)})")
-        rec = _ATTEMPTS.get(wire_tid)
-    if isinstance(rec.get("owed_close"), dict):
+
+    def due(debt):
+        return isinstance(debt, dict) and debt.get("gen") == gen
+
+    if due(rec.get("owed_close")):
         _withdraw_closed(wire_tid, str(rec["owed_close"].get("why")))
         rec = _ATTEMPTS.get(wire_tid)
     owed = rec.get("owed_ctl")
-    if isinstance(owed, dict) and isinstance(owed.get("id"), str):
+    if due(owed) and isinstance(owed.get("id"), str):
         ctl = owed["id"]
         if _ctl_written(ctl) or _queue_cancel_instruction(tid, str(owed.get("reason")), ctl):
             _ATTEMPTS._set(wire_tid, owed_ctl=None)
     lost = rec.get("dispatch_lost")
-    body = lost.get("body") if isinstance(lost, dict) else None
+    body = lost.get("body") if due(lost) else None
     if isinstance(body, str) and not (os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid)):
-        written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body)
+        # The file is named in the record before it is published: only it is ever this failure.
+        written = _write_if_absent(RESULTS_DIR / f"{tid}.txt", body, claim=lambda identity: _ATTEMPTS._set(
+            wire_tid, dispatch_lost={**lost, "file": identity}))
         if written:
             _log(f"task {tid}: its owed failure result is written — posting it as failed")
             wake_outbound()
@@ -4164,6 +4210,13 @@ def _settle_owed(wire_tid: str) -> None:
 
 
 def _fence_attempt(wire_tid: str, error: dict) -> None:
+    """A beat's fencing answer, acted on only while the record holds the generation it was sent for."""
+    with _ATTEMPTS.lock:
+        if _ATTEMPTS.get(wire_tid).get("execution_generation") == error.get("beat_generation"):
+            _fence_current(wire_tid, error)
+
+
+def _fence_current(wire_tid: str, error: dict) -> None:
     if error.get("error_code") == "task_cancelled":
         # A Stop on a running attempt is cooperative: a result the core still writes is delivered.
         ctl = _new_ctl_id()
@@ -4225,11 +4278,12 @@ def _post_task_beats(inflight: "set[str]", force: bool = False) -> None:
     _last_task_beat_at = time.time()
     _settle_ledger(inflight)
     wire = {_broker_tid(t) for t in inflight}
-    for wire_tid in wire:
-        _resolve_stop(wire_tid)
-        _resolve_taken_cancel(wire_tid)
-        _ATTEMPTS.cancel_ack(wire_tid)              # no-op unless a cancel awaits its ack
-        _watch_dispatch(wire_tid)
+    for wire_tid in sorted(wire):
+        with _ATTEMPTS.lock:                    # each reads the record, acts, then writes it
+            _resolve_stop(wire_tid)
+            _resolve_taken_cancel(wire_tid)
+            _ATTEMPTS.cancel_ack(wire_tid)          # no-op unless a cancel awaits its ack
+            _watch_dispatch(wire_tid)
     for err in _ATTEMPTS.post_task_beats(wire):
         if err.get("task_id") in wire:
             _fence_attempt(err["task_id"], err)
@@ -4333,15 +4387,34 @@ def _own_copy_exists(tid: str) -> bool:
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
-    """At start: hold every record that owes work, then retire what left flight. An in-flight set
-    that could not be read retires nothing: unknown is not empty."""
+    """At start, before anything settles or sweeps: migrate older records, then bring back into
+    flight every attempt still live on disk (its task file queued or its result waiting; every
+    attempt when the in-flight set could not be read), then settle owed work and retire what left
+    flight. Unknown retires nothing: an unreadable ledger or in-flight set, a migration that did
+    not commit, or a recovery that could not be saved."""
     if _ATTEMPTS is None:
         return
-    _settle_ledger(inflight)
-    if _INFLIGHT_DEGRADED:
-        _log("in-flight set unreadable — no attempt or turn retired at start")
-        return
-    closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
+    with _ATTEMPTS.lock:
+        migrated = task_attempt_migrations.migrate(
+            _ATTEMPTS, TASKS_DIR, local_tid=_local_tid, new_ctl=_new_ctl_id, failure_of=_legacy_failure,
+            log=_log)
+        records = _ATTEMPTS.records()
+        if records is None:
+            _log("attempt ledger unreadable — nothing settled or retired at start")
+            return
+        live = {t for t in map(_local_tid, records) if _INFLIGHT_DEGRADED or _task_pending(t)
+                or os.path.lexists(RESULTS_DIR / f"{t}.txt")} - inflight
+        if live:
+            if not _hold_in_flight(inflight, live):
+                _log(f"attempts still live ({', '.join(sorted(live))}) could not be saved in flight "
+                     "— nothing settled or retired at start")
+                return
+            _log(f"attempts still live brought back in flight: {', '.join(sorted(live))}")
+        _settle_ledger(inflight)
+        if migrated is not True or _INFLIGHT_DEGRADED:
+            _log("attempt records not all known — no attempt or turn retired at start")
+            return
+        closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
     if closed:
         _log(f"closed {closed} turn file(s) whose task is no longer in flight")
 
@@ -4993,7 +5066,8 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
             with _WAKE_HANDOFF:
                 settling = _earlier_attempt_settling(tid, task["wake"])
                 if not settling:
-                    woken = _ATTEMPTS.open_wake(broker_tid, task["wake"])
+                    woken = _ATTEMPTS.open_wake(broker_tid, task["wake"],
+                                                retract=lambda rec: _retract_generation(broker_tid, rec))
         if settling:
             _log_backoff((tid, "wake-settling"), f"wake for {tid}: its earlier attempt is still "
                          "settling here — left unacked until the broker serves it again")
@@ -7713,15 +7787,6 @@ def _dm_only(parsed) -> bool:
     return any(a.kind == "dm-only" for a in parsed.actions)
 
 
-def _published_text(result_file, generation, body: str) -> str:
-    """The result file's own text, which the drain may have rewritten into `body`; empty when the
-    file is no longer the one this delivery is about."""
-    if result_file is None:
-        return body
-    raw, identity = _read_ready_generation(result_file)
-    return raw if raw is not None and generation in (None, identity) else ""
-
-
 def _retired(tid: str, broker_tid: str, attempt) -> bool:
     """Retire the settled attempt. False keeps the result live (not archived, still in flight), so
     the next drain retries: a retirement that could not save the wake's identity would lose it."""
@@ -7749,34 +7814,36 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if woken_item == task_attempts.UNKNOWN:
         _log_backoff((tid, "attempt-unread"), f"result {tid}: held — its attempt records cannot be read")
         return False
-    attempt = _ATTEMPTS.get(broker_tid) if _ATTEMPTS is not None else None
-    hold = _ATTEMPTS.result_hold(broker_tid) if _ATTEMPTS is not None else None
-    if hold:
-        _log_backoff((tid, "ack-hold"), f"result {tid}: held — {hold}")
-        return False
-    stopped = _ATTEMPTS.stop_by_result(broker_tid, body, no_send) if _ATTEMPTS is not None else None
-    if stopped is False:
-        _log_backoff((tid, "stop-ack"), f"result {tid}: held — the Stop it confirms awaits its cancel-ack")
-        return False
-    if stopped:
-        _log(f"result {tid}: settled without a post (the Stop is confirmed)")
-        return _retired(tid, broker_tid, attempt)
-    published = _published_text(result_file, generation, body)
-    decision = _ATTEMPTS.result_decision(broker_tid, body, no_send, published) if _ATTEMPTS else None
-    if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
-        _log_backoff((tid, "journal-defer"), f"result {tid}: held — {decision.reason}")
-        return False
-    if decision is not None and decision.action == task_attempts.agent_turn.SETTLE:
-        _log(f"result {tid}: settled without a post ({decision.reason})")
-        return _retired(tid, broker_tid, attempt)
-    if decision is not None:
-        _log(f"result {tid}: {decision.reason} -> {decision.fields}")
-        no_send = no_send or bool(decision.fields.get("no_send"))
-    # `no_send` is the broker's STRUCTURED suppression field: the lease must
-    # close without a user-facing send. It rides the payload, not the body.
-    doc = {"id": broker_tid, "body": body}
-    if _ATTEMPTS is not None:
-        doc.update(_ATTEMPTS.result_fields(broker_tid))
+    # One ruling: the attempt it is about, the Stop it may confirm, the gate and the lease fields
+    # are read in one transition, so a newer generation recorded meanwhile is never mixed in.
+    with _ATTEMPTS.lock if _ATTEMPTS is not None else contextlib.nullcontext():
+        attempt = _ATTEMPTS.get(broker_tid) if _ATTEMPTS is not None else None
+        hold = _ATTEMPTS.result_hold(broker_tid) if _ATTEMPTS is not None else None
+        if hold:
+            _log_backoff((tid, "ack-hold"), f"result {tid}: held — {hold}")
+            return False
+        stopped = _ATTEMPTS.stop_by_result(broker_tid, body, no_send) if _ATTEMPTS is not None else None
+        if stopped is False:
+            _log_backoff((tid, "stop-ack"), f"result {tid}: held — the Stop it confirms awaits its cancel-ack")
+            return False
+        if stopped:
+            _log(f"result {tid}: settled without a post (the Stop is confirmed)")
+            return _retired(tid, broker_tid, attempt)
+        decision = _ATTEMPTS.result_decision(broker_tid, body, no_send, generation) if _ATTEMPTS else None
+        if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
+            _log_backoff((tid, "journal-defer"), f"result {tid}: held — {decision.reason}")
+            return False
+        if decision is not None and decision.action == task_attempts.agent_turn.SETTLE:
+            _log(f"result {tid}: settled without a post ({decision.reason})")
+            return _retired(tid, broker_tid, attempt)
+        if decision is not None:
+            _log(f"result {tid}: {decision.reason} -> {decision.fields}")
+            no_send = no_send or bool(decision.fields.get("no_send"))
+        # `no_send` is the broker's STRUCTURED suppression field: the lease must
+        # close without a user-facing send. It rides the payload, not the body.
+        doc = {"id": broker_tid, "body": body}
+        if _ATTEMPTS is not None:
+            doc.update(_ATTEMPTS.result_fields(broker_tid))
     if decision is not None and decision.fields.get("status"):
         doc["status"] = decision.fields["status"]
     if no_send:
@@ -8298,9 +8365,8 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
 
 def _broker_holds(tid: str) -> bool:
     """An attempt still beating (the dispatch watch fails it with a posted result, never silently),
-    or one whose record still owes work."""
-    return _ATTEMPTS is not None and (_ATTEMPTS.beating((_broker_tid(tid),))
-                                      or _broker_tid(tid) in _ATTEMPTS.owing())
+    one whose record still owes work, or any while the attempt ledger cannot be read."""
+    return _ATTEMPTS is not None and _ATTEMPTS.holds(_broker_tid(tid))
 
 
 # A task archived here minutes ago was completed HERE, not elsewhere — its

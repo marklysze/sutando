@@ -17,7 +17,7 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG_ROOT))
 
-from ag2_sparrow import agent_turn, task_attempts  # noqa: E402
+from ag2_sparrow import agent_turn, task_attempt_migrations, task_attempts  # noqa: E402
 from ag2_sparrow.delivery_core import contract, provider_ag2space
 
 DeliveryOutcome, AG2SpaceResultProvider = contract.DeliveryOutcome, provider_ag2space.AG2SpaceResultProvider
@@ -82,10 +82,21 @@ class Attempts(unittest.TestCase):
         a.mark_dispatch_lost("tsk_A", "failed")
         self.assertFalse(a.beating({"tsk_A"}))
         self.assertFalse(a.dispatch_lost_due("tsk_A", False, None), "decided once")
-        d = a.result_decision("tsk_A", "failed", True)
+        lost, mine, core = a.get("tsk_A")["dispatch_lost"], self.state / "mine.txt", self.state / "core.txt"
+        claim = lambda ident: a._set("tsk_A", dispatch_lost={**lost, "file": ident})  # noqa: E731
+        self.assertTrue(task_attempts.write_if_absent(mine, "failed", claim))
+        core.write_text("failed")
+        d = a.result_decision("tsk_A", "failed", True, task_attempts.identity_of(mine)[1])
         self.assertEqual((d.action, d.fields), (agent_turn.POST, {"status": "failed", "no_send": True}))
-        self.assertIsNone(a.result_decision("tsk_A", "the core's own answer", False),
-                          "the marker rules only on the failure result it owes")
+        self.assertIsNone(a.result_decision("tsk_A", "failed", True, task_attempts.identity_of(core)[1]),
+                          "the same words in a file the core wrote are its own answer")
+        self.assertIsNone(a.result_decision("tsk_A", "failed", True), "no file: nothing proves it ours")
+
+    def test_a_refused_claim_publishes_nothing(self):
+        path = self.state / "r.txt"
+        self.assertFalse(task_attempts.write_if_absent(path, "x", lambda ident: False))
+        self.assertFalse(path.exists())
+        self.assertEqual([p for p in self.state.iterdir() if p.name.startswith(".r.txt")], [])
 
     def test_owed_work_carries_its_generation_and_a_new_generation_drops_it(self):
         a = self.mk()
@@ -108,31 +119,99 @@ class Attempts(unittest.TestCase):
         a.sweep(set())
         self.assertEqual((bool(a.get("tsk_A")), bool(a.get("tsk_B"))), (True, False))
 
-    def test_base_records_are_upgraded_once(self):
+    def migrate(self, a, ids=None, failure=("body", None)):
+        ids = ids or iter(f"ctl-{i}" for i in range(10))
+        return task_attempt_migrations.migrate(
+            a, self.tasks, local_tid=lambda t: t, new_ctl=lambda: next(ids), failure_of=lambda t: failure,
+            log=self.logs.append)
+
+    @property
+    def tasks(self):
+        d = self.state / "tasks"
+        d.mkdir(exist_ok=True)
+        return d
+
+    def queue_ctl(self, ctl, target, suffix=".txt"):
+        (self.tasks / f"{ctl}{suffix}").write_text(task_attempts.cancel_task_text(target, ctl, "t", "why"))
+
+    def test_base_records_are_migrated_once(self):
         a = self.mk()
-        ids = iter(f"ctl-{i}" for i in range(10))
         a.path.write_text(json.dumps({
             "lost": {"execution_generation": 1, "dispatch_lost": True},
             "stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None},
             "stale": {"execution_generation": 1, "fenced": "stale_execution_generation"},
             "closed": {"execution_generation": 1, "fenced": "task_not_found"},
             "done": {"execution_generation": 1, "fenced": "cancel_confirmed"}}))
-        self.assertEqual(a.upgrade(lambda: next(ids), lambda t: f"body of {t}"), 5)
+        self.assertTrue(a.holds("done"), "held untouched until migrated")
+        self.assertTrue(self.migrate(a, failure=("body of lost", None)))
         got = a._load()
-        self.assertEqual(got["lost"]["dispatch_lost"], {"body": "body of lost", "gen": 1})
+        self.assertEqual(got["lost"]["dispatch_lost"], {"body": "body of lost", "gen": 1, "file": None})
         self.assertEqual((got["stop"]["stop_ctl"], got["stop"]["owed_ctl"]["id"]), ("ctl-0", "ctl-0"))
         self.assertEqual((got["stale"]["fence_ctl"], got["stale"]["owed_ctl"]["id"]), ("ctl-1", "ctl-1"))
         self.assertEqual(got["closed"]["owed_close"]["gen"], 1)
         self.assertFalse(task_attempts._owes(got["done"]), "a confirmed cancel owes nothing")
-        self.assertEqual(a.upgrade(lambda: next(ids), lambda t: "x"), 0, "idempotent")
+        self.assertTrue(self.migrate(a), "idempotent")
         self.assertEqual(a._load(), got)
 
-    def test_an_unreadable_ledger_is_never_upgraded_or_owing(self):
+    def test_a_control_the_base_queued_but_never_recorded_is_adopted_or_retired(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({
+            "stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None},
+            "closed": {"execution_generation": 1, "fenced": "task_already_terminal"},
+            "moved": {"execution_generation": 2, "fence_ctl": None},
+            "claimed": {"execution_generation": 2}}))
+        self.queue_ctl("task-ctl-1-aaaaaa", "stop")
+        self.queue_ctl("task-ctl-2-bbbbbb", "closed")
+        self.queue_ctl("task-ctl-3-cccccc", "moved")
+        self.queue_ctl("task-ctl-4-dddddd", "claimed", ".claimed-core1")
+        self.assertTrue(self.migrate(a))
+        got = a._load()
+        self.assertEqual((got["stop"]["stop_ctl"], got["stop"].get("owed_ctl")), ("task-ctl-1-aaaaaa", None),
+                         "the Stop's own control is adopted, not written twice")
+        self.assertEqual((got["closed"]["fence_ctl"], got["closed"].get("owed_close")), ("task-ctl-2-bbbbbb", None))
+        self.assertFalse((self.tasks / "task-ctl-3-cccccc.txt").exists(), "a control no state explains is withdrawn")
+        self.assertEqual(got["moved"].get("taken_ctl"), None)
+        self.assertEqual(got["claimed"]["taken_ctl"], "task-ctl-4-dddddd", "one the core claimed is watched")
+        self.assertEqual(sorted(p.name for p in self.tasks.iterdir()),
+                         ["task-ctl-1-aaaaaa.txt", "task-ctl-2-bbbbbb.txt", "task-ctl-4-dddddd.claimed-core1"])
+
+    def test_a_migration_that_does_not_commit_reports_it_and_changes_nothing(self):
+        a = self.mk()
+        base = {"stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None}}
+        a.path.write_text(json.dumps(base))
+        with unittest.mock.patch.object(a, "_save", return_value=False):
+            self.assertIs(self.migrate(a), False)
+        self.assertEqual(a._load(), base)
+        self.assertTrue(a.holds("stop"))
+        self.assertEqual(a.sweep(set()), 0)
+        self.assertEqual(a._load(), base, "a record awaiting its migration is never swept")
+
+    def test_an_unreadable_ledger_is_unknown_and_held(self):
         a = self.mk()
         a.path.write_text("{not json")
-        self.assertEqual(a.upgrade(lambda: "c", lambda t: "x"), 0)
-        self.assertEqual(a.owing(), set())
+        self.assertIsNone(self.migrate(a))
+        self.assertIsNone(a.owing())
+        self.assertTrue(a.holds("tsk_A"), "unknown is not released")
         self.assertEqual(a.path.read_text(), "{not json")
+
+    def test_the_migration_lives_apart_from_the_live_writer(self):
+        live = (PKG_ROOT / "ag2_sparrow" / "task_attempts.py").read_text()
+        for word in ("def upgrade", "def _upgraded", "CLOSED_FENCES", "dispatch_lost is True or"):
+            self.assertNotIn(word, live)
+        bridge = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        self.assertEqual(bridge.count("task_attempt_migrations.migrate("), 1)
+        start = bridge[bridge.index("def _close_stale_turns"):]
+        start = start[:start.index("\ndef ")]
+        self.assertLess(start.index("task_attempt_migrations.migrate("), start.index("_settle_ledger("))
+        self.assertLess(start.index("_settle_ledger("), start.index(".sweep("))
+
+    def test_finish_keeps_a_record_that_moved_to_another_generation(self):
+        a = self.mk()
+        a.record_ack("tsk_A", _ack(1))
+        seen = a.get("tsk_A")
+        a.record_ack("tsk_A", _ack(2))
+        self.assertTrue(a.finish("tsk_A", seen))
+        self.assertEqual(a.get("tsk_A")["execution_generation"], 2, "generation 2 is not retired by 1's result")
 
     def test_last_activity_reads_only_the_sessions_own_rows(self):
         self.assertIsNone(task_attempts.last_activity(self.state, "t1"), "no log")
