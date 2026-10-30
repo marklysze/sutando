@@ -13,6 +13,8 @@ decision is logged to the watcher's stderr and as an owner row in the activity l
 
 The stop is then confirmed: once the core has answered the control task, a stopped task with no
 result, or only a no-send or empty one, is CANCELLED; a task the core finished is left to delivery.
+
+Off unless SUTANDO_STOP_INTERRUPT reads as true; off, task-emit.sh marks the task CANCELLED at once.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ from delivery.pane_gate import AWAIT_HINT, live_tail
 from delivery.task_dispatch import worker_holds
 from local_task_protocol import find_archived_result
 from result_markers import parse_markers
+from skill_config import TRUE
 from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
@@ -41,6 +44,14 @@ TAIL_BYTES = 256 * 1024
 CONFIRM_POLL_S = 2.0
 CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
+ENABLE_ENV = "SUTANDO_STOP_INTERRUPT"
+CONFIG_SH = Path(__file__).resolve().parents[1] / "scripts" / "sutando-config.sh"
+
+
+def enabled(environ=None) -> bool:
+    """Off unless the switch reads as true; task-emit.sh reads the same values."""
+    env = os.environ if environ is None else environ
+    return str(env.get(ENABLE_ENV) or "").strip().lower() in TRUE
 
 
 def current_task(workspace: Path, now: float, fresh_s: float = FRESH_S) -> str | None:
@@ -158,12 +169,23 @@ def _run(argv: list) -> str | None:
     return p.stdout if p.returncode == 0 else None
 
 
+def _socket(run: Callable) -> str | None:
+    """The core's tmux socket, resolved as the launcher resolves it."""
+    if os.environ.get("SUTANDO_TMUX_SOCK"):
+        return os.environ["SUTANDO_TMUX_SOCK"]
+    out = run(["bash", str(CONFIG_SH), "tmux-socket"])
+    return (out.strip() or None) if out else None
+
+
 def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = _run,
               log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
               now: float | None = None) -> bool:
     """Decide, send at most one Escape, and log the decision. True when Escape was sent."""
     now = time.time() if now is None else now
-    sock = os.environ.get("SUTANDO_TMUX_SOCKET") or os.environ.get("SUTANDO_TMUX_SOCK") or "/tmp/sutando-tmux.sock"
+    sock = _socket(run)
+    if not sock:
+        log(f"stop-interrupt: {target}: no tmux socket resolved; left the turn to finish")
+        return False
     newest, _ = newest_task(workspace)
     current = current_task(workspace, now)
     manager, reqs = _tui_requirements(workspace, _session()) if newest == target else (None, [])
@@ -246,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace")
     ap.add_argument("--control-file", help="the CANCEL_INSTRUCTION task: its answer confirms the stop")
     a = ap.parse_args(argv)
+    if not enabled():
+        return 0
     tasks_dir = Path(a.tasks_dir)
     workspace = Path(a.workspace) if a.workspace else resolve_workspace()
     try:

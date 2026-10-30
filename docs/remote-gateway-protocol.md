@@ -387,7 +387,7 @@ Sutando checkout around it sends neither field.
   going to be answered: its beats stop and it is posted as `status: failed` with `no_send`. So is
   one still queued whose task file the core took up (a turn row newer than the file) and then left
   with no turn activity and no result for 30 min, and that one also gets a `CANCEL_INSTRUCTION`, so a
-  turn parked on a terminal prompt is answered by the Stop path's Escape; a task file the core has not reached yet keeps
+  turn parked on a terminal prompt is answered by the Stop path's Escape (with `SUTANDO_STOP_INTERRUPT=1`); a task file the core has not reached yet keeps
   beating however long it waits. Until then the in-flight reconcile keeps the id, rather than
   dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
