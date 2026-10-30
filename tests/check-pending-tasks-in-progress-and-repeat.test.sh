@@ -80,7 +80,12 @@ OUT="$(run_hook '')"
 SUTANDO_SRC="$REPO/src" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); import turn_ledger; turn_ledger.mark_stop(sys.argv[1])' "$TMPWS"
 sleep 1; record_delivery
 OUT="$(run_hook '')"
-case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "...but a turn that recorded a no-send has finished: its unanswered task blocks" ;; *) bad "a turn that recorded a no-send: its unanswered task blocks" "got: ${OUT:0:160}" ;; esac
+[ "$OUT" = "{}" ] && ok "a turn that recorded a no-send: a task it is running still does not block" || bad "a no-send leaves a running task in progress" "got: ${OUT:0:160}"
+printf 'id: %s\nwake_episode: e1\ntask: keep working\n' "$TASK" > "$WS/tasks/$TASK.txt"
+sleep 1; record_delivery
+OUT="$(run_hook '')"
+case "$OUT" in *'"reason":"Unprocessed tasks in tasks/'*) ok "...but a wake turn it left unanswered after a no-send blocks" ;; *) bad "a wake turn left unanswered after a no-send blocks" "got: ${OUT:0:160}" ;; esac
+printf 'id: %s\ntask: keep working\n' "$TASK" > "$WS/tasks/$TASK.txt"
 rm -f "$WS/state/turn-stop"*.json "$WS/state/turn-ledger.jsonl"; record_delivery
 rm -f "$WS/state/agent-activity.jsonl"
 engaged "$TASK" 7200

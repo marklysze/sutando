@@ -151,7 +151,7 @@ claimed_by_a_worker() {
 # archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
 # own test suite pins), which is exactly the duplicated-policy failure mode
 # the shared owner exists to close off.
-# With the queued file as $2, an older result answered an earlier turn of the same id.
+# With the queued file as $2: when it is a wake turn, an older result answered an earlier turn.
 already_delivered() {
   local task_id="$1" since=()
   [ -n "$PYBIN" ] || return 1
@@ -164,7 +164,7 @@ already_delivered() {
 # life of a task it was working, ~6/hour). The scheduler's own activity snapshot
 # (src/activity_bus.py, state/activity/<task-id>.json) says RUNNING with fresh
 # activity; queued, waiting on a person, stale, unreadable or absent still blocks.
-# A turn that recorded a no-send has said it is done, so a task it left unanswered is not in progress.
+# A wake turn ($2) left unanswered by a turn that recorded a no-send is not in progress.
 task_in_progress() {
   [ -n "$PYBIN" ] || return 1
   if [ -z "${NO_SEND_THIS_TURN:-}" ]; then
@@ -172,7 +172,10 @@ task_in_progress() {
     "$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" no-send-this-turn >/dev/null 2>&1 \
       && NO_SEND_THIS_TURN=yes
   fi
-  [ "$NO_SEND_THIS_TURN" = no ] || return 1
+  if [ "$NO_SEND_THIS_TURN" = yes ] && [ -n "${2:-}" ] \
+    && "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" wake-turn "$(dirname "$2")" "$(basename "$2")" >/dev/null 2>&1; then
+    return 1
+  fi
   [ -f "$REPO_DIR/src/activity_bus.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/activity_bus.py" in-progress "$1" --workspace "$WORKSPACE" \
     --max-age "${SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE:-1800}" >/dev/null 2>&1
@@ -226,7 +229,7 @@ else
     TASK_ID="${BASENAME%.txt}"
     claimed_by_a_worker "$TASK_ID" && continue
     already_delivered "$TASK_ID" "$f" && continue
-    task_in_progress "$TASK_ID" && continue
+    task_in_progress "$TASK_ID" "$f" && continue
     UNPROCESSED_NAMES="$UNPROCESSED_NAMES $BASENAME"
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py; existence is not

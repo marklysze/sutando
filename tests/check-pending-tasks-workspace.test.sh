@@ -148,11 +148,19 @@ rm -f "$WS/tasks/$PROBE" "$WS/results/$PROBE"
 mkdir -p "$WS/results/archive/2026-10"
 printf 'asked\n' > "$WS/results/archive/2026-10/$PROBE"
 touch -t 202601010000 "$WS/results/archive/2026-10/$PROBE"
-printf 'id: probe\ntask: resumed\n' > "$WS/tasks/$PROBE"
+printf 'id: probe\nwake_episode: e1\ntask: resumed\n' > "$WS/tasks/$PROBE"
 OUT="$(bash "$HOOK" 2>&1)"
 case "$OUT" in
-  *'"decision":"block"'*) ok "an earlier turn's archived result does not answer a newer task file" ;;
-  *) bad "an earlier turn's archived result does not answer a newer task file" "got: ${OUT:0:120}" ;;
+  *'"decision":"block"'*) ok "an earlier turn's archived result does not answer a newer wake turn" ;;
+  *) bad "an earlier turn's archived result does not answer a newer wake turn" "got: ${OUT:0:120}" ;;
+esac
+# ...any other task file is answered by that result, however old, as before.
+printf 'id: probe\ntask: resumed\n' > "$WS/tasks/$PROBE"
+record_delivery
+OUT="$(bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "an older archived result still answers a task file that is not a wake turn" ;;
+  *) bad "an older archived result still answers a task file that is not a wake turn" "got: ${OUT:0:120}" ;;
 esac
 rm -rf "$WS/tasks/$PROBE" "$WS/results/archive"
 
