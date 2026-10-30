@@ -584,7 +584,7 @@ class Hooks(unittest.TestCase):
         gw._ATTEMPTS.record_ack("task-moved", _ack("task-moved", 1))
         earlier = gw._ATTEMPTS.get("task-moved")
         gw._ATTEMPTS.open_wake("task-moved", {"blocker_episode_id": "e2"})
-        self.assertFalse(gw._ATTEMPTS.finish("task-moved", earlier))
+        self.assertTrue(gw._ATTEMPTS.finish("task-moved", earlier), "nothing of the earlier attempt is left")
         self.assertTrue(agent_turn.is_closed(gw._STATE, earlier["turn_id"]))
         self.assertEqual(gw._ATTEMPTS.get("task-moved")["wake_episode"], "e2", "the wake is kept")
         self.assertEqual(gw._ATTEMPTS.open_wake("task-moved", {"blocker_episode_id": "e2"}), "e2",
@@ -951,6 +951,56 @@ class Hooks(unittest.TestCase):
         gw._close_stale_turns(set())
         self.assertTrue(agent_turn.is_closed(gw._STATE, turn))
         self.assertTrue(any(m.startswith("closed ") and "turn file" in m for m in self.logs))
+
+    def answered_task(self, tid):
+        """A first attempt that asked and settled: its task and result archived."""
+        task = {"id": tid, "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.assertIsNotNone(gw._write_task(dict(task)))
+        for d in (gw.TASKS_DIR / "archive", gw.RESULTS_DIR / "archive"):
+            d.mkdir(exist_ok=True)
+        (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+        (gw.RESULTS_DIR / "archive" / f"{tid}.txt").write_text("I asked.")
+        return {**task, "wake": {"blocker_episode_id": "e1", "resolved_blockers": [
+            {"question_id": "q1", "outcome": "answered", "answer": {"kind": "text", "text": "b"}}]}}
+
+    def failing_save(self, prefix):
+        real = gw._ATTEMPTS._save_json
+        return mock.patch.object(gw._ATTEMPTS, "_save_json",
+                                 side_effect=lambda p, d: False if p.name.startswith(prefix) else real(p, d))
+
+    def test_a_wake_that_cannot_be_saved_is_not_queued_or_acked(self):
+        wake = self.answered_task("task-wopen")
+        with self.failing_save("relay-task-attempts"):
+            self.assertIsNone(gw._write_task(dict(wake)), "left unacked for a re-serve")
+        self.assertFalse((gw.TASKS_DIR / "task-wopen.txt").exists(), "nothing queued")
+        self.assertIsNone(gw._ATTEMPTS.get("task-wopen").get("wake_episode"))
+        self.assertTrue(any("wake e1 not saved" in m for m in self.logs))
+        gw._WAKES_LEFT_UNACKED.discard(("task-wopen", "e1"))
+        self.assertEqual(gw._write_task(dict(wake)), ("task-wopen", True), "the re-serve runs it")
+
+    def test_a_wake_result_whose_retirement_fails_stays_live_and_is_retried(self):
+        for failing in ("relay-wake-items", "relay-wake-episodes"):
+            with self.subTest(failing=failing):
+                tid = f"task-wret-{failing.rsplit('-', 1)[-1]}"
+                self.assertEqual(gw._write_task(dict(self.answered_task(tid))), (tid, True))
+                fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+                self.assertTrue(gw._post_task_ack(tid, durable=True))
+                (gw.TASKS_DIR / "archive").mkdir(exist_ok=True)
+                (gw.TASKS_DIR / f"{tid}.txt").rename(gw.TASKS_DIR / "archive" / f"{tid}.txt")
+                (gw.RESULTS_DIR / f"{tid}.txt").write_text("went with b")
+                inflight = {tid}
+                with self.failing_save(failing):
+                    gw._post_ready_results(inflight)
+                self.assertTrue((gw.RESULTS_DIR / f"{tid}.txt").exists(), "not archived: still live")
+                self.assertIn(tid, inflight, "still in flight")
+                self.assertEqual(gw._ATTEMPTS.get(tid).get("wake_episode"), "e1", "the attempt is kept")
+                self.assertTrue(any(f"result {tid}: settled, but its attempt could not be retired" in m
+                                    for m in self.logs))
+                gw._post_ready_results(inflight)
+                self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "the retry archives it")
+                self.assertNotIn(tid, inflight)
+                self.assertEqual(len(fake.posted("/v1/results")), 1, "posted once across both passes")
+                self.assertEqual(gw._ATTEMPTS.wake_item(tid), f"{tid}.wake-e1")
 
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}

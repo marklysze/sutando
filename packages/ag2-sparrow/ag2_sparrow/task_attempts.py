@@ -452,8 +452,8 @@ class TaskAttempts:
         """The result is settled: close the attempt's turn and forget the attempt. With `attempt`
         (the record read before the result was posted), a record that has moved on to another
         turn or wake since is kept; only the settled attempt's own turn is closed. A wake's episode
-        (as seen) and then its item are saved before the attempt is retired; False, with the attempt
-        kept, when any of those writes fails, so a later finish retries it."""
+        (as seen) and then its item are saved before the attempt is retired. False only when one of
+        those writes failed: the attempt is kept, and the caller keeps its result live to retry."""
         with _MUTEX:
             data = self._load()
             rec = data.get(wire_tid) or {}
@@ -461,7 +461,7 @@ class TaskAttempts:
                                            for k in ("turn_id", "wake_episode")):
                 if attempt.get("turn_id"):
                     self._close_turn(attempt["turn_id"])
-                return False
+                return True                 # nothing of the settled attempt is left to retire
             if rec.get("wake_episode"):
                 wakes = self._load_wakes()
                 seen = [e for e in wakes.get(wire_tid, []) if e != rec["wake_episode"]]
@@ -481,7 +481,8 @@ class TaskAttempts:
 
     # ── wake after a human answered ──────────────────────────────────────
     def open_wake(self, wire_tid: str, wake) -> "str | None":
-        """The wake's episode when this node has not run it yet, else None."""
+        """The wake's episode when this node has not run it yet, else None. None too when the
+        opened wake cannot be saved: a wake not on disk would lose its identity, so it is not run."""
         episode = wake.get("blocker_episode_id") if isinstance(wake, dict) else None
         if not isinstance(episode, str) or not _EPISODE_RE.fullmatch(episode):
             self.log(f"task {wire_tid}: wake without a usable blocker_episode_id — not run")
@@ -493,9 +494,14 @@ class TaskAttempts:
             # A new wake is a new turn: nothing of an earlier attempt's lease or turn carries over.
             if rec.get("turn_id"):
                 self._close_turn(rec["turn_id"])
-            self._update(wire_tid, wake_episode=episode, turn_id=None, issued_at=None,
-                         execution_generation=None, fenced=None, published_at=None,
-                         hold_reported=None)
+            with _MUTEX:
+                data = self._load()
+                data[wire_tid] = {**data.get(wire_tid, {}), "wake_episode": episode, "turn_id": None,
+                                  "issued_at": None, "execution_generation": None, "fenced": None,
+                                  "published_at": None, "hold_reported": None}
+                if not self._save(data):
+                    self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
+                    return None
         return episode
 
     def wake_item(self, wire_tid: str) -> "str | None":

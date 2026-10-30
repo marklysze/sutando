@@ -7562,6 +7562,16 @@ def _dm_only(parsed) -> bool:
     return any(a.kind == "dm-only" for a in parsed.actions)
 
 
+def _retired(tid: str, broker_tid: str, attempt) -> bool:
+    """Retire the settled attempt. False keeps the result live (not archived, still in flight), so
+    the next drain retries: a retirement that could not save the wake's identity would lose it."""
+    if _ATTEMPTS is None or _ATTEMPTS.finish(broker_tid, attempt):
+        return True
+    _log_backoff((tid, "retire"), f"result {tid}: settled, but its attempt could not be retired yet "
+                 "— the result stays live and is retried")
+    return False
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None,
                             generation=None, thread_ask: bool = False,
@@ -7586,16 +7596,14 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         return False
     if stopped:
         _log(f"result {tid}: settled without a post (the Stop is confirmed)")
-        _ATTEMPTS.finish(broker_tid, attempt)
-        return True
+        return _retired(tid, broker_tid, attempt)
     decision = _ATTEMPTS.result_decision(broker_tid, body, no_send) if _ATTEMPTS else None
     if decision is not None and decision.action == task_attempts.agent_turn.DEFER:
         _log_backoff((tid, "journal-defer"), f"result {tid}: held — {decision.reason}")
         return False
     if decision is not None and decision.action == task_attempts.agent_turn.SETTLE:
         _log(f"result {tid}: settled without a post ({decision.reason})")
-        _ATTEMPTS.finish(broker_tid, attempt)
-        return True
+        return _retired(tid, broker_tid, attempt)
     if decision is not None:
         _log(f"result {tid}: {decision.reason} -> {decision.fields}")
         no_send = no_send or bool(decision.fields.get("no_send"))
@@ -7646,8 +7654,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     ruled = live if result_file is not None else body
     source = ({"source_ready_sha256": source_digest(live)}
               if live is not None and getattr(core.backend, "records_source_digest", False) else {})
-    if item_id != broker_tid and not (woken_item and not (attempt or {}).get("wake_episode")):
-        # A settled wake's item (kept until archival) is already delivered: re-offered, it is not re-sent.
+    if item_id != broker_tid and not woken_item:
+        # A wake's item is its episode's own, so a delivered one is this result: re-offered, not re-sent.
         core.backend.publish(item_id, payload, republish_delivered=True, **source)
     else:
         core.backend.publish(item_id, payload, **source)
@@ -7658,9 +7666,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
-            if _ATTEMPTS is not None:
-                _ATTEMPTS.finish(broker_tid, attempt)
-            return True
+            return _retired(tid, broker_tid, attempt)
         if relay:
             _reopen_relay_result(core, item_id, tid, record, result_file, generation)
             return False
@@ -7697,9 +7703,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
-        if _ATTEMPTS is not None:
-            _ATTEMPTS.finish(broker_tid, attempt)
-        return True
+        return _retired(tid, broker_tid, attempt)
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
         if relay:
