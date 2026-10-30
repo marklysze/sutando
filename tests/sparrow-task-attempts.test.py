@@ -436,12 +436,11 @@ class AnsweredOnce(unittest.TestCase):
                          "operation_id": "op_r", "operation_status": "succeeded"}):
                 fh.write(json.dumps(rec) + "\n")
         again = self.mk(turn_context=True)    # crashed before the result was decided
-        self.assertIn("`room.question.answer`", again.answer_rule("tsk_R", {**self.Q, "question_id": "rq_9"}),
-                      "a different question on the same task is not the one answered")
-        again._update("tsk_R", answer_offered="rq_1")
         self.assertEqual(again.answer_rule("tsk_R", self.Q), task_attempts.ANSWERED_HERE_NOTE)
-        self.assertIn("`room.question.answer`", again.answer_rule("tsk_S", self.Q),
-                      "another task's journal says nothing about this one")
+        self.assertEqual(again.answer_rule("tsk_B", self.Q), task_attempts.ANSWERED_HERE_NOTE,
+                         "another task carrying the same question, before any settle")
+        self.assertIn("`room.question.answer`", again.answer_rule("tsk_B", {**self.Q, "question_id": "rq_9"}),
+                      "a question no answering task was offered still gets the rule")
 
     def test_a_failed_or_other_action_does_not_record_an_answer(self):
         for kw in ({"status": "failed"}, {"action": "room.message.send"}):

@@ -85,6 +85,7 @@ ANSWERED_HERE_NOTE = (
     "The room question quoted above was already answered by this agent; do not answer it again. "
     "Write this task's result file as `[no-send]` with a one-line note that it was answered.")
 ANSWERED_KEPT = 500
+ANSWER_OFFERS_PER_Q = 8
 _QUESTION_KEYS = ("question_id", "expected_revision", "prompt", "options", "allow_free_text",
                   "response_mode", "target_members", "expires_at")
 _QUESTION_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -128,6 +129,8 @@ class TaskAttempts:
         self._wake_items_path = self.state_dir / f"relay-wake-items{suffix}.json"
         self._contract_path = self.state_dir / f"relay-broker-contract{suffix}.json"
         self._answered_path = self.state_dir / f"relay-answered-questions{suffix}.json"
+        # Which tasks were offered each question: the journal names tasks, not questions.
+        self._offers_path = self.state_dir / f"relay-answer-offers{suffix}.json"
         self._task_beat_disabled = False
 
     # ── storage ──────────────────────────────────────────────────────────
@@ -187,18 +190,22 @@ class TaskAttempts:
     def answer_rule(self, task_id: str, question) -> "str | None":
         """The answer rule for a question not yet answered here, the already-answered note for
         one that was, None when this agent may not answer. Answered here means recorded by question
-        id at a settle, or, before any settle, this task offered this question and its journal holds a
-        succeeded answer. The server's expected_revision only guards a concurrent answer: the rule
+        id at a settle, or, before any settle, a task that was offered this question has a succeeded
+        answer in its journal. The server's expected_revision only guards a concurrent answer: the rule
         re-reads it before answering, so it does not stop a second one; this record does."""
         rule = answer_in_room_rule(task_id, question)
         if not rule:
             return None
         qid = _question_id(question)
-        # The journal holds a succeeded answer before any result is decided: a crash or redelivery in
-        # between still sees it.
-        offered = self.get(task_id).get("answer_offered")
-        if qid in self._load_answered() or (offered == qid and agent_turn.answered_in_journal(self.state_dir, task_id)):
-            return ANSWERED_HERE_NOTE
+        # The journal holds a succeeded answer before any result is decided: a crash, a redelivery or
+        # another task carrying the same question still sees it.
+        with _MUTEX:
+            offers = self._load_json(self._offers_path)
+            tasks = [t for t in offers.get(qid, []) if isinstance(t, str)]
+            if qid in self._load_answered() or any(agent_turn.answered_in_journal(self.state_dir, t) for t in tasks):
+                return ANSWERED_HERE_NOTE
+            offers[qid] = (tasks + [task_id] if task_id not in tasks else tasks)[-ANSWER_OFFERS_PER_Q:]
+            self._save_json(self._offers_path, dict(list(offers.items())[-ANSWERED_KEPT:]))
         self._update(task_id, answer_offered=qid)
         return rule
 
