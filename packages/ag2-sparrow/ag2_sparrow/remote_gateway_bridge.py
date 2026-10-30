@@ -3986,6 +3986,12 @@ def _record_attempt(wire_tid: str, doc, open_turn: bool = True) -> bool:
         before = None if before is None else before.get(wire_tid) or {}
         if before is None or (before and before.get("schema") != task_attempts.SCHEMA):
             return False                        # unknown, or awaiting its migration: held
+        old = before.get("execution_generation")
+        if not before or (gen is not None and type(old) is int and gen < old):
+            # Every serve records its attempt before the ack: none left means it was retired, and a
+            # lower generation is an older lease's late answer. Neither moves the record.
+            _log(f"task {wire_tid}: ack for a retired attempt or an older generation — not recorded")
+            return True
         if gen is not None and gen != before.get("execution_generation") \
                 and not _retract_generation(wire_tid, before):
             return False
@@ -4004,7 +4010,7 @@ def _retract_generation(wire_tid: str, before: dict) -> bool:
     still says who took it. Called under the attempts lock."""
     old = before.get("execution_generation")
     owed = before.get("owed_ctl") if isinstance(before.get("owed_ctl"), dict) else {}
-    taken, parked = before.get("taken_ctl"), []
+    taken, parked = task_attempts.taken_ids(before), []
     named = [c for c in dict.fromkeys((before.get("fence_ctl"), before.get("stop_ctl"), owed.get("id")))
              if isinstance(c, str)]
     if not named and not (before.get("dispatch_lost") or {}).get("file"):
@@ -4017,7 +4023,7 @@ def _retract_generation(wire_tid: str, before: dict) -> bool:
                  "is served here")
         except FileNotFoundError:
             if not aside.exists() and (owed.get("id") != ctl or _ctl_written(ctl)):
-                taken = ctl
+                taken += [] if ctl in taken else [ctl]
                 _log(f"task {wire_tid}: cancel {ctl} for generation {old} was already taken by the core — "
                      "the newer attempt may be stopped")
         except OSError as e:
@@ -4027,7 +4033,7 @@ def _retract_generation(wire_tid: str, before: dict) -> bool:
         parked.append(aside)
     if not _withdraw_failure(wire_tid, before.get("dispatch_lost")):
         return False
-    if not _ATTEMPTS._set(wire_tid, fence_ctl=None, stop_ctl=None, owed_ctl=None, taken_ctl=taken):
+    if not _ATTEMPTS._set(wire_tid, fence_ctl=None, stop_ctl=None, owed_ctl=None, taken_ctl=taken or None):
         _log(f"task {wire_tid}: generation {old}'s cancels not cleared — the ack is retried")
         return False
     for aside in parked:
@@ -4079,13 +4085,21 @@ def _ack_fenced(tid: str, lease_id: "str | None", raw: str, published: bool) -> 
         return True
     wire_tid = _broker_tid(tid)
     with _ATTEMPTS.lock:
+        rec = _ATTEMPTS.get(wire_tid)
+        held, asked = rec.get("execution_generation"), err.get("cancel_requested_generation")
+        if type(held) is int and ((type(asked) is int and asked < held) or (
+                code == "stale_execution_generation" and not rec.get("awaiting_ack"))):
+            # The refusal is about a lease older than the generation already recorded here.
+            _forget_pending_ack(tid, lease_id)
+            _log(f"task ack for {tid}: refused ({code}) for a lease older than generation {held} — ignored")
+            return True
         owed = _fence_owes(wire_tid, code, {**err, "error_code": code}) if published else {}
         verdict = _ATTEMPTS.fence(wire_tid, {**err, "error_code": code}, **owed)
         if verdict.get("unsaved"):
             return True                         # its pending ack is kept: the retry is fenced again
         _forget_pending_ack(tid, lease_id)
-        if verdict["new"] and published:
-            _settle_owed(wire_tid)
+        if published:
+            _settle_owed(wire_tid)               # idempotent: a repeated fence finds its work done
         _ATTEMPTS.cancel_ack(wire_tid)
     return True
 
@@ -4159,8 +4173,10 @@ def _legacy_failure(wire_tid: str) -> "tuple[str, list | None]":
     path = RESULTS_DIR / f"{_local_tid(wire_tid)}.txt"
     try:
         data, identity = identity_of(path)
-    except OSError:
+    except FileNotFoundError:
         return DISPATCH_LOST_RESULT, None
+    except OSError as e:
+        raise task_attempt_migrations.Unknown(path.name) from e
     body = ready_body_of(data)
     for own in (DISPATCH_LOST_RESULT, STALLED_RESULT, STALE_CANCEL_RESULT):
         if body == ready_body_of(own.encode("utf-8")):
@@ -4212,7 +4228,9 @@ def _settle_current(wire_tid: str) -> None:
 def _fence_attempt(wire_tid: str, error: dict) -> None:
     """A beat's fencing answer, acted on only while the record holds the generation it was sent for."""
     with _ATTEMPTS.lock:
-        if _ATTEMPTS.get(wire_tid).get("execution_generation") == error.get("beat_generation"):
+        rec = _ATTEMPTS.get(wire_tid)
+        # While a newer serve awaits its ack, the task file is already that serve's: its ack decides.
+        if rec.get("execution_generation") == error.get("beat_generation") and not rec.get("awaiting_ack"):
             _fence_current(wire_tid, error)
 
 
@@ -4349,8 +4367,8 @@ def _resolve_taken_cancel(wire_tid: str) -> None:
     """Once the core has handled an older generation's cancel: a newer attempt it left with no
     result and no queued task file is posted as failed; one it still answers posts normally."""
     rec = _ATTEMPTS.get(wire_tid)
-    ctl = rec.get("taken_ctl")
-    if not ctl or not ((RESULTS_DIR / f"{ctl}.txt").exists() or _delivered_copy_exists(ctl)):
+    if not any((RESULTS_DIR / f"{c}.txt").exists() or _delivered_copy_exists(c)
+               for c in task_attempts.taken_ids(rec)):
         return
     tid = _local_tid(wire_tid)
     if os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _own_copy_exists(tid):
@@ -4395,15 +4413,16 @@ def _close_stale_turns(inflight: "set[str]") -> None:
     if _ATTEMPTS is None:
         return
     with _ATTEMPTS.lock:
+        records = _ATTEMPTS.records()
+        live = None if records is None else _live_on_disk({_local_tid(w) for w in records})
+        if live is None:
+            _log("attempt ledger, task queue or results unreadable — nothing migrated, settled or "
+                 "retired at start")
+            return
         migrated = task_attempt_migrations.migrate(
             _ATTEMPTS, TASKS_DIR, local_tid=_local_tid, new_ctl=_new_ctl_id, failure_of=_legacy_failure,
             log=_log)
-        records = _ATTEMPTS.records()
-        if records is None:
-            _log("attempt ledger unreadable — nothing settled or retired at start")
-            return
-        live = {t for t in map(_local_tid, records) if _INFLIGHT_DEGRADED or _task_pending(t)
-                or os.path.lexists(RESULTS_DIR / f"{t}.txt")} - inflight
+        live = (set(map(_local_tid, records)) if _INFLIGHT_DEGRADED else live) - inflight
         if live:
             if not _hold_in_flight(inflight, live):
                 _log(f"attempts still live ({', '.join(sorted(live))}) could not be saved in flight "
@@ -4417,6 +4436,29 @@ def _close_stale_turns(inflight: "set[str]") -> None:
         closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})
     if closed:
         _log(f"closed {closed} turn file(s) whose task is no longer in flight")
+
+
+def _live_on_disk(tids: "set[str]") -> "set[str] | None":
+    """The ids whose task file is queued or claimed, or whose result is waiting; None when the
+    queue or a result cannot be read: a read fault is not evidence that nothing is there."""
+    try:
+        names = os.listdir(TASKS_DIR)
+    except FileNotFoundError:
+        names = []
+    except OSError:
+        return None
+    found = set()
+    for tid in tids:
+        try:
+            os.lstat(RESULTS_DIR / f"{tid}.txt")
+            found.add(tid)
+        except FileNotFoundError:
+            # The same three names `_task_pending` accepts.
+            if any(n == f"{tid}.txt" or n.startswith((f"{tid}.assigned-", f"{tid}.claimed-")) for n in names):
+                found.add(tid)
+        except OSError:
+            return None
+    return found
 
 
 _last_turn_close_pass = 0.0
@@ -7814,9 +7856,12 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     if woken_item == task_attempts.UNKNOWN:
         _log_backoff((tid, "attempt-unread"), f"result {tid}: held — its attempt records cannot be read")
         return False
-    # One ruling: the attempt it is about, the Stop it may confirm, the gate and the lease fields
-    # are read in one transition, so a newer generation recorded meanwhile is never mixed in.
+    # One ruling, through the local publish: the file it is about (revalidated last), the attempt,
+    # the Stop it may confirm, the gate and the lease fields are one transition no ack can split.
     with _ATTEMPTS.lock if _ATTEMPTS is not None else contextlib.nullcontext():
+        if _ATTEMPTS is not None and _ATTEMPTS.records() is None:
+            _log_backoff((tid, "attempt-unread"), f"result {tid}: held — its attempt records cannot be read")
+            return False
         attempt = _ATTEMPTS.get(broker_tid) if _ATTEMPTS is not None else None
         hold = _ATTEMPTS.result_hold(broker_tid) if _ATTEMPTS is not None else None
         if hold:
@@ -7844,52 +7889,59 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc = {"id": broker_tid, "body": body}
         if _ATTEMPTS is not None:
             doc.update(_ATTEMPTS.result_fields(broker_tid))
-    if decision is not None and decision.fields.get("status"):
-        doc["status"] = decision.fields["status"]
-    if no_send:
-        doc["no_send"] = True
-    if consolidated_into:
-        # An honoured fold of a relay ask: the broker records it as merged into
-        # that task and posts nothing for it, so no marker and no `no_send` ride along.
-        doc["consolidated_into"] = consolidated_into
-    doc.update(_result_contract(dm_only))
-    if thread_ask:
-        # The broker roots it on this task's own ask; a broker without it ignores the key.
-        doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
-    # Structured attribution, not the "— core-N" prose in the body: the
-    # signature is for humans and reformatting it must not change routing.
-    worker, refused = _attribution(tid)
-    if refused:
-        # ENFORCED, not just logged: this is a worker's reply that nothing
-        # recorded, so sending it would publish it as the core's own.
-        why = ("attribution refused: delivered to a worker but no assignment "
-               "record and no completion residue - withholding rather than "
-               "publishing an unattributed result as the core's own")
-        if result_file is not None:
-            _quarantine_undelivered(result_file, tid, why, generation=generation)
+        if decision is not None and decision.fields.get("status"):
+            doc["status"] = decision.fields["status"]
+        if no_send:
+            doc["no_send"] = True
+        if consolidated_into:
+            # An honoured fold of a relay ask: the broker records it as merged into
+            # that task and posts nothing for it, so no marker and no `no_send` ride along.
+            doc["consolidated_into"] = consolidated_into
+        doc.update(_result_contract(dm_only))
+        if thread_ask:
+            # The broker roots it on this task's own ask; a broker without it ignores the key.
+            doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
+        # Structured attribution, not the "— core-N" prose in the body: the
+        # signature is for humans and reformatting it must not change routing.
+        worker, refused = _attribution(tid)
+        if refused:
+            # ENFORCED, not just logged: this is a worker's reply that nothing
+            # recorded, so sending it would publish it as the core's own.
+            why = ("attribution refused: delivered to a worker but no assignment "
+                   "record and no completion residue - withholding rather than "
+                   "publishing an unattributed result as the core's own")
+            if result_file is not None:
+                _quarantine_undelivered(result_file, tid, why, generation=generation)
+            else:
+                _log(f"result {tid}: {why} - not published, not delivered")
+            return False
+        if worker:
+            doc["metadata"] = {"worker_id": worker}
+            _log(f"result {tid}: attributed to worker {worker}")
+        payload = json.dumps(doc).encode("utf-8")
+        # A fold posts nothing either, so it closes an already-accepted id the same way.
+        item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
+        # The task's own result item only: a close of an id already accepted keeps today's policy.
+        relay = relay and item_id == broker_tid
+        if relay:
+            core = _delivery_core("relay")
+        live = _live_source(result_file, generation)
+        root = getattr(core.backend, "root", None)
+        if (_ATTEMPTS is not None and result_file is not None and live is None
+                and (root is None or read_item(root, item_id) is None)):
+            # The file this ruling read was withdrawn or replaced before anything of it was published:
+            # rule its successor next pass. One already in the outbox is settled by its record.
+            _log_backoff((tid, "source-moved"), f"result {tid}: its file changed before it was published — retried")
+            return False
+        # With no result file there is nothing live to protect; the body sent is this call's.
+        ruled = live if result_file is not None else body
+        source = ({"source_ready_sha256": source_digest(live)}
+                  if live is not None and getattr(core.backend, "records_source_digest", False) else {})
+        if item_id != broker_tid and not woken_item:
+            # A wake's item is its episode's own, so a delivered one is this result: re-offered, not re-sent.
+            core.backend.publish(item_id, payload, republish_delivered=True, **source)
         else:
-            _log(f"result {tid}: {why} - not published, not delivered")
-        return False
-    if worker:
-        doc["metadata"] = {"worker_id": worker}
-        _log(f"result {tid}: attributed to worker {worker}")
-    payload = json.dumps(doc).encode("utf-8")
-    # A fold posts nothing either, so it closes an already-accepted id the same way.
-    item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
-    # The task's own result item only: a close of an id already accepted keeps today's policy.
-    relay = relay and item_id == broker_tid
-    if relay:
-        core = _delivery_core("relay")
-    live = _live_source(result_file, generation)
-    # With no result file there is nothing live to protect; the body sent is this call's.
-    ruled = live if result_file is not None else body
-    source = ({"source_ready_sha256": source_digest(live)}
-              if live is not None and getattr(core.backend, "records_source_digest", False) else {})
-    if item_id != broker_tid and not woken_item:
-        # A wake's item is its episode's own, so a delivered one is this result: re-offered, not re-sent.
-        core.backend.publish(item_id, payload, republish_delivered=True, **source)
-    else:
-        core.backend.publish(item_id, payload, **source)
+            core.backend.publish(item_id, payload, **source)
     res = core.deliver_one(item_id, payload)
     if res.status is DrainStatus.TERMINAL:
         record = read_item(core.backend.root, item_id) or {}

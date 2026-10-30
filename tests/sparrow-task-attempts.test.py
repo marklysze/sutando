@@ -171,7 +171,7 @@ class Attempts(unittest.TestCase):
         self.assertEqual((got["closed"]["fence_ctl"], got["closed"].get("owed_close")), ("task-ctl-2-bbbbbb", None))
         self.assertFalse((self.tasks / "task-ctl-3-cccccc.txt").exists(), "a control no state explains is withdrawn")
         self.assertEqual(got["moved"].get("taken_ctl"), None)
-        self.assertEqual(got["claimed"]["taken_ctl"], "task-ctl-4-dddddd", "one the core claimed is watched")
+        self.assertEqual(got["claimed"]["taken_ctl"], ["task-ctl-4-dddddd"], "one the core claimed is watched")
         self.assertEqual(sorted(p.name for p in self.tasks.iterdir()),
                          ["task-ctl-1-aaaaaa.txt", "task-ctl-2-bbbbbb.txt", "task-ctl-4-dddddd.claimed-core1"])
 
@@ -223,19 +223,84 @@ class Attempts(unittest.TestCase):
         self.assertEqual(a._load(), base)
         self.assertTrue((self.tasks / "task-ctl-5-eeeeee.txt").exists())
 
-    def test_a_control_answered_while_the_queue_is_listed_is_skipped(self):
+    def test_a_control_claimed_while_the_queue_is_scanned_is_found_under_its_new_name(self):
+        for move in ("claimed", "answered"):
+            with self.subTest(move=move):
+                a = self.mk()
+                a.path.write_text(json.dumps({move: {"execution_generation": 2}}))
+                ctl = f"task-ctl-6-ffffff-{move}"
+                self.queue_ctl(ctl, move)
+                real = Path.read_text
+
+                def read(path, *args, _ctl=ctl, _move=move, **kw):
+                    if path.name == f"{_ctl}.txt":
+                        if _move == "claimed":
+                            path.rename(path.with_name(f"{_ctl}.claimed-core1"))
+                        else:
+                            path.unlink()
+                    return real(path, *args, **kw)
+                with unittest.mock.patch.object(Path, "read_text", read):
+                    self.assertTrue(self.migrate(a))
+                self.assertEqual(a.get(move).get("taken_ctl"), [ctl] if move == "claimed" else None,
+                                 "a control the core claimed mid-scan is watched, never missed")
+
+    def test_a_named_instance_control_is_found(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"stop": {"execution_generation": 1, "stop_requested": True,
+                                               "stop_ctl": None}}))
+        self.queue_ctl("task-ctl-1793-a1b2c3-dev_blue", "stop")
+        self.assertTrue(self.migrate(a))
+        self.assertEqual((a.get("stop")["stop_ctl"], a.get("stop").get("owed_ctl")),
+                         ("task-ctl-1793-a1b2c3-dev_blue", None), "adopted, not doubled")
+
+    def test_a_withdrawn_cancel_that_cannot_be_cleaned_up_never_fails_the_start(self):
         a = self.mk()
         a.path.write_text(json.dumps({"moved": {"execution_generation": 2}}))
-        self.queue_ctl("task-ctl-6-ffffff", "moved")
-        real = Path.read_text
+        self.queue_ctl("task-ctl-8-aaaaaa", "moved")
+        real = Path.unlink
 
-        def read(path, *args, **kw):
-            if path.name == "task-ctl-6-ffffff.txt":
-                path.unlink()
+        def unlink(path, *args, **kw):
+            if path.name.endswith(".withdrawn"):
+                raise PermissionError(path)
             return real(path, *args, **kw)
-        with unittest.mock.patch.object(Path, "read_text", read):
+        with unittest.mock.patch.object(Path, "unlink", unlink):
             self.assertTrue(self.migrate(a))
-        self.assertIsNone(a.get("moved").get("taken_ctl"))
+        self.assertTrue(any("left in place" in m for m in self.logs))
+
+    def test_a_live_result_that_cannot_be_read_stops_the_migration(self):
+        a = self.mk()
+        base = {"lost": {"execution_generation": 1, "dispatch_lost": True}}
+        a.path.write_text(json.dumps(base))
+
+        def unreadable(t):
+            raise task_attempt_migrations.Unknown(t)
+        self.assertIsNone(task_attempt_migrations.migrate(
+            a, self.tasks, local_tid=lambda t: t, new_ctl=lambda: "c", failure_of=unreadable,
+            log=self.logs.append))
+        self.assertEqual(a._load(), base)
+
+    def test_a_control_the_record_already_names_is_left_as_it_is(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"stale": {"execution_generation": 1, "fenced": "stale_execution_generation",
+                                                "fence_ctl": "task-ctl-9-aaaaaa"}}))
+        self.queue_ctl("task-ctl-9-aaaaaa", "stale")
+        self.assertTrue(self.migrate(a))
+        self.assertTrue((self.tasks / "task-ctl-9-aaaaaa.txt").exists(), "its own control, not withdrawn")
+        self.assertEqual(a.get("stale")["fence_ctl"], "task-ctl-9-aaaaaa")
+
+    def test_a_control_assigned_to_a_core_is_found(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"moved": {"execution_generation": 2}}))
+        self.queue_ctl("task-ctl-10-bbbbbb", "moved", ".assigned-core2")
+        self.assertTrue(self.migrate(a))
+        self.assertEqual(a.get("moved")["taken_ctl"], ["task-ctl-10-bbbbbb"])
+
+    def test_a_queue_whose_workspace_is_missing_is_unknown(self):
+        a = self.mk()
+        a.path.write_text(json.dumps({"stop": {"execution_generation": 1, "stop_requested": True}}))
+        self.assertIsNone(task_attempt_migrations.migrate(
+            a, self.state / "gone" / "tasks", local_tid=lambda t: t, new_ctl=lambda: "c",
+            failure_of=lambda t: ("b", None), log=self.logs.append), "an unmounted workspace is not empty")
 
     def test_older_marker_shapes_carry_the_records_generation(self):
         a = self.mk()

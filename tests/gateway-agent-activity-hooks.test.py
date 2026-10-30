@@ -104,6 +104,7 @@ class Hooks(unittest.TestCase):
 
     def test_the_ack_first_path_records_the_generation_or_refuses_a_cancel(self):
         self.use(FakeGateway(**{"/v1/tasks/task-h3/ack": _ack("task-h3", 2)}))
+        self.assertIsNotNone(gw._write_task(_task("task-h3"), hold=True))     # staged before its ack
         self.assertEqual(gw._post_ack_first("task-h3", None), "accepted")
         self.assertEqual(gw._ATTEMPTS.get("task-h3")["execution_generation"], 2)
         fake = self.use(FakeGateway(**{"/v1/tasks/task-h3b/ack": _http(409, {"error_code": "task_cancelled"})}))
@@ -158,7 +159,7 @@ class Hooks(unittest.TestCase):
         self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1)
         gw._retry_pending_acks({tid})
         rec = gw._ATTEMPTS.get(tid)
-        self.assertEqual((rec["execution_generation"], rec.get("taken_ctl")), (2, ctl.stem),
+        self.assertEqual((rec["execution_generation"], rec.get("taken_ctl")), (2, [ctl.stem]),
                          "the retry records that the core ran it")
         self.assertNotIn(tid, gw._load_pending_acks())
 
@@ -221,7 +222,7 @@ class Hooks(unittest.TestCase):
                 ({}, False) if "dispatch_lost" in f else real(w, f))):
             gw._post_task_beats({tid}, force=True)
         self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
-        self.assertEqual(gw._ATTEMPTS.get(tid).get("taken_ctl"), ctl, "kept: the next beat retries")
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("taken_ctl"), [ctl], "kept: the next beat retries")
         gw._post_task_beats({tid}, force=True)
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALE_CANCEL_RESULT)
         self.assertIsNone(gw._ATTEMPTS.get(tid).get("taken_ctl"))
@@ -1854,13 +1855,427 @@ class Hooks(unittest.TestCase):
         gw._ATTEMPTS.path.write_text("{not json")
         gw._close_stale_turns(set())
         self.assertEqual(gw._ATTEMPTS.path.read_text(), "{not json", "an unreadable ledger is not touched")
-        self.assertTrue(any("nothing settled or retired at start" in m for m in self.logs))
+        self.assertTrue(any("nothing migrated, settled or retired at start" in m for m in self.logs))
         gw._ATTEMPTS.path.write_bytes(saved)
         with mock.patch.object(gw, "_save_inflight", return_value=False), \
                 mock.patch.object(gw._ATTEMPTS, "sweep") as sweep:
             gw._close_stale_turns(set())
         sweep.assert_not_called()
         self.assertEqual(gw._ATTEMPTS.get(tid).get("execution_generation"), 1)
+
+    # ── round 12: the file ruled is the file published; serves, beats and start are transitions ──
+    def test_a_result_file_that_moves_after_the_drain_read_it_is_never_published(self):
+        for race in ("withdrawn by a newer generation", "replaced by the core's answer"):
+            with self.subTest(race=race):
+                tid = f"task-drain-race-{len(race)}"
+                fake = self.owed_failure(tid)
+                gw._post_task_beats({tid}, force=True)
+                self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.DISPATCH_LOST_RESULT)
+                fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2), "/v1/results": {"ok": True}}))
+                reached, release = self.paused("_relay_result")            # read done, ruling not begun
+                drain = threading.Thread(target=gw._post_ready_results, args=({tid},))
+                drain.start()
+                self.assertTrue(reached.wait(5))
+                if race.startswith("withdrawn"):
+                    (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
+                    self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+                    self.assertTrue(gw._post_task_ack(tid, durable=True))
+                else:
+                    tmp = gw.RESULTS_DIR / f".{tid}.core"
+                    tmp.write_text("the core's answer")
+                    os.replace(tmp, gw.RESULTS_DIR / f"{tid}.txt")
+                release.set()
+                drain.join(10)
+                mock.patch.object(gw, "_relay_result", side_effect=None).stop()
+                mock.patch.stopall()
+                mock.patch.object(gw, "_log", self.logs.append).start()
+                self.use(fake)
+                self.assertEqual([p for p in fake.posted("/v1/results") if p["id"] == tid], [],
+                                 "the bytes it read are gone: nothing of them is published")
+                gw._post_ready_results({tid})
+                posts = [(p["body"], p.get("status")) for p in fake.posted("/v1/results") if p["id"] == tid]
+                self.assertEqual(posts, [] if race.startswith("withdrawn") else [("the core's answer", "completed")])
+                self.assertFalse(any((gw.RESULTS_DIR / "undelivered").glob(f"*{tid}*")), "never quarantined")
+
+    def test_a_serve_waits_for_a_settlement_already_under_way(self):
+        tid = "task-serve-vs-settle"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        with self.no_ctl_write():
+            self.beat_error(tid, "stale_execution_generation")
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True}}))
+        reached, release = self.paused("_queue_cancel_instruction")
+        settler = threading.Thread(target=gw._post_task_beats, args=({tid},), kwargs={"force": True})
+        settler.start()
+        self.assertTrue(reached.wait(5), "the settlement read generation 1's owed cancel")
+        served = threading.Thread(target=gw._write_task, args=(_task(tid),))
+        served.start()
+        served.join(0.3)
+        blocked = served.is_alive()
+        release.set()
+        settler.join(10)
+        served.join(10)
+        self.assertTrue(blocked, "the re-serve waits until the settlement's transition is done")
+        self.assertTrue(gw._ATTEMPTS.get(tid).get("awaiting_ack"))
+        mock.patch.stopall()
+        mock.patch.object(gw, "_log", self.logs.append).start()
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual((self.all_controls(tid), gw._ATTEMPTS.get(tid).get("taken_ctl")), ([], None))
+
+    def test_a_beat_answered_for_an_older_generation_never_fences_the_newer(self):
+        tid = "task-beat-regen"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        entered, gate = threading.Event(), threading.Event()
+
+        def beat(payload):
+            entered.set()
+            gate.wait(10)
+            return {"ok": True, "task_errors": [{"task_id": tid, "error_code": "task_cancelled"}]}
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": beat, f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        beating = threading.Thread(target=gw._post_task_beats, args=({tid},), kwargs={"force": True})
+        beating.start()
+        self.assertTrue(entered.wait(5), "generation 1's beat is on the wire")
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        gate.set()
+        beating.join(10)
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["execution_generation"], rec.get("stop_requested"), rec.get("fenced")), (2, None, None))
+        self.assertEqual(self.all_controls(tid), [], "generation 1's Stop never reaches generation 2")
+
+    def test_a_start_that_cannot_read_a_live_result_keeps_its_wake_identity(self):
+        tid = "task-wake-unreadable"
+        task = {"id": tid, "task": "hi", "source": "ag2space", "user_id": "@o:x"}
+        self.answered = self.answered_task(tid)
+        self.assertEqual(gw._write_task(self.answered), (tid, True))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.ran(tid)
+        (gw.RESULTS_DIR / f"{tid}.txt").write_text("went with b")
+        mode = gw.RESULTS_DIR.stat().st_mode
+        self.addCleanup(os.chmod, gw.RESULTS_DIR, mode)
+        os.chmod(gw.RESULTS_DIR, 0)
+        try:
+            gw._close_stale_turns(set())
+        finally:
+            os.chmod(gw.RESULTS_DIR, mode)
+        self.assertEqual(gw._ATTEMPTS.wake_item(tid), f"{tid}.wake-e1", "unknown is not absent")
+        self.assertTrue(any("nothing migrated, settled or retired at start" in m for m in self.logs))
+        del task
+
+    def test_a_base_failure_whose_result_cannot_be_read_is_not_migrated(self):
+        tid = "task-base-lost-unreadable"
+        self.seed(tid, {"execution_generation": 1, "attempt": 1, "acked_at": time.time(),
+                        "awaiting_ack": False, "dispatch_lost": True})
+        path = gw.RESULTS_DIR / f"{tid}.txt"
+        path.write_text(gw.DISPATCH_LOST_RESULT)
+        self.addCleanup(lambda: (os.chmod(path, 0o644), path.unlink(missing_ok=True)))
+        os.chmod(path, 0)
+        gw._close_stale_turns(set())
+        self.assertIs(gw._ATTEMPTS.get(tid).get("dispatch_lost"), True, "left for a start that can read it")
+        os.chmod(path, 0o644)
+        gw._close_stale_turns(set())
+        self.assertEqual(gw._ATTEMPTS.get(tid)["dispatch_lost"]["file"],
+                         gw.task_attempts.file_identity(path), "its own file, adopted once readable")
+
+    def test_a_wake_left_unacked_never_receives_the_earlier_attempts_failure(self):
+        tid = "task-wake-owed-failure"
+        self.owed_failure(tid)                                  # generation 1 owes its failure result
+        wake = {"id": tid, "task": "hi", "source": "ag2space", "user_id": "@o:x",
+                "wake": {"blocker_episode_id": "e1", "resolved_blockers": []}}
+        with mock.patch.object(gw._ATTEMPTS, "remember_task", return_value=False):
+            self.assertIsNone(gw._write_task(wake), "opened, but its serve was not recorded: left unacked")
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("wake_episode"), "e1")
+        gw._post_task_beats({tid}, force=True)
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "generation 1's debt is not the wake's")
+
+    def test_a_start_whose_migration_did_not_finish_retires_nothing(self):
+        stale, legacy = "task-stale-current", "task-legacy-pending"
+        self.seed(stale, {"schema": gw.task_attempts.SCHEMA, "execution_generation": 1, "attempt": 1})
+        self.seed(legacy, {"execution_generation": 1, "attempt": 1})
+        broken = gw.TASKS_DIR / "task-ctl-0-unreadable.txt"
+        broken.mkdir()
+        self.addCleanup(lambda: broken.exists() and broken.rmdir())
+        gw._close_stale_turns(set())
+        self.assertTrue(gw._ATTEMPTS.get(stale), "no sweep after a migration that could not read the queue")
+        broken.rmdir()
+        gw._close_stale_turns(set())
+        self.assertEqual(gw._ATTEMPTS.get(stale), {}, "swept by the next start")
+
+    # ── round 12, independent review: acks and refusals for older leases, unknown entries ──
+    def test_a_late_ack_for_an_older_generation_or_a_retired_attempt_moves_nothing(self):
+        tid = "task-late-ack"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        turn = gw._ATTEMPTS.get(tid)["turn_id"]
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))   # generation 1's answer, late
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["execution_generation"], rec["turn_id"]), (2, turn), "generation 2 stands")
+        self.assertFalse(agent_turn.is_closed(gw._STATE, turn))
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.ran(tid)
+        gw._post_ready_results({tid})
+        self.assertEqual(gw._ATTEMPTS.get(tid), {}, "settled and retired")
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(gw._ATTEMPTS.get(tid), {}, "a late ack does not bring a retired attempt back")
+        self.assertEqual(len(fake.posted("/v1/results")), 1)
+
+    def test_an_ack_refusal_about_an_older_lease_never_fences_the_newer_generation(self):
+        tid = "task-ack-refused-old"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(409, {
+            "error_code": "task_cancelled", "cancel_requested_generation": 1})}))
+        gw._post_task_ack(tid, durable=True)
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec["execution_generation"], rec.get("fenced")), (2, None))
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "generation 2's task is not withdrawn")
+        self.assertEqual(fake.posted("/cancel-ack"), [])
+        self.assertNotIn(tid, gw._load_pending_acks())
+
+    def test_a_beat_fence_while_a_newer_serve_awaits_its_ack_is_left_to_that_ack(self):
+        tid = "task-beat-awaiting"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.assertIsNotNone(gw._write_task(_task(tid)))                         # served again, unacked
+        self.assertTrue(gw._ATTEMPTS.get(tid).get("awaiting_ack"))
+        self.beat_error(tid, "stale_execution_generation")
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertEqual((rec.get("fenced"), rec.get("awaiting_ack")), (None, True))
+        self.assertEqual(self.all_controls(tid), [], "no cancel queued against the waiting serve")
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 2)
+
+    def test_a_ledger_that_turns_unreadable_mid_delivery_holds_the_result(self):
+        tid = "task-ledger-mid-delivery"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.beat_error(tid, "task_cancelled")
+        self.ran(tid)
+        saved, real = gw._ATTEMPTS.path.read_bytes(), gw._ATTEMPTS.wake_item
+        self.addCleanup(lambda: gw._ATTEMPTS.path.write_bytes(saved))
+
+        def wake_item(w):
+            item = real(w)
+            gw._ATTEMPTS.path.write_text("{not json")                # the ledger breaks right after
+            return item
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}}))
+        with mock.patch.object(gw._ATTEMPTS, "wake_item", side_effect=wake_item):
+            gw._post_ready_results({tid})
+        self.assertEqual(fake.posted("/v1/results"), [], "held, never posted without its lease")
+        self.assertTrue((gw.RESULTS_DIR / f"{tid}.txt").exists())
+
+    def test_a_damaged_ledger_entry_is_kept_and_held(self):
+        tid = "task-entry-damaged"
+        data = gw._ATTEMPTS._load_json(gw._ATTEMPTS.path)
+        data[tid] = "damaged"
+        gw._ATTEMPTS.path.write_text(json.dumps(data))
+        self.assertTrue(gw._broker_holds(tid), "an entry that is not a record is unknown")
+        gw._close_stale_turns(set())
+        self.assertEqual(gw._ATTEMPTS._load_json(gw._ATTEMPTS.path).get(tid), "damaged", "never swept")
+        data = gw._ATTEMPTS._load_json(gw._ATTEMPTS.path)
+        data.pop(tid)
+        gw._ATTEMPTS.path.write_text(json.dumps(data))
+
+    def test_every_older_cancel_the_core_took_is_watched(self):
+        tid = "task-two-taken"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.beat_error(tid, "task_cancelled")
+        gw._ATTEMPTS._set(tid, stop_requested=None)
+        self.beat_error(tid, "stale_execution_generation")
+        ctls = self.controls(tid)
+        self.assertEqual(len(ctls), 2)
+        for p in ctls:
+            p.rename(p.with_name(p.name.replace(".txt", ".claimed-core1")))   # the core takes both
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(sorted(gw._ATTEMPTS.get(tid)["taken_ctl"]), sorted(p.stem for p in ctls))
+
+    def test_a_wake_withdraws_the_earlier_attempts_queued_cancel_before_it_runs(self):
+        tid = "task-wake-retracts"
+        wake = self.answered_task(tid)
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.beat_error(tid, "stale_execution_generation")
+        self.assertEqual(len(self.controls(tid)), 1)
+        self.assertEqual(gw._write_task(wake), (tid, True))
+        self.assertEqual(self.all_controls(tid), [], "the earlier attempt's cancel never stops the wake")
+
+    def test_an_ack_whose_older_generation_cannot_be_undone_is_retried_not_recorded(self):
+        for fault in ("failure result", "cancel", "unreadable failure"):
+            with self.subTest(fault=fault):
+                tid = f"task-retract-fault-{len(fault)}"
+                if fault != "cancel":
+                    self.owed_failure(tid)
+                    gw._post_task_beats({tid}, force=True)
+                    (gw.TASKS_DIR / "archive" / f"{tid}.txt").rename(gw.TASKS_DIR / f"{tid}.txt")
+                    stuck = (mock.patch.object(gw.disposal, "retire_generation", return_value=mock.Mock(
+                        retired=False, outcome=None, cause="injected")) if fault == "failure result" else
+                        mock.patch.object(gw.task_attempts, "file_identity", side_effect=PermissionError("x")))
+                else:
+                    self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+                    gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+                    self.beat_error(tid, "stale_execution_generation")
+                    real = os.rename
+                    stuck = mock.patch.object(gw.os, "rename", side_effect=lambda a, b, *x, **k: (
+                        (_ for _ in ()).throw(PermissionError(a)) if "task-ctl-" in str(a) else real(a, b, *x, **k)))
+                self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+                self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+                with stuck:
+                    self.assertFalse(gw._post_task_ack(tid, durable=True))
+                self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 1, "not recorded over it")
+                self.assertIn(tid, gw._load_pending_acks(), "the ack is retried")
+                self.assertTrue(gw._post_task_ack(tid, durable=True))
+                self.assertEqual((gw._ATTEMPTS.get(tid)["execution_generation"], self.all_controls(tid)), (2, []))
+                self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists())
+
+    def test_a_start_counts_a_claimed_task_live_and_an_unreadable_queue_unknown(self):
+        for state in ("claimed", "queue unreadable"):
+            with self.subTest(state=state):
+                tid = f"task-start-{len(state)}"
+                self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+                gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+                claimed = gw.TASKS_DIR / f"{tid}.claimed-core1"
+                (gw.TASKS_DIR / f"{tid}.txt").rename(claimed)
+                self.addCleanup(lambda c=claimed: c.unlink(missing_ok=True))
+                mode = gw.TASKS_DIR.stat().st_mode
+                self.addCleanup(os.chmod, gw.TASKS_DIR, mode)
+                if state == "queue unreadable":
+                    os.chmod(gw.TASKS_DIR, 0)
+                try:
+                    inflight: set = set()
+                    gw._close_stale_turns(inflight)
+                finally:
+                    os.chmod(gw.TASKS_DIR, mode)
+                self.assertEqual(gw._ATTEMPTS.get(tid).get("execution_generation"), 1, "kept through the start")
+                self.assertEqual(tid in inflight, state == "claimed")
+
+    def test_an_ack_fence_that_cannot_be_recorded_keeps_its_pending_ack(self):
+        tid = "task-ack-fence-unsaved"
+        pending: list = []
+        self.assertTrue(gw._take_served_task(_task(tid), set(), pending))
+        self.assertTrue(gw._record_pending_acks(pending))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _http(409, {"error_code": "task_already_terminal"})}))
+        with mock.patch.object(gw._ATTEMPTS, "fence", return_value={"new": False, "cancel": False, "unsaved": True}):
+            gw._post_task_ack(tid, durable=True)
+        self.assertIn(tid, gw._load_pending_acks(), "retried, so the fence is heard again")
+
+    def test_a_legacy_ack_whose_wait_cannot_be_ended_keeps_its_pending_ack(self):
+        tid = "task-legacy-ack-unsaved"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": {"ok": True, "durable": True}}))   # no generation
+        with mock.patch.object(gw._ATTEMPTS, "ack_settled", return_value=False):
+            self.assertFalse(gw._post_task_ack(tid, durable=True))
+        self.assertIn(tid, gw._load_pending_acks())
+
+    def test_a_stop_is_not_judged_while_the_wake_records_cannot_be_read(self):
+        tid = "task-stop-wake-unknown"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.beat_error(tid, "task_cancelled")
+        ctl = gw._ATTEMPTS.get(tid)["stop_ctl"]
+        (gw.TASKS_DIR / f"{ctl}.txt").unlink()
+        (gw.RESULTS_DIR / f"{ctl}.txt").write_text("[no-send]")               # the core ran the Stop
+        self.addCleanup(lambda: (gw.RESULTS_DIR / f"{ctl}.txt").unlink(missing_ok=True))
+        items = gw._ATTEMPTS._wake_items_path
+        saved = items.read_bytes() if items.exists() else None
+        self.addCleanup(lambda: items.write_bytes(saved) if saved is not None else items.unlink(missing_ok=True))
+        items.write_text("{not json")
+        fake = self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True}}))
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(fake.posted("/cancel-ack"), [], "unknown is never read as stopped with no reply")
+
+    def test_an_ack_waits_for_a_beat_check_already_under_way(self):
+        tid = "task-beat-check-vs-ack"
+        self.held_then_archived(tid)
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2), "/v1/tasks/heartbeat": {"ok": True}}))
+        real, reached, release = gw.task_attempts.last_activity, threading.Event(), threading.Event()
+
+        def activity(*a):
+            reached.set()
+            release.wait(10)
+            return real(*a)
+        with mock.patch.object(gw.task_attempts, "last_activity", side_effect=activity):
+            beat = threading.Thread(target=gw._post_task_beats, args=({tid},), kwargs={"force": True})
+            beat.start()
+            self.assertTrue(reached.wait(5))
+            acker = threading.Thread(target=gw._post_task_ack, args=(tid,), kwargs={"durable": True})
+            acker.start()
+            acker.join(0.3)
+            blocked = acker.is_alive()
+            release.set()
+            beat.join(10)
+            acker.join(10)
+        self.assertTrue(blocked, "the dispatch watch's read and write are one transition")
+        self.assertEqual(gw._ATTEMPTS.get(tid)["execution_generation"], 2)
+
+    def test_a_cancel_written_but_not_cleared_then_taken_is_watched_by_the_newer(self):
+        tid = "task-owed-written-taken"
+        self.assertTrue(gw._take_served_task(_task(tid), set(), []))
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        real = gw._ATTEMPTS._set
+        with mock.patch.object(gw._ATTEMPTS, "_set", side_effect=lambda w, **f: (
+                False if f == {"owed_ctl": None} else real(w, **f))):
+            self.beat_error(tid, "stale_execution_generation")          # written; its marker not cleared
+        ctl = gw._ATTEMPTS.get(tid)["owed_ctl"]["id"]
+        (gw.TASKS_DIR / f"{ctl}.txt").rename(gw.TASKS_DIR / f"{ctl}.claimed-core1")
+        self.addCleanup(lambda: (gw.TASKS_DIR / f"{ctl}.claimed-core1").unlink(missing_ok=True))
+        self.assertTrue(gw._record_pending_acks([(tid, True, None)]))
+        self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 2)}))
+        self.assertTrue(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(gw._ATTEMPTS.get(tid).get("taken_ctl"), [ctl], "the core took it: watched")
+
+    def test_an_unmigrated_records_debt_is_not_carried_out(self):
+        tid = "task-legacy-debt"
+        self.seed(tid, {"execution_generation": None, "awaiting_ack": False, "fenced": "stale_execution_generation",
+                        "owed_ctl": {"id": "task-ctl-1-legacydebt", "reason": "r"}})
+        self.use(FakeGateway(**{"/v1/tasks/heartbeat": {"ok": True}}))
+        gw._post_task_beats({tid}, force=True)
+        self.assertEqual(self.all_controls(tid), [], "nothing acts on a record before its migration")
+        data = gw._ATTEMPTS._load_json(gw._ATTEMPTS.path)
+        data.pop(tid)
+        gw._ATTEMPTS.path.write_text(json.dumps(data))
+
+    def test_a_wake_waits_while_its_earlier_attempts_id_is_still_to_retire(self):
+        tid = "task-wake-settle-pending"
+        wake = self.answered_task(tid)
+        with mock.patch.object(gw, "_SETTLE_PENDING", {tid}):
+            self.assertIsNone(gw._write_task(wake), "left unacked until the retirement is done")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("wake_episode"))
+
+    def test_a_wake_whose_earlier_cancel_cannot_be_withdrawn_is_not_opened(self):
+        tid = "task-wake-retract-fails"
+        wake = self.answered_task(tid)
+        gw._ATTEMPTS.record_ack(tid, _ack(tid, 1))
+        self.beat_error(tid, "stale_execution_generation")
+        real = os.rename
+        with mock.patch.object(gw.os, "rename", side_effect=lambda a, b, *x, **k: (
+                (_ for _ in ()).throw(PermissionError(a)) if "task-ctl-" in str(a) else real(a, b, *x, **k))):
+            self.assertIsNone(gw._write_task(wake))
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("wake_episode"), "not opened over a live cancel")
+        self.assertEqual(gw._write_task(wake), (tid, True), "opened once the cancel is withdrawn")
+        self.assertEqual(self.all_controls(tid), [])
+
+    def test_a_record_watching_a_taken_cancel_is_never_swept(self):
+        tid = "task-taken-only"
+        self.seed(tid, {"schema": gw.task_attempts.SCHEMA, "execution_generation": 2, "fenced": "task_not_found",
+                        "taken_ctl": ["task-ctl-1-watched"]})
+        gw._close_stale_turns(set())
+        self.assertEqual(gw._ATTEMPTS.get(tid)["taken_ctl"], ["task-ctl-1-watched"])
 
     def test_a_wake_runs_once_with_its_answer_and_its_own_result_item(self):
         task = {"id": "task-h8", "task": "hi", "source": "ag2space", "user_id": "@o:x"}

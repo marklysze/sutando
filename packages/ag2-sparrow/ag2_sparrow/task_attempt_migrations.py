@@ -21,19 +21,39 @@ from .task_attempts import SCHEMA, TaskAttempts
 
 CLOSED_FENCES = ("task_already_terminal", "task_not_found", "task_cancelled")
 _TARGET = re.compile(r"^task: CANCEL_INSTRUCTION: stop processing (\S+) if still in flight", re.M)
-_CTL_NAME = re.compile(r"^(task-ctl-[A-Za-z0-9-]+)(\.txt|\.assigned-.+|\.claimed-.+)$")
+# Every id `_new_ctl_id` can mint, a named gateway instance's `_` included.
+_CTL_NAME = re.compile(r"^(task-ctl-[A-Za-z0-9_-]+)(\.txt|\.assigned-.+|\.claimed-.+)$")
+SCANS = 5
+
+
+class Unknown(Exception):
+    """A state the migration needs could not be read: nothing is migrated."""
 
 
 def legacy_controls(tasks_dir: Path) -> "dict[str, dict[str, bool]] | None":
     """{task id the control stops: {control id: still queued}} for every relay control not yet
-    answered; None when the queue cannot be read."""
+    answered; None when the queue cannot be read. A control that moves while it is read (the core
+    claims it by renaming it) restarts the scan, so it is found under its new name or not at all."""
+    for _ in range(SCANS):
+        try:
+            return _scan(tasks_dir)
+        except FileNotFoundError:
+            continue
+        except Unknown:
+            return None
+    return None
+
+
+def _scan(tasks_dir: Path) -> "dict[str, dict[str, bool]]":
     found: "dict[str, dict[str, bool]]" = {}
     try:
         names = sorted(os.listdir(tasks_dir))
     except FileNotFoundError:
-        return found
+        if os.path.isdir(tasks_dir.parent):
+            return found
+        raise Unknown(tasks_dir) from None
     except OSError:
-        return None
+        raise Unknown(tasks_dir) from None
     for name in names:
         m = _CTL_NAME.match(name)
         if not m:
@@ -41,9 +61,9 @@ def legacy_controls(tasks_dir: Path) -> "dict[str, dict[str, bool]] | None":
         try:
             text = (tasks_dir / name).read_text(encoding="utf-8")
         except FileNotFoundError:
-            continue                            # taken between the listing and the read
+            raise                               # moved while scanned: the caller rescans
         except (OSError, ValueError):
-            return None
+            raise Unknown(name) from None
         target = _TARGET.search(text)
         if f"source: {task_attempts.CONTROL_SOURCE}\n" in text and target:
             found.setdefault(target.group(1), {})[m.group(1)] = m.group(2) == ".txt"
@@ -58,7 +78,7 @@ def migrate(attempts: TaskAttempts, tasks_dir: Path, *, local_tid: Callable[[str
     queue cannot be read. Never raises: a record not upgraded stays held, and the next start retries.
 
     `failure_of(wire_tid)` is the failure body a lost attempt owes and the identity of the result
-    file it already wrote, if that file is still live."""
+    file it already wrote, if that file is still live; it raises `Unknown` when that cannot be read."""
     with attempts.lock:
         data = attempts._read_json(attempts.path)
         if data is None:
@@ -74,7 +94,11 @@ def migrate(attempts: TaskAttempts, tasks_dir: Path, *, local_tid: Callable[[str
         parked: "list[Path]" = []
         for wire_tid in old:
             found = controls.get(local_tid(wire_tid), {})
-            rec, retire = _upgraded(data[wire_tid], found, new_ctl, lambda: failure_of(wire_tid))
+            try:
+                rec, retire = _upgraded(data[wire_tid], found, new_ctl, lambda: failure_of(wire_tid))
+            except Unknown:
+                log(f"task {wire_tid}: its live result cannot be read — attempt records not migrated")
+                return None
             for ctl in retire:
                 aside = tasks_dir / f".{ctl}.withdrawn"
                 try:
@@ -84,7 +108,7 @@ def migrate(attempts: TaskAttempts, tasks_dir: Path, *, local_tid: Callable[[str
                     parked.append(aside)
                     log(f"task {wire_tid}: unrecorded cancel {ctl} withdrawn")
                 except FileNotFoundError:
-                    rec["taken_ctl"] = rec.get("taken_ctl") or ctl
+                    rec["taken_ctl"] = task_attempts.taken_ids(rec) + [ctl]
                     log(f"task {wire_tid}: unrecorded cancel {ctl} was taken by the core — watched")
                 except OSError as e:
                     log(f"task {wire_tid}: unrecorded cancel {ctl} could not be withdrawn ({e}) "
@@ -95,7 +119,10 @@ def migrate(attempts: TaskAttempts, tasks_dir: Path, *, local_tid: Callable[[str
             log("attempt records not migrated — their save failed; held until the next start")
             return False
     for aside in parked:
-        aside.unlink(missing_ok=True)           # an inert dotfile: no task watcher reads it
+        try:
+            aside.unlink(missing_ok=True)       # an inert dotfile: no task watcher reads it
+        except OSError as e:
+            log(f"withdrawn cancel {aside.name} left in place ({e})")
     log(f"migrated {len(old)} attempt record(s)")
     return True
 
@@ -105,7 +132,7 @@ def _upgraded(rec: dict, found: "dict[str, bool]", new_ctl: Callable[[], str],
     """The record in the current schema, and the found controls it does not explain."""
     gen = rec.get("execution_generation")
     out = {**rec, "schema": SCHEMA}
-    named = {rec.get("fence_ctl"), rec.get("stop_ctl"), rec.get("taken_ctl"),
+    named = {rec.get("fence_ctl"), rec.get("stop_ctl"), *task_attempts.taken_ids(rec),
              (rec.get("owed_ctl") or {}).get("id") if isinstance(rec.get("owed_ctl"), dict) else None}
     unexplained = [c for c in found if c not in named]
     lost = rec.get("dispatch_lost")

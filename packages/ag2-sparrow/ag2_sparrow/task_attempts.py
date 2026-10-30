@@ -221,11 +221,12 @@ class TaskAttempts:
                 if isinstance(v, str) and v:
                     return v
             return None
-        return self._merge(wire_tid, dict(
-            room_id=s("source_room_id", "channel_id"), thread_root_id=s("thread_root"),
-            source_event_id=s("source_event_id", "source_message_id", "event_id"),
-            source_kind=s("source_kind", "interaction_type"), awaiting_ack=True,
-            published_at=self.get(wire_tid).get("published_at") or self.now()))[1]
+        with self.lock:                 # a serve is a transition: no settlement straddles it
+            return self._merge(wire_tid, dict(
+                room_id=s("source_room_id", "channel_id"), thread_root_id=s("thread_root"),
+                source_event_id=s("source_event_id", "source_message_id", "event_id"),
+                source_kind=s("source_kind", "interaction_type"), awaiting_ack=True,
+                published_at=self.get(wire_tid).get("published_at") or self.now()))[1]
 
     def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None,
                    open_turn: bool = True) -> dict | None:
@@ -370,8 +371,8 @@ class TaskAttempts:
     def holds(self, wire_tid: str) -> bool:
         """Whether this attempt must stay in flight: it beats, owes work or awaits its migration.
         A ledger that cannot be read holds every attempt: unknown is not released."""
-        data = self.records()
-        if data is None:
+        data = self._read_json(self.path)
+        if data is None or not isinstance(data.get(wire_tid, {}), dict):
             return True
         rec = data.get(wire_tid) or {}
         return (_beats(rec) and not self._task_beat_disabled) or _owes(rec)
@@ -636,7 +637,8 @@ class TaskAttempts:
                 closed += not p.exists()
         with _MUTEX:
             data = self._read_json(self.path) or {}
-            stale = [t for t in data if t not in live and not _owes(data[t])]
+            # An entry that is not a record is unknown, so it is kept.
+            stale = [t for t in data if t not in live and isinstance(data[t], dict) and not _owes(data[t])]
             for t in stale:
                 data.pop(t)
             if stale:
@@ -769,6 +771,14 @@ def owns_result(rec: dict, identity) -> bool:
         return True
     return (isinstance(lost, dict) and identity is not None and lost.get("file") == list(identity)
             and lost.get("gen") == rec.get("execution_generation"))
+
+
+def taken_ids(rec: dict) -> "list[str]":
+    """Every older generation's cancel the core took and the record still watches."""
+    taken = rec.get("taken_ctl")
+    if isinstance(taken, str):
+        return [taken]
+    return [c for c in taken if isinstance(c, str)] if isinstance(taken, list) else []
 
 
 def _owes(rec) -> bool:
