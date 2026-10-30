@@ -285,6 +285,29 @@ class StopInterrupt(unittest.TestCase):
                 self.assertEqual(tmux.escapes(), [])
                 self.assertIn("was not written mid-turn", self.logs[-1])
 
+    def test_a_turn_that_ends_while_the_pane_is_read_is_not_escaped(self):
+        self.row(TARGET)
+        for late in ("done row", "result"):
+            with self.subTest(late=late):
+                ws = self
+
+                class Racing(FakeTmux):
+                    def __call__(self, argv):
+                        if "capture-pane" in argv:      # T finishes between the snapshot and the key
+                            if late == "done row":
+                                ws.row(TARGET, age=0, kind="done")
+                            else:
+                                (ws.ws / "results").mkdir(exist_ok=True)
+                                (ws.ws / "results" / f"{TARGET}.txt").write_text("the answer")
+                        return super().__call__(argv)
+                tmux = Racing()
+                self.assertFalse(self.run_it(tmux))
+                self.assertEqual(tmux.escapes(), [])
+                self.assertIn("changed while the pane was read", self.logs[-1])
+                self.assertFalse((self.ws / "state" / "stop-interrupts" / TARGET).exists(), "not claimed")
+                (self.ws / "results" / f"{TARGET}.txt").unlink(missing_ok=True)
+                self.row(TARGET)
+
     def test_a_task_with_its_result_is_never_escaped(self):
         self.row(TARGET)
         (self.ws / "results").mkdir()

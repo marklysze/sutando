@@ -303,6 +303,27 @@ class Attempts(unittest.TestCase):
         self.gw.answers[task_attempts.ACTIVE_TASKS_PATH] = {"tasks": [], "next_cursor": "again"}
         self.assertIsNone(a.active_tasks(), "a listing past one page is not complete")
 
+    def test_a_wake_attempt_is_retired_only_after_its_identity_is_saved(self):
+        wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
+        for failing in ("relay-wake-items", "relay-wake-episodes", "relay-task-attempts"):
+            with self.subTest(failing=failing):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk()
+                a.remember_task("tsk_W", {"source_room_id": "!r:x"})
+                self.assertEqual(a.open_wake("tsk_W", wake), "ep1")
+                a.record_ack("tsk_W", _ack(1))
+                real = a._save_json
+                with unittest.mock.patch.object(a, "_save_json", side_effect=lambda p, d: (
+                        False if p.name.startswith(failing) else real(p, d))):
+                    self.assertFalse(a.finish("tsk_W"), "a failed write never retires the attempt")
+                self.assertEqual(a.get("tsk_W").get("wake_episode"), "ep1", "the attempt is kept")
+                self.assertEqual(self.mk().wake_item("tsk_W"), "tsk_W.wake-ep1", "the identity survives")
+                if failing != "relay-wake-episodes":    # once the episode is saved as seen
+                    self.assertIsNone(a.open_wake("tsk_W", wake), "the episode is not run again")
+                self.assertTrue(a.finish("tsk_W"), "the next finish retires it")
+                self.assertEqual(a.get("tsk_W"), {})
+                self.assertEqual(self.mk().wake_item("tsk_W"), "tsk_W.wake-ep1")
+
     def test_a_wake_episode_runs_once_and_its_result_rides_its_own_item(self):
         a = self.mk(turn_context=True)
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
@@ -424,6 +445,17 @@ class AnsweredOnce(unittest.TestCase):
         again = self.mk(turn_context=True)
         self.assertEqual(again.answer_rule("tsk_B", self.Q), task_attempts.ANSWERED_HERE_NOTE)
         self.assertIn("`room.question.answer`", again.answer_rule("tsk_B", {**self.Q, "question_id": "rq_2"}))
+
+    def test_an_offer_that_cannot_be_recorded_never_carries_the_answer_instruction(self):
+        for failing in ("relay-answer-offers", "relay-task-attempts"):
+            with self.subTest(failing=failing):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk(turn_context=True)
+                real = a._save_json
+                with unittest.mock.patch.object(a, "_save_json", side_effect=lambda p, d: (
+                        False if p.name.startswith(failing) else real(p, d))):
+                    self.assertEqual(a.answer_rule("tsk_U", self.Q), task_attempts.ANSWER_UNRECORDED_NOTE)
+                self.assertIn("`room.question.answer`", a.answer_rule("tsk_U", self.Q), "recorded: the rule")
 
     def test_a_redelivery_after_a_crash_sees_the_answer_in_the_journal(self):
         a = self.mk(turn_context=True)
