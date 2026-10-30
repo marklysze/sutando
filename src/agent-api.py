@@ -233,10 +233,14 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             expected = body.get("expected_server")
             if not isinstance(expected, str) or not expected.strip():
                 return 400, {"error": "confirm needs expected_server (the server the preview showed)"}
+            skip_backlog = body.get("skip_backlog", False)
+            if not isinstance(skip_backlog, bool):
+                return 400, {"error": "skip_backlog must be a boolean"}
             try:
                 row, created = _connections.add_connection(
                     token, added_by=str(body.get("added_by", "ui")), expected_server=expected,
-                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill)
+                    instance=body.get("instance"), preview=preview, workspace=ws, vault=vault, kill=kill,
+                    skip_backlog=skip_backlog)
             except _connections.ConnectionMismatch as e:
                 return 409, {"error": "mismatch", "server_from_token": e.derived, "expected_server": e.claimed}
             launch = _connections.start_added(row, repo=repo, logs_dir=logs_dir, workspace=ws,
@@ -1925,6 +1929,9 @@ if __name__ == "__main__":
         daemon=True,
     )
     workstream_maintenance.start()
+    # Rows imported from the environment name no agent until their own token is asked.
+    threading.Thread(target=_connections.run_identity_learner, args=(workstream_maintenance_stop, WORKSPACE_DIR),
+                     name="connections-identity", daemon=True).start()
     local_ip = _resolve_local_ip()
     print(f"Sutando Agent API → http://{bind}:{PORT}")
     print("  POST /task  — submit a task")

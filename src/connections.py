@@ -69,12 +69,14 @@ import signal
 import subprocess
 import sys
 import contextlib
+import datetime
 import hashlib
 import http.client
 import ipaddress
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -110,6 +112,8 @@ LEGACY_PATH_SEGMENT = "legacy"
 RESERVED_INSTANCES = ("known-servers", "token", "park-legacy", LEGACY_PATH_SEGMENT)
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
+# Matched whole: a gateway's whoami is a new input, and its id reaches a process environment.
+_STRICT_MXID_RE = re.compile(r"@[a-z0-9._=/+-]+:[A-Za-z0-9.-]+(?::[0-9]{1,5})?")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
              "server_source")
 # What the gateway's agent listing says about the one agent a verified preview names; never a secret.
@@ -527,6 +531,16 @@ def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -
     """The gateway's own `GET /v1/agents` under the token's bearer, over a connection pinned to
     the vetted `address` with the URL's host as SNI and Host. Anything but 200 raises HTTPError
     with that status: a redirect is never followed."""
+    return _fetch_json(gateway_url, token, address, "/v1/agents", connect=connect)
+
+
+def _fetch_whoami(gateway_url: str, token: str, address: str, *, connect=None) -> dict:
+    """The gateway's `GET /v1/whoami`: the agent its registry resolves the bearer to, never a
+    client claim. Pinned and refused exactly as `_fetch_agents`."""
+    return _fetch_json(gateway_url, token, address, "/v1/whoami", connect=connect)
+
+
+def _fetch_json(gateway_url: str, token: str, address: str, path: str, *, connect=None) -> dict:
     parts = urllib.parse.urlsplit(gateway_url)
     host = parts.hostname or ""
     port = parts.port or 443
@@ -534,7 +548,7 @@ def _fetch_agents(gateway_url: str, token: str, address: str, *, connect=None) -
     conn = http.client.HTTPConnection(host, port, timeout=PROBE_TIMEOUT_S)
     conn.sock = sock  # the transport is the pinned one; connect() is never reached
     try:
-        conn.request("GET", parts.path.rstrip("/") + "/v1/agents", headers={
+        conn.request("GET", parts.path.rstrip("/") + path, headers={
             "Host": f"{parts.hostname}:{port}" if parts.port else parts.hostname,
             "Authorization": f"Bearer {secret_of(token)}",
             "Accept": "application/json", "User-Agent": "sutando-gateway-client/1.0"})
@@ -599,7 +613,7 @@ def gateway_host_ok(host: str) -> bool:
 
 
 def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver=None,
-                       getaddrinfo=None) -> dict:
+                       getaddrinfo=None, whoami: Optional[Callable] = None) -> dict:
     """What saving this token would record, without saving: the gateway URL as issued, the
     server and where it came from (`server_source`), and whether the token authenticated
     (`authenticated` None when the gateway gave no verdict).
@@ -607,7 +621,10 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     The gateway's agent listing can CONFIRM an identity, never establish one: `verified` is
     true only when the listing names one agent whose server is the DotSpace the resolver
     registers for the gateway host. An unregistered host stays the server itself, whatever the
-    listing claims. The gateway URL must be https and its host a public server name: an http
+    listing claims. A listing of several agents (an owner-scoped one) is settled by the gateway's
+    `whoami` for the bearer, taken only for an agent of that same server that a non-empty listing
+    also names; a caller that injects
+    `fetch` without `whoami` asks no whoami. The gateway URL must be https and its host a public server name: an http
     URL, an address, a reserved or single-label name, or a name resolving to any non-public
     address is refused as invalid_gateway before any probe; the probe is pinned to the vetted
     address."""
@@ -629,6 +646,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     if address is None:
         out["error"] = "unreachable (resolution)"
         return out
+    if whoami is None and fetch is None:
+        whoami = _fetch_whoami
     fetch = _fetch_agents if fetch is None else fetch
     try:
         answer = fetch(url, token, address)
@@ -646,7 +665,22 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         if isinstance(agents, list) else []
     if registered and len(named) == 1 and server_of_mxid(named[0]["id"]) == registered:
         out.update(_identity_of(named[0]), server_source="identity", verified=True)
+    elif registered and whoami is not None:
+        mine = _whoami_agent(whoami, url, token, address)
+        entry = next((a for a in named if a["id"] == mine), None if named else {"id": mine})
+        if mine and server_of_mxid(mine) == registered and entry is not None:
+            out.update(_identity_of(entry), server_source="identity", verified=True)
     return out
+
+
+def _whoami_agent(whoami: Callable, url: str, token: str, address: str) -> str:
+    """The agent mxid the gateway's whoami names for the bearer; '' when it names none or fails."""
+    try:
+        answer = whoami(url, token, address)
+    except Exception:  # noqa: BLE001 - an older gateway without whoami leaves the listing's verdict
+        return ""
+    mxid = answer.get("agent_mxid") if isinstance(answer, dict) else None
+    return mxid if isinstance(mxid, str) and _STRICT_MXID_RE.fullmatch(mxid) else ""
 
 
 def _identity_of(agent: Mapping[str, object]) -> dict:
@@ -805,6 +839,9 @@ def _validate_row(row: object, index: int) -> dict:
     for key in ("disabled", "parked"):
         if key in row and not isinstance(row[key], bool):
             raise SchemaError(f"connections.json: row {index} field {key} is not a boolean")
+    nb = row.get("not_before")
+    if nb is not None and (isinstance(nb, bool) or not isinstance(nb, int) or nb < 0):
+        raise SchemaError(f"connections.json: row {index} not_before is not an epoch second")
     keys = row.get("launch_keys", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) and _ENV_VAR_RE.match(k) for k in keys):
         raise SchemaError(f"connections.json: row {index} launch_keys is not a list of AG2_REMOTE_TOKEN_<INST> names")
@@ -1033,8 +1070,12 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
                    preview: Optional[dict] = None, fetch: Optional[Callable] = None,
                    resolver=None, getaddrinfo=None, workspace: Optional[Path] = None,
-                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None) -> "tuple[dict, bool]":
+                   vault=None, environ: Optional[Mapping[str, str]] = None, kill=None,
+                   skip_backlog: bool = False) -> "tuple[dict, bool]":
     """Save the token as a row once its gateway still answers to `expected_server`.
+
+    With `skip_backlog`, a row this call creates records `not_before` (now, epoch seconds): its
+    bridge settles every task stamped earlier unqueued (`backlog_reason`). An existing row keeps its own.
 
     Launch keys not yet in the record (`channel_launch_keys`) are imported first, under the instance
     their launcher already runs them as, so a token for one of their servers adopts that row instead
@@ -1108,6 +1149,8 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
                        identity=seen)
+            if skip_backlog:
+                row["not_before"] = int(time.time())
             rows.append(row)
             rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
@@ -1444,7 +1487,8 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
 
     In order: under the record lock, clear the row's `parked` flag and flip the primary to it, so
     `launch_env` gives its bridge the proactive room; stop the row's bridge if one runs (it was
-    launched as a secondary, without the room) and `start` it; wait up to `CONNECT_TIMEOUT_S` for
+    launched as a secondary, without the room) and `start` it, unless that bridge is already connected:
+    then it keeps running through the flip and the row carries `relaunch_needed`; wait up to `CONNECT_TIMEOUT_S` for
     that bridge's own status to show the gateway accepted its token; then, under one hold of the
     record lock, confirm the flip. The old owner's bridge (`_owner_row` before the flip) keeps
     running as a secondary unless `park`: then it is stopped by the stop path `disconnect` uses and
@@ -1481,8 +1525,10 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary:
-            undo["relaunched"] = bool(_stop_row(snapshot, workspace, kill))
+        if not was_primary and not _connected_bridge(snapshot, workspace):
+            # A stop that signals and then is refused has still taken it down: rollback restarts it.
+            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+            _stop_row(snapshot, workspace, kill)
         launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
@@ -1532,6 +1578,17 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                changed=parked is not None or bool(legacy_stopped) or was_parked or not was_primary,
                relaunch_needed=launch.get("lease") in ("already_running", "alias_running") and not was_primary)
     return out
+
+
+def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> int:
+    """The pid of the row's bridge when it holds the lease and its own status says connected; else 0."""
+    inst = str(row["instance"])
+    try:
+        pid = bridge_pid(inst, workspace)
+    except BridgeLeaseIndeterminate:
+        return 0
+    sidecar = _sidecar(inst, workspace)
+    return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
 def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:
@@ -2058,7 +2115,8 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"],
-                     "agent_mxid": r.get("agent_mxid") or ""})
+                     "agent_mxid": r.get("agent_mxid") or "",
+                     **({"not_before": r["not_before"]} if r.get("not_before") is not None else {})})
     for inst, var in env_token_vars(environ):
         if inst in seen_inst or var in seen_ref:
             continue
@@ -2142,8 +2200,30 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
+        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
     })
     return env
+
+
+# The bridge's intake reads its row's `not_before` here; empty when the row has none.
+NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+
+
+def backlog_reason(task: Mapping[str, object], not_before: object) -> Optional[str]:
+    """Why a task stamped before its connection's `not_before` is settled unqueued; None to deliver
+    it (no bound, or a timestamp that is missing or unreadable)."""
+    try:
+        bound = int(str(not_before).strip())
+    except ValueError:
+        return None
+    stamp = str(task.get("timestamp") or "").strip()
+    try:
+        at = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    if at.timestamp() >= bound:
+        return None
+    return f"backlog: stamped {stamp}, before this connection was added"
 
 
 def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
@@ -2158,20 +2238,79 @@ def _verified_agent(token: str, fetch=None, getaddrinfo=None) -> str:
     return mxid if isinstance(mxid, str) else ""
 
 
+def _learn_row_identity(row: Mapping[str, object], token_of: Callable, workspace: Optional[Path], *,
+                        fetch=None, getaddrinfo=None, whoami=None) -> Optional[bool]:
+    """Learn onto one enabled row that names no agent the identity its token (`token_of(row)`)
+    answers to; True when it learned one, False when it asked and did not, None when the row needs
+    no asking. The record is written only for a verified preview."""
+    if row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+        return None
+    try:
+        token = token_of(row)
+        if not token:
+            return False
+        seen = preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
+        if not seen.get("verified"):
+            return False
+        return bool(learn_identity(str(row["instance"]), seen, workspace=workspace).get("agent_mxid"))
+    except ConnectionsError:
+        return False
+
+
 def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace: Optional[Path], vault,
                             fetch=None, getaddrinfo=None) -> None:
-    """Learn onto a launchable named row that has no agent the identity its own token answers to."""
+    """Learn onto a launchable named row that has no agent the identity the token its bridge runs on
+    answers to; launch_env refuses the row that is still without one."""
     row = _row_named(instance, workspace)
-    if not instance or row is None or row.get("agent_mxid") or row.get("disabled") or row.get("parked"):
+    if not instance or row is None:
         return
-    ref = str(row["token_ref"])
-    token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
-    if not token:
-        return  # launch_env names the missing token
-    try:
-        learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo), workspace=workspace)
-    except ConnectionsError:
-        pass  # launch_env refuses the row that is still without one
+
+    def token_of(r):
+        ref = str(r["token_ref"])
+        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+    _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
+
+
+IDENTITY_LEARN_INTERVAL_S = 60.0
+IDENTITY_LEARN_MAX_BACKOFF_S = 3600.0
+
+
+def learn_missing_identities(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None,
+                             vault=None, fetch=None, getaddrinfo=None, whoami=None,
+                             backoff: Optional[dict] = None, clock: Callable[[], float] = time.monotonic,
+                             interval_s: float = IDENTITY_LEARN_INTERVAL_S) -> list:
+    """Learn, onto every enabled row that names no agent (the legacy row included), the identity its
+    own token answers to; the instances that learned one. With `backoff` (instance -> (due, delay)),
+    a row that did not learn waits twice as long each pass, up to `IDENTITY_LEARN_MAX_BACKOFF_S`."""
+    learned = []
+    for row in read_rows(workspace):
+        inst = str(row["instance"])
+        if backoff is not None and inst in backoff and clock() < backoff[inst][0]:
+            continue
+        got = _learn_row_identity(row, lambda r: connection_credential(r, environ, vault=vault)[1], workspace,
+                                  fetch=fetch, getaddrinfo=getaddrinfo, whoami=whoami)
+        if got:
+            learned.append(inst)
+        if backoff is not None:
+            if got is False:
+                delay = min(backoff[inst][1] * 2, IDENTITY_LEARN_MAX_BACKOFF_S) if inst in backoff else interval_s
+                backoff[inst] = (clock() + delay, delay)
+            else:
+                backoff.pop(inst, None)
+    return learned
+
+
+def run_identity_learner(stop_event, workspace: Optional[Path] = None, *,
+                         interval_s: float = IDENTITY_LEARN_INTERVAL_S, vault=None) -> None:
+    """Until `stop_event`: `learn_missing_identities` now, then every `interval_s`, each row that
+    did not learn backing off; never raises."""
+    backoff: dict = {}
+    while not stop_event.is_set():
+        try:
+            learn_missing_identities(workspace, vault=vault, backoff=backoff, interval_s=interval_s)
+        except Exception as e:  # noqa: BLE001 - a failed pass only waits for the next one
+            logging.getLogger(__name__).warning("connections: identity pass failed (%s)", type(e).__name__)
+        stop_event.wait(interval_s)
 
 
 def _agent_identity():
@@ -2201,6 +2340,13 @@ def _spawn(argv: list, env: dict, log_path: Path) -> "subprocess.Popen":
     return proc
 
 
+def _reap_when_done(child) -> None:
+    """Wait on a spawned bridge in the background, so its exit is reaped at once, not left a zombie."""
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        threading.Thread(target=wait, name=f"bridge-reaper-{child.pid}", daemon=True).start()
+
+
 def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
@@ -2213,6 +2359,9 @@ def _exited(pid: int) -> bool:
     if waitid is not None:
         try:  # an exited, unreaped child of this process: seen without reaping it
             if waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:
+            if _ps_zombie(pid):  # another process's child, exited and never reaped by its parent
                 return True
         except OSError:
             pass
@@ -2241,6 +2390,11 @@ def _zombie(pid: int) -> bool:
         return False
     else:
         return False
+    return _ps_zombie(pid)
+
+
+def _ps_zombie(pid: int) -> bool:
+    """Whether ps reads `pid` as a zombie; False when ps cannot answer."""
     ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
     try:
         out = subprocess.run([ps, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
@@ -2342,6 +2496,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
             pid = int(getattr(child, "pid", child))
             if hasattr(child, "poll"):
                 _CHILDREN[pid] = child
+                _reap_when_done(child)
             if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
                 return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
             lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
