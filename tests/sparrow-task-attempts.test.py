@@ -357,6 +357,23 @@ class Attempts(unittest.TestCase):
         self.assertTrue(a.finish("tsk_M", attempt), "a record read and moved on: nothing to retire")
         self.assertEqual(a.get("tsk_M")["wake_episode"], "ep2", "the newer wake is kept")
 
+    def test_an_unreadable_record_is_never_rewritten_and_its_item_is_unknown(self):
+        wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
+        for name in ("relay-task-attempts", "relay-wake-items"):
+            with self.subTest(name=name):
+                self.state = Path(tempfile.mkdtemp())
+                a = self.mk()
+                a.open_wake("tsk_X", wake)
+                a.record_ack("tsk_X", _ack(1))
+                a.finish("tsk_X")
+                path = self.state / f"{name}.json"
+                path.write_text("{x")
+                a.remember_task("tsk_Y", {"source_room_id": "!r:x"})
+                a.record_ack("tsk_Y", _ack(1))
+                a.sweep(set())
+                self.assertEqual(path.read_text(), "{x", "left as it was")
+                self.assertEqual(a.wake_item("tsk_X"), task_attempts.UNKNOWN)
+
     def test_a_wake_episode_runs_once_and_its_result_rides_its_own_item(self):
         a = self.mk(turn_context=True)
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}

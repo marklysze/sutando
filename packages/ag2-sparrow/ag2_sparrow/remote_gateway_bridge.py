@@ -4188,6 +4188,8 @@ def _own_copy_exists(tid: str) -> bool:
     """An archived copy of this attempt's own result. A woken attempt's is its own outbox item:
     the first attempt's copies are archived under the same id."""
     item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if item == task_attempts.UNKNOWN:
+        return True                             # unknown: never judged stopped with no reply
     if not item:
         return _delivered_copy_exists(tid)
     root = getattr(_delivery_core().backend, "root", None)
@@ -6213,6 +6215,8 @@ def _result_disposed(tid: str) -> bool:
     """This id's own result was archived or kept, or its own delivery succeeded;
     an alias is judged only by its own copies, never by its primary's record."""
     woken_item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if woken_item == task_attempts.UNKNOWN:
+        return False
     if woken_item:
         # The first attempt's copies are archived under this id; only the woken item decides.
         root = getattr(_delivery_core().backend, "root", None)
@@ -6228,6 +6232,8 @@ def _result_disposed(tid: str) -> bool:
 def _open_wake_unsettled(tid: str) -> bool:
     """A wake runs here under this id and its own result is not delivered yet."""
     item = _ATTEMPTS.wake_item(_broker_tid(tid)) if _ATTEMPTS is not None else None
+    if item == task_attempts.UNKNOWN:
+        return True
     if not item:
         return False
     root = getattr(_delivery_core().backend, "root", None)
@@ -7585,6 +7591,10 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     relay = _relay_result(tid, broker_tid)
     if relay is None:
         return False
+    woken_item = _ATTEMPTS.wake_item(broker_tid) if _ATTEMPTS is not None else None
+    if woken_item == task_attempts.UNKNOWN:
+        _log_backoff((tid, "attempt-unread"), f"result {tid}: held — its attempt records cannot be read")
+        return False
     attempt = _ATTEMPTS.get(broker_tid) if _ATTEMPTS is not None else None
     hold = _ATTEMPTS.result_hold(broker_tid) if _ATTEMPTS is not None else None
     if hold:
@@ -7643,7 +7653,6 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
     # A fold posts nothing either, so it closes an already-accepted id the same way.
-    woken_item = _ATTEMPTS.wake_item(broker_tid) if _ATTEMPTS is not None else None
     item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
     # The task's own result item only: a close of an id already accepted keeps today's policy.
     relay = relay and item_id == broker_tid

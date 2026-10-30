@@ -74,6 +74,8 @@ WAKE_TURN_RULE = (
     "again, starting it with `[no-send]` when there is nothing to post.")
 
 _MUTEX = threading.Lock()
+# wake_item() when its records cannot be read: no delivery is attempted and nothing is decided.
+UNKNOWN = "<unknown>"
 
 
 def http_error_code(e: urllib.error.HTTPError) -> "tuple[str, dict]":
@@ -144,15 +146,19 @@ class TaskAttempts:
         """A missing file is empty; None when the file is there but unreadable or malformed."""
         try:
             data = json.loads(path.read_text())
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             return {}
         except (OSError, ValueError):
             return None
         return data if isinstance(data, dict) else None
 
     def _update(self, wire_tid: str, **fields) -> dict:
+        """Merge `fields` into the record. An unreadable ledger is left as it is, never rewritten."""
         with _MUTEX:
-            data = self._load()
+            data = self._read_json(self.path)
+            if data is None:
+                self.log(f"task {wire_tid}: {self.path.name} unreadable — not written")
+                return {}
             rec = {**data.get(wire_tid, {}), **fields}
             data[wire_tid] = rec
             self._save(data)
@@ -522,11 +528,18 @@ class TaskAttempts:
 
     def wake_item(self, wire_tid: str) -> "str | None":
         """The outbox item for a woken attempt's result, distinct from the first attempt's: the open
-        wake's, else a settled wake's until its task leaves flight (its result may still be live)."""
-        episode = self.get(wire_tid).get("wake_episode")
+        wake's, else a settled wake's until its task leaves flight (its result may still be live).
+        UNKNOWN when the records that decide it cannot be read."""
+        data = self._read_json(self.path)
+        if data is None:
+            return UNKNOWN
+        episode = (data.get(wire_tid) or {}).get("wake_episode")
         if episode:
             return f"{wire_tid}.wake-{episode}"
-        item = self._load_json(self._wake_items_path).get(wire_tid)
+        items = self._read_json(self._wake_items_path)
+        if items is None:
+            return UNKNOWN
+        item = items.get(wire_tid)
         return item if isinstance(item, str) else None
 
     def close_finished_turns(self, live_wire_tids) -> int:
@@ -553,13 +566,13 @@ class TaskAttempts:
                 self._close_turn(p.stem)
                 closed += not p.exists()
         with _MUTEX:
-            data = self._load()
+            data = self._read_json(self.path) or {}
             stale = [t for t in data if t not in live]
             for t in stale:
                 data.pop(t)
             if stale:
                 self._save(data)
-            items = self._load_json(self._wake_items_path)
+            items = self._read_json(self._wake_items_path) or {}
             if any(t not in live for t in items):
                 self._save_json(self._wake_items_path, {t: i for t, i in items.items() if t in live})
         return closed
