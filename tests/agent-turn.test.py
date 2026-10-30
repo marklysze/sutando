@@ -421,6 +421,13 @@ class ResultFileDecision(unittest.TestCase):
                 self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
         state = Path(tempfile.mkdtemp())
         turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"))
+        failed = {"operation_id": f"op_{turn}_1", "operation_status": "failed", "turn_id": turn, "seq": 1}
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked",
+                                                 reconciled=[failed]).fields,
+                         {"status": "completed"}, "reconciliation shows the ask failed: nothing is open")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
         _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
         self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "the answer").fields,
                          {"status": "completed"}, "a lost message send is not a question")
