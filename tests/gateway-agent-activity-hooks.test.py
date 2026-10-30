@@ -259,7 +259,7 @@ class Hooks(unittest.TestCase):
         self.assertTrue(gw._deliver_result_payload("task-cap", "task-cap", "answer"), "a fence ends the wait")
         self.assertEqual(fake.posted("/v1/results"), [])
 
-    def test_a_held_result_whose_task_the_server_closed_is_settled_by_the_reconcile(self):
+    def test_a_held_result_is_settled_only_on_an_explicit_terminal_answer(self):
         gw._ATTEMPTS.record_ack("task-v2seen2", _ack("task-v2seen2", 1))
         tid = "task-held-closed"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
@@ -270,7 +270,13 @@ class Hooks(unittest.TestCase):
         self.assertFalse(gw._deliver_result_payload(tid, tid, "answer"), "held: its ack never answered")
         mock.patch.object(gw, "_last_ledger_reconcile", 0.0).start()
         gw._reconcile_ledger({tid})
-        self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "task_already_terminal")
+        self.assertIsNone(gw._ATTEMPTS.get(tid).get("fenced"), "absent from the outstanding list is not terminal")
+        self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "a reply the core may be writing is kept")
+        self.assertFalse(gw._deliver_result_payload(tid, tid, "answer"), "still held")
+        self.assertTrue(any(f"{tid} is not listed as outstanding" in m for m in self.logs))
+        fake.answers[f"/v1/tasks/{tid}/ack"] = _http(409, {"error_code": "task_already_terminal"})
+        self.assertFalse(gw._post_task_ack(tid, durable=True))
+        self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "task_already_terminal", "the broker said so")
         self.assertFalse((gw.TASKS_DIR / f"{tid}.txt").exists(), "its untaken file is withdrawn")
         self.assertEqual(self.controls(tid), [], "nothing for the core to stop")
         self.assertTrue(gw._deliver_result_payload(tid, tid, "answer"), "settled")
@@ -421,6 +427,13 @@ class Hooks(unittest.TestCase):
         self.assertEqual(gw._post_ack_first(tid, None), "stale")
         self.assertEqual(gw._ATTEMPTS.get(tid)["fenced"], "stale_execution_generation")
         self.assertEqual(self.controls(tid), [])
+
+    def test_with_the_lifecycle_off_a_wake_is_an_ordinary_task(self):
+        wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
+        with mock.patch.object(gw, "LIFECYCLE_V2", False):
+            self.assertIsNotNone(gw._write_task(_task("task-plain-wake", wake=wake)))
+        self.assertTrue((gw.TASKS_DIR / "task-plain-wake.txt").exists(), "written and acked as on main")
+        self.assertFalse(any("task-plain-wake: not handled" in m for m in self.logs))
 
     def test_a_wake_is_never_run_without_support_even_as_the_first_sight_of_its_id(self):
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": [
@@ -628,8 +641,9 @@ class Hooks(unittest.TestCase):
         clock[0] += 500
         self.assertFalse(self.beat(tid))
 
-    def held_in_queue(self, tid):
-        """A served, acked attempt whose task file is still queued."""
+    def held_in_queue(self, tid, motion="idle"):
+        """A served, acked attempt whose task file is still queued; the core reads `motion`."""
+        self.motion = mock.patch.object(gw, "_core_motion", return_value=motion).start()
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
         fake = self.use(FakeGateway(**{f"/v1/tasks/{tid}/ack": _ack(tid, 1), "/v1/results": {"ok": True}}))
         self.assertTrue(gw._post_task_ack(tid, durable=True))
@@ -652,10 +666,45 @@ class Hooks(unittest.TestCase):
         clock[0] += 1
         self.assertFalse(self.beat(tid), "no beat holds a task the core walked away from")
         self.assertEqual((gw.RESULTS_DIR / f"{tid}.txt").read_text(), gw.STALLED_RESULT)
-        self.assertTrue(any("then wrote no turn activity or result for 30 min" in m for m in self.logs))
+        self.assertTrue(any("then wrote no turn activity or result for 30 min and is not mid-turn" in m
+                            for m in self.logs))
         self.assertTrue(gw._deliver_result_payload(tid, tid, "stopped working", no_send=True))
         post = fake.posted("/v1/results")[0]
         self.assertEqual((post["status"], post["no_send"]), ("failed", True))
+
+    def test_a_core_mid_turn_on_a_long_tool_call_is_never_stalled(self):
+        tid = "task-long-tool"
+        _, clock = self.held_in_queue(tid, motion="moving")
+        self.row(tid, clock[0] + 5, "working")
+        clock[0] += 4 * gw.task_attempts.STALLED_UNOBSERVED_S
+        self.assertTrue(self.beat(tid), "still beating: the core reads mid-turn")
+        self.assertFalse((gw.RESULTS_DIR / f"{tid}.txt").exists(), "no failure posted over a live turn")
+        self.motion.return_value = "idle"
+        self.assertFalse(self.beat(tid), "once the core reads idle, the silence is an abandoned turn")
+
+    def test_with_no_reading_of_the_core_the_stall_waits_the_long_window(self):
+        tid = "task-unobserved"
+        _, clock = self.held_in_queue(tid, motion=None)
+        self.row(tid, clock[0] + 5, "working")
+        clock[0] += 5 + gw.task_attempts.STALLED_UNOBSERVED_S - 1
+        self.assertTrue(self.beat(tid))
+        clock[0] += 1
+        self.assertFalse(self.beat(tid))
+        self.assertTrue(any("for 120 min and is not mid-turn" in m for m in self.logs))
+
+    def test_the_core_motion_is_the_cores_own_reading(self):
+        cmd = mock.Mock()
+        cmd.row.return_value = {"motion": "unknown"}
+        with mock.patch.object(gw, "_HEALTH_COMMAND", cmd):
+            self.assertIsNone(gw._core_motion(), "Sparrow's own fill-in never counts as the core moving")
+            cmd.row.return_value = {"motion": "moving"}
+            self.assertEqual(gw._core_motion(), "moving")
+        with mock.patch.object(gw, "_HEALTH_COMMAND", None), \
+                mock.patch.object(gw, "_health_snapshot", return_value={"agents": [
+                    {"role": "core", "motion": "idle", "alive": True}]}):
+            self.assertEqual(gw._core_motion(), "idle")
+        with mock.patch.object(gw, "_HEALTH_COMMAND", None), mock.patch.object(gw, "_health_snapshot", return_value=None):
+            self.assertIsNone(gw._core_motion())
 
     def test_a_queued_task_the_core_never_took_up_keeps_beating(self):
         tid = "task-waiting-its-turn"
@@ -683,9 +732,16 @@ class Hooks(unittest.TestCase):
         self.assertIsNone(gw._write_if_absent(rfile, gw.DISPATCH_LOST_RESULT))
         self.assertEqual(rfile.read_text(), "the real answer")
         self.assertFalse(gw._write_if_absent(gw.RESULTS_DIR / "no-such-dir" / "task-x.txt", "x"))
-        with mock.patch.object(gw.os, "write", side_effect=OSError("disk full")):
-            self.assertTrue(gw._write_if_absent(gw.RESULTS_DIR / "task-y.txt", "x"), "created: the ledger rules")
-        (gw.RESULTS_DIR / "task-y.txt").unlink()
+        target = gw.RESULTS_DIR / "task-y.txt"
+        for fault in ("fsync", "link"):
+            with self.subTest(fault=fault), mock.patch.object(gw.os, fault, side_effect=OSError("disk full")):
+                self.assertFalse(gw._write_if_absent(target, "x"), "a failed write is a failure")
+            self.assertFalse(target.exists(), "no empty placeholder blocks the retry")
+        self.assertEqual([p.name for p in gw.RESULTS_DIR.iterdir() if p.name.startswith(".task-y")], [],
+                         "the temp file is gone")
+        self.assertTrue(gw._write_if_absent(target, "x"), "the retry writes it")
+        self.assertEqual(target.read_text(), "x")
+        target.unlink()
 
     def test_a_failure_result_that_cannot_be_written_is_retried_next_beat(self):
         tid = "task-lost-retry"
@@ -709,16 +765,29 @@ class Hooks(unittest.TestCase):
         self.use(FakeGateway(**{"/v1/tasks/active": {"tasks": [{"task_id": "task-srv"}], "next_cursor": None}}))
         mock.patch.object(gw, "_last_ledger_reconcile", 0.0).start()
         gw._reconcile_ledger({"task-h6"})
-        self.assertEqual(len(self.controls("task-h6")), 1)
+        self.assertEqual(self.controls("task-h6"), [], "not listed is not closed: the core is not stopped")
+        self.assertIsNone(gw._ATTEMPTS.get("task-h6").get("fenced"))
         listed = json.loads(gw.OUTSTANDING_TASKS_FILE.read_text())
         self.assertEqual([t["task_id"] for t in listed["tasks"]], ["task-srv"])
         self.assertTrue(any("not held here" in m for m in self.logs))
-        before = len(self.controls("task-h6"))
+        logged = sum("task-h6 is not listed" in m for m in self.logs)
         gw._reconcile_ledger({"task-h6"})
-        self.assertEqual(len(self.controls("task-h6")), before, "the cadence holds the next pass")
+        self.assertEqual(sum("task-h6 is not listed" in m for m in self.logs), logged, "the cadence holds the next pass")
         mock.patch.object(gw, "_last_ledger_reconcile", 0.0).start()
         self.use(FakeGateway(**{"/v1/tasks/active": _http(503, {"error_code": "task_api_unavailable"})}))
         gw._reconcile_ledger({"task-h6"})
+
+    def test_the_close_retry_runs_on_the_beat_cadence(self):
+        turn = gw._ATTEMPTS.record_ack("task-h9", _ack("task-h9", 1))["turn_id"]
+        mock.patch.object(gw, "_last_turn_close_pass", 0.0).start()
+        gw._retry_turn_closes({"task-h9"})
+        self.assertFalse(agent_turn.is_closed(gw._STATE, turn), "in flight: left open")
+        gw._retry_turn_closes(set())
+        self.assertFalse(agent_turn.is_closed(gw._STATE, turn), "the cadence holds the next pass")
+        mock.patch.object(gw, "_last_turn_close_pass", 0.0).start()
+        gw._retry_turn_closes(set())
+        self.assertTrue(agent_turn.is_closed(gw._STATE, turn))
+        self.assertTrue(any("finished turn file(s)" in m for m in self.logs))
 
     def test_turns_whose_task_left_flight_are_closed_at_start(self):
         turn = gw._ATTEMPTS.record_ack("task-h7", _ack("task-h7", 1))["turn_id"]
