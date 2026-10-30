@@ -331,6 +331,7 @@ class Attempts(unittest.TestCase):
         rule = task_attempts.ask_in_room_rule("tsk_A")
         self.assertIn("top-level `task_id` `tsk_A`", rule)
         self.assertIn("`room.question.ask`", rule)
+        self.assertIn("goes to the owner's DM with `ask-owner.py`", rule, "the same audience test as a reply")
         self.assertNotIn("~", rule)
 
     def test_the_ask_in_room_rule_sends_visible_text_before_asking(self):

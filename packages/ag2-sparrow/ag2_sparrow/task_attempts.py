@@ -54,7 +54,10 @@ WAKE_EPISODES_KEPT = 20
 _EPISODE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Kept in one place so its wording and placement can change together.
 ASK_IN_ROOM_RULE = (
-    "For a question that blocks THIS task, ask it in this task's room: call `room.action.execute` "
+    "For a question that blocks THIS task, ask it in this task's room when everyone there should "
+    "read it; a question about something the owner asked for themselves (their own errand, or "
+    "data from their accounts or device) goes to the owner's DM with `ask-owner.py` instead, even "
+    "from a shared room. To ask in the room: call `room.action.execute` "
     "with action `room.question.ask`, top-level `task_id` `{task_id}`, and `arguments` `prompt` "
     "(plus `options` when the answer is a choice). Anything the room should read besides the "
     "question, send first with `room.message.send`. Then write this task's result file with a "

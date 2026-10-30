@@ -445,6 +445,10 @@ def result_file_decision(records: TurnRecords, body: str, *, no_send: bool = Fal
         return ResultDecision(DEFER, {}, "a journal line is still being written")
     if verdict.outcome == DURABLY_SUSPENDED:
         return ResultDecision(POST, {"status": "waiting_input", "no_send": True}, verdict.reason)
+    if any(i.get("action") == "room.question.ask" for i in unmatched_intents(records)):
+        # The note says "I asked X": never the final reply. A broker with no open question refuses it.
+        return ResultDecision(POST, {"status": "waiting_input", "no_send": True},
+                              "a question was asked and its outcome is unknown")
     if no_send:
         return ResultDecision(POST, {"status": "no_action_needed"}, "result marked no-send")
     if not records.readable:
