@@ -78,8 +78,6 @@ _MUTEX = threading.Lock()
 # An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
 # it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
-# A record without it predates generation-stamped debts: it is held untouched until migrated.
-SCHEMA = 2
 # Work a record owes until it is done; each is stamped with the generation it belongs to.
 DEBTS = ("owed_ctl", "owed_close", "dispatch_lost")
 
@@ -113,7 +111,9 @@ class TaskAttempts:
         self.turn_context = turn_context
         self.log = log
         self.now = now
-        self.path = self.state_dir / f"relay-task-attempts{suffix}.json"
+        self.path = self.state_dir / f"relay-task-attempts-v2{suffix}.json"
+        # An earlier bridge's ledger, in a shape this one does not read: its attempts are not resumed.
+        self._superseded_path = self.state_dir / f"relay-task-attempts{suffix}.json"
         self._worker_path = self.state_dir / f"relay-lease-worker-id{suffix}"
         self._wakes_path = self.state_dir / f"relay-wake-episodes{suffix}.json"
         # A settled wake's outbox item, kept until its task leaves flight: its result is archived after.
@@ -123,6 +123,11 @@ class TaskAttempts:
         self._worker_id: "str | None" = None
         # Held across every read -> effect outside the ledger -> write of one transition.
         self.lock = threading.RLock()
+
+    def report_superseded(self) -> None:
+        if os.path.lexists(self._superseded_path):
+            self.log(f"{self._superseded_path.name} is from an earlier bridge and is ignored; "
+                     "its attempts are not resumed")
 
     # ── storage ──────────────────────────────────────────────────────────
     def _load(self) -> dict:
@@ -183,7 +188,7 @@ class TaskAttempts:
             if old is UNKNOWN:
                 self.log(f"task {wire_tid}: its attempt record is not a record — not written")
                 return {}, False
-            rec = {**(old or {"schema": SCHEMA}), **fields}
+            rec = {**(old or {}), **fields}
             for k in DEBTS:
                 if isinstance(fields.get(k), dict) and "gen" not in fields[k]:
                     rec[k] = {**fields[k], "gen": rec.get("execution_generation")}
@@ -391,8 +396,8 @@ class TaskAttempts:
         return None if data is None else {t for t, r in data.items() if r is UNKNOWN or _owes(r)}
 
     def holds(self, wire_tid: str) -> bool:
-        """Whether this attempt must stay in flight: it beats, owes work, awaits its migration or
-        cannot be read. Unknown is never released."""
+        """Whether this attempt must stay in flight: it beats, owes work or cannot be read. Unknown is
+        never released."""
         rec = self.entry(wire_tid)
         if rec is UNKNOWN:
             return True
@@ -616,9 +621,6 @@ class TaskAttempts:
             return None
         rec = rec or {}
         if rec.get("wake_episode") != episode:
-            if rec and rec.get("schema") != SCHEMA:
-                self.log(f"task {wire_tid}: wake {episode} not run, its record awaits its migration")
-                return None
             if not retract(rec):
                 return None
             # A new wake is a new turn: nothing of an earlier attempt's lease or turn carries over.
@@ -633,7 +635,7 @@ class TaskAttempts:
                 if cur is UNKNOWN:
                     self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
                     return None
-                data[wire_tid] = {**(cur or {"schema": SCHEMA}), "wake_episode": episode,
+                data[wire_tid] = {**(cur or {}), "wake_episode": episode,
                                   "turn_id": None, "issued_at": None, "execution_generation": None,
                                   "fenced": None, "published_at": None, "hold_reported": None}
                 if not self._save(data):
@@ -829,11 +831,8 @@ def same_serve(rec: dict, lease: "str | None") -> bool:
 
 def owns_result(rec: dict, identity) -> bool:
     """Whether the result file with `identity` is the failure this attempt's record wrote: the
-    record names the file it created, so a core answer is never taken for it, whatever its text.
-    A boolean marker predates that and claims any result, as it did then, until it is migrated."""
+    record names the file it created, so a core answer is never taken for it, whatever its text."""
     lost = rec.get("dispatch_lost")
-    if lost is True:
-        return True
     return (isinstance(lost, dict) and identity is not None and lost.get("file") == list(identity)
             and lost.get("gen") == rec.get("execution_generation"))
 
@@ -847,9 +846,8 @@ def taken_ids(rec: dict) -> "list[str]":
 
 
 def _owes(rec) -> bool:
-    """Owed work, a taken cancel still watched, or a record awaiting its migration."""
-    return isinstance(rec, dict) and (any(rec.get(k) for k in DEBTS) or bool(rec.get("taken_ctl"))
-                                      or (bool(rec) and rec.get("schema") != SCHEMA))
+    """Owed work, or a taken cancel still watched."""
+    return isinstance(rec, dict) and (any(rec.get(k) for k in DEBTS) or bool(rec.get("taken_ctl")))
 
 
 # What one attempt is: a record that differs in any of these has moved on to another attempt.

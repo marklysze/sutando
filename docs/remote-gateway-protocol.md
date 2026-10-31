@@ -432,6 +432,9 @@ Sutando checkout around it sends neither field.
   task id is not retired while its pin is held, so the results directory must support hard links.
   When a newer generation is acked, an earlier generation's failure result that was published but
   never sent is taken back from the outbox; an ack that finds it sending is retried.
+- The attempt ledger is `state/relay-task-attempts-v2.json`. The `relay-task-attempts.json` an
+  earlier bridge wrote is not read or upgraded; start logs that it is ignored, and attempts in
+  flight across that upgrade are not resumed.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room

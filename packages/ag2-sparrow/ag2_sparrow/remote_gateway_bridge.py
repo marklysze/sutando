@@ -357,7 +357,6 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from . import task_attempts
-from . import task_attempt_migrations
 from . import task_hold
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
@@ -4075,8 +4074,8 @@ def _record_attempt(wire_tid: str, doc, open_turn: bool = True, lease: "str | No
     gen = gen if type(gen) is int and gen >= 1 else None
     with _ATTEMPTS.lock:
         before = _ATTEMPTS.entry(wire_tid)
-        if before is task_attempts.UNKNOWN or (before and before.get("schema") != task_attempts.SCHEMA):
-            return False                        # unknown, or awaiting its migration: held
+        if before is task_attempts.UNKNOWN:
+            return False
         if not before or not task_attempts.same_serve(before, lease):
             _log(f"task {wire_tid}: ack for a serve this attempt no longer holds — not recorded")
             return True
@@ -4277,23 +4276,6 @@ def _hold_in_flight(inflight: "set[str]", tids: "set[str]") -> bool:
         return True
 
 
-def _legacy_failure(wire_tid: str) -> "tuple[str, list | None]":
-    """For a record migrated from a boolean failure marker: the failure body it owes, and the result
-    file it already wrote when the live result is one of the bridge's own failure bodies."""
-    path = RESULTS_DIR / f"{_local_tid(wire_tid)}.txt"
-    try:
-        data, identity = identity_of(path)
-    except FileNotFoundError:
-        return DISPATCH_LOST_RESULT, None
-    except OSError as e:
-        raise task_attempt_migrations.Unknown(path.name) from e
-    body = ready_body_of(data)
-    for own in (DISPATCH_LOST_RESULT, STALLED_RESULT, STALE_CANCEL_RESULT):
-        if body == ready_body_of(own.encode("utf-8")):
-            return own, list(identity)
-    return DISPATCH_LOST_RESULT, None
-
-
 def _settle_owed(wire_tid: str) -> None:
     """Carry out what a saved fence, Stop or failure still owes, as one transition under the attempts
     lock: no ack, wake or retirement moves the record between the read, the effect and the marker's
@@ -4306,7 +4288,7 @@ def _settle_owed(wire_tid: str) -> None:
 
 def _settle_current(wire_tid: str) -> None:
     rec, tid = _ATTEMPTS.entry(wire_tid), _local_tid(wire_tid)
-    if not isinstance(rec, dict) or rec.get("schema") != task_attempts.SCHEMA or rec.get("awaiting_ack"):
+    if not isinstance(rec, dict) or rec.get("awaiting_ack"):
         return
     gen = rec.get("execution_generation")
 
@@ -4518,21 +4500,19 @@ def _own_copy_exists(tid: str) -> bool:
 
 
 def _close_stale_turns(inflight: "set[str]") -> None:
-    """At start, before anything settles or sweeps: migrate older records, then bring back into
-    flight every attempt still live on disk (its task file queued or its result waiting; every
-    attempt when the in-flight set could not be read), then settle owed work and retire what left
-    flight. Unknown retires nothing: an unreadable ledger or in-flight set, a migration that did
-    not commit, or a recovery that could not be saved. Runs before any worker thread starts."""
+    """At start, before anything settles or sweeps: bring back into flight every attempt still live
+    on disk (its task file queued or its result waiting; every attempt when the in-flight set could
+    not be read), then settle owed work and retire what left flight. Unknown retires nothing: an
+    unreadable ledger or in-flight set, or a recovery that could not be saved. Runs before any
+    worker thread starts."""
     if _ATTEMPTS is None:
         return
+    _ATTEMPTS.report_superseded()
     records = _ATTEMPTS.records()
     live = None if records is None else _live_on_disk({_local_tid(w) for w in records})
     if live is None:
-        _log("attempt ledger, task queue or results unreadable — nothing migrated, settled or "
-             "retired at start")
+        _log("attempt ledger, task queue or results unreadable — nothing settled or retired at start")
         return
-    migrated = task_attempt_migrations.migrate(
-        _ATTEMPTS, TASKS_DIR, local_tid=_local_tid, failure_of=_legacy_failure, log=_log)
     live = (set(map(_local_tid, records)) if _INFLIGHT_DEGRADED else live) - inflight
     if live:
         if not _hold_in_flight(inflight, live):
@@ -4541,7 +4521,7 @@ def _close_stale_turns(inflight: "set[str]") -> None:
             return
         _log(f"attempts still live brought back in flight: {', '.join(sorted(live))}")
     _settle_ledger(inflight)
-    if migrated is not True or _INFLIGHT_DEGRADED:
+    if _INFLIGHT_DEGRADED:
         _log("attempt records not all known — no attempt or turn retired at start")
         return
     closed = _ATTEMPTS.sweep({_broker_tid(t) for t in inflight})

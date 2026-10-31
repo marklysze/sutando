@@ -17,7 +17,7 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"
 sys.path.insert(0, str(PKG_ROOT))
 
-from ag2_sparrow import agent_turn, task_attempt_migrations, task_attempts  # noqa: E402
+from ag2_sparrow import agent_turn, task_attempts  # noqa: E402
 from ag2_sparrow.delivery_core import contract, provider_ag2space
 
 DeliveryOutcome, AG2SpaceResultProvider = contract.DeliveryOutcome, provider_ag2space.AG2SpaceResultProvider
@@ -104,7 +104,7 @@ class Attempts(unittest.TestCase):
         a.mark_dispatch_lost("tsk_A", "failed")
         a._set("tsk_A", owed_close={"why": "closed"})
         rec = a.get("tsk_A")
-        self.assertEqual((rec["schema"], rec["dispatch_lost"]["gen"], rec["owed_close"]["gen"]), (2, 1, 1))
+        self.assertEqual((rec["dispatch_lost"]["gen"], rec["owed_close"]["gen"]), (1, 1))
         self.assertEqual(a.owing(), {"tsk_A"})
         a.record_ack("tsk_A", _ack(2))
         rec = a.get("tsk_A")
@@ -119,210 +119,25 @@ class Attempts(unittest.TestCase):
         a.sweep(set())
         self.assertEqual((bool(a.get("tsk_A")), bool(a.get("tsk_B"))), (True, False))
 
-    def migrate(self, a, failure=("body", None)):
-        return task_attempt_migrations.migrate(
-            a, self.tasks, local_tid=lambda t: t, failure_of=lambda t: failure,
-            log=self.logs.append)
-
-    @property
-    def tasks(self):
-        d = self.state / "tasks"
-        d.mkdir(exist_ok=True)
-        return d
-
-    def queue_ctl(self, ctl, target, suffix=".txt"):
-        (self.tasks / f"{ctl}{suffix}").write_text(task_attempts.cancel_task_text(target, ctl, "t", "why"))
-
-    def test_base_records_are_migrated_once(self):
+    def test_an_earlier_bridges_ledger_is_ignored_and_reported(self):
+        old = {"tsk_A": {"execution_generation": 1, "dispatch_lost": True, "stop_requested": True}}
+        (self.state / "relay-task-attempts.json").write_text(json.dumps(old))
         a = self.mk()
-        a.path.write_text(json.dumps({
-            "lost": {"execution_generation": 1, "dispatch_lost": True},
-            "stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None},
-            "stale": {"execution_generation": 1, "fenced": "stale_execution_generation"},
-            "closed": {"execution_generation": 1, "fenced": "task_not_found"},
-            "done": {"execution_generation": 1, "fenced": "cancel_confirmed"}}))
-        self.assertTrue(a.holds("done"), "held untouched until migrated")
-        self.assertTrue(self.migrate(a, failure=("body of lost", None)))
-        got = a._load()
-        self.assertEqual(got["lost"]["dispatch_lost"], {"body": "body of lost", "gen": 1, "file": None})
-        # A control the record does not name, and none queued or claimed: it may have run already.
-        self.assertEqual((got["stop"]["stop_ctl"], got["stop"].get("owed_ctl")), (None, None))
-        self.assertEqual((got["stale"]["fence_ctl"], got["stale"].get("owed_ctl")), (None, None))
-        self.assertEqual(list(self.tasks.iterdir()), [], "no cancel is minted")
-        self.assertEqual(got["closed"]["owed_close"]["gen"], 1)
-        self.assertFalse(task_attempts._owes(got["done"]), "a confirmed cancel owes nothing")
-        self.assertTrue(self.migrate(a), "idempotent")
-        self.assertEqual(a._load(), got)
+        self.assertEqual((a.records(), a.holds("tsk_A")), ({}, False), "nothing of it is read")
+        a.report_superseded()
+        self.assertIn("relay-task-attempts.json is from an earlier bridge and is ignored", self.logs[-1])
+        a.record_ack("tsk_A", _ack(1))
+        self.assertEqual(json.loads((self.state / "relay-task-attempts.json").read_text()), old, "never written")
 
-    def test_a_control_the_base_queued_but_never_recorded_is_adopted_or_retired(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({
-            "stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None},
-            "closed": {"execution_generation": 1, "fenced": "task_already_terminal"},
-            "moved": {"execution_generation": 2, "fence_ctl": None},
-            "claimed": {"execution_generation": 2}}))
-        self.queue_ctl("task-ctl-1-aaaaaa", "stop")
-        self.queue_ctl("task-ctl-2-bbbbbb", "closed")
-        self.queue_ctl("task-ctl-3-cccccc", "moved")
-        self.queue_ctl("task-ctl-4-dddddd", "claimed", ".claimed-core1")
-        self.assertTrue(self.migrate(a))
-        got = a._load()
-        self.assertEqual((got["stop"]["stop_ctl"], got["stop"].get("owed_ctl")), ("task-ctl-1-aaaaaa", None),
-                         "the Stop's own control is adopted, not written twice")
-        self.assertEqual((got["closed"]["fence_ctl"], got["closed"].get("owed_close")), ("task-ctl-2-bbbbbb", None))
-        self.assertFalse((self.tasks / "task-ctl-3-cccccc.txt").exists(), "a control no state explains is withdrawn")
-        self.assertEqual(got["moved"].get("taken_ctl"), None)
-        self.assertEqual(got["claimed"]["taken_ctl"], ["task-ctl-4-dddddd"], "one the core claimed is watched")
-        self.assertEqual(sorted(p.name for p in self.tasks.iterdir()),
-                         ["task-ctl-1-aaaaaa.txt", "task-ctl-2-bbbbbb.txt", "task-ctl-4-dddddd.claimed-core1"])
+    def test_a_boolean_failure_marker_claims_no_result(self):
+        self.assertFalse(task_attempts.owns_result({"dispatch_lost": True, "execution_generation": 1}, (1, 2)))
 
-    def test_a_migration_that_does_not_commit_reports_it_and_changes_nothing(self):
-        a = self.mk()
-        base = {"stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None}}
-        a.path.write_text(json.dumps(base))
-        with unittest.mock.patch.object(a, "_save", return_value=False):
-            self.assertIs(self.migrate(a), False)
-        self.assertEqual(a._load(), base)
-        self.assertTrue(a.holds("stop"))
-        self.assertEqual(a.sweep(set()), 0)
-        self.assertEqual(a._load(), base, "a record awaiting its migration is never swept")
-
-    def test_an_unreadable_ledger_is_unknown_and_held(self):
-        a = self.mk()
-        a.path.write_text("{not json")
-        self.assertIsNone(self.migrate(a))
-        self.assertIsNone(a.owing())
-        self.assertTrue(a.holds("tsk_A"), "unknown is not released")
-        self.assertEqual(a.path.read_text(), "{not json")
-
-    def test_a_queue_that_cannot_be_read_leaves_the_records_unmigrated(self):
-        a = self.mk()
-        base = {"stop": {"execution_generation": 1, "stop_requested": True, "stop_ctl": None}}
-        a.path.write_text(json.dumps(base))
-        queue = self.state / "queue"
-
-        def migrate():
-            return task_attempt_migrations.migrate(a, queue, local_tid=lambda t: t,
-                                                   failure_of=lambda t: ("b", None), log=self.logs.append)
-        queue.write_text("not a directory")
-        self.assertIsNone(migrate(), "a queue that is a file cannot be read")
-        queue.unlink()
-        (queue / "task-ctl-1-aaaaaa.txt").mkdir(parents=True)
-        self.assertIsNone(migrate(), "nor one whose control cannot be read")
-        self.assertEqual(a._load(), base)
-        (queue / "task-ctl-1-aaaaaa.txt").rmdir()
-        queue.rmdir()
-        self.assertTrue(migrate(), "no queue at all: nothing can be live")
-
-    def test_a_control_that_cannot_be_withdrawn_stops_the_migration(self):
-        a = self.mk()
-        base = {"moved": {"execution_generation": 2}}
-        a.path.write_text(json.dumps(base))
-        self.queue_ctl("task-ctl-5-eeeeee", "moved")
-        (self.tasks / ".task-ctl-5-eeeeee.withdrawn" / "x").mkdir(parents=True)  # the aside is taken
-        self.assertIs(self.migrate(a), False)
-        self.assertEqual(a._load(), base)
-        self.assertTrue((self.tasks / "task-ctl-5-eeeeee.txt").exists())
-
-    def test_a_control_claimed_while_the_queue_is_scanned_is_found_under_its_new_name(self):
-        for move in ("claimed", "answered"):
-            with self.subTest(move=move):
-                a = self.mk()
-                a.path.write_text(json.dumps({move: {"execution_generation": 2}}))
-                ctl = f"task-ctl-6-ffffff-{move}"
-                self.queue_ctl(ctl, move)
-                real = Path.read_text
-
-                def read(path, *args, _ctl=ctl, _move=move, **kw):
-                    if path.name == f"{_ctl}.txt":
-                        if _move == "claimed":
-                            path.rename(path.with_name(f"{_ctl}.claimed-core1"))
-                        else:
-                            path.unlink()
-                    return real(path, *args, **kw)
-                with unittest.mock.patch.object(Path, "read_text", read):
-                    self.assertTrue(self.migrate(a))
-                self.assertEqual(a.get(move).get("taken_ctl"), [ctl] if move == "claimed" else None,
-                                 "a control the core claimed mid-scan is watched, never missed")
-
-    def test_a_named_instance_control_is_found(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"stop": {"execution_generation": 1, "stop_requested": True,
-                                               "stop_ctl": None}}))
-        self.queue_ctl("task-ctl-1793-a1b2c3-dev_blue", "stop")
-        self.assertTrue(self.migrate(a))
-        self.assertEqual((a.get("stop")["stop_ctl"], a.get("stop").get("owed_ctl")),
-                         ("task-ctl-1793-a1b2c3-dev_blue", None), "adopted, not doubled")
-
-    def test_a_withdrawn_cancel_that_cannot_be_cleaned_up_never_fails_the_start(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"moved": {"execution_generation": 2}}))
-        self.queue_ctl("task-ctl-8-aaaaaa", "moved")
-        real = Path.unlink
-
-        def unlink(path, *args, **kw):
-            if path.name.endswith(".withdrawn"):
-                raise PermissionError(path)
-            return real(path, *args, **kw)
-        with unittest.mock.patch.object(Path, "unlink", unlink):
-            self.assertTrue(self.migrate(a))
-        self.assertTrue(any("left in place" in m for m in self.logs))
-
-    def test_a_live_result_that_cannot_be_read_stops_the_migration(self):
-        a = self.mk()
-        base = {"lost": {"execution_generation": 1, "dispatch_lost": True}}
-        a.path.write_text(json.dumps(base))
-
-        def unreadable(t):
-            raise task_attempt_migrations.Unknown(t)
-        self.assertIsNone(task_attempt_migrations.migrate(
-            a, self.tasks, local_tid=lambda t: t, failure_of=unreadable,
-            log=self.logs.append))
-        self.assertEqual(a._load(), base)
-
-    def test_a_control_the_record_already_names_is_left_as_it_is(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"stale": {"execution_generation": 1, "fenced": "stale_execution_generation",
-                                                "fence_ctl": "task-ctl-9-aaaaaa"}}))
-        self.queue_ctl("task-ctl-9-aaaaaa", "stale")
-        self.assertTrue(self.migrate(a))
-        self.assertTrue((self.tasks / "task-ctl-9-aaaaaa.txt").exists(), "its own control, not withdrawn")
-        self.assertEqual(a.get("stale")["fence_ctl"], "task-ctl-9-aaaaaa")
-
-    def test_a_control_assigned_to_a_core_is_found(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"moved": {"execution_generation": 2}}))
-        self.queue_ctl("task-ctl-10-bbbbbb", "moved", ".assigned-core2")
-        self.assertTrue(self.migrate(a))
-        self.assertEqual(a.get("moved")["taken_ctl"], ["task-ctl-10-bbbbbb"])
-
-    def test_a_queue_whose_workspace_is_missing_is_unknown(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"stop": {"execution_generation": 1, "stop_requested": True}}))
-        self.assertIsNone(task_attempt_migrations.migrate(
-            a, self.state / "gone" / "tasks", local_tid=lambda t: t,
-            failure_of=lambda t: ("b", None), log=self.logs.append), "an unmounted workspace is not empty")
-
-    def test_older_marker_shapes_carry_the_records_generation(self):
-        a = self.mk()
-        a.path.write_text(json.dumps({"t": {
-            "execution_generation": 3, "dispatch_lost": 1, "owed_close": "closed",
-            "owed_ctl": {"id": "task-ctl-7-a", "reason": "r"}}}))
-        self.assertTrue(self.migrate(a))
-        rec = a.get("t")
-        self.assertEqual((rec["dispatch_lost"], rec["owed_close"], rec["owed_ctl"]["gen"]),
-                         (None, {"why": "closed", "gen": 3}, 3))
-
-    def test_the_migration_lives_apart_from_the_live_writer(self):
-        live = (PKG_ROOT / "ag2_sparrow" / "task_attempts.py").read_text()
-        for word in ("def upgrade", "def _upgraded", "CLOSED_FENCES", "dispatch_lost is True or"):
-            self.assertNotIn(word, live)
-        bridge = (PKG_ROOT / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-        self.assertEqual(bridge.count("task_attempt_migrations.migrate("), 1)
-        start = bridge[bridge.index("def _close_stale_turns"):]
-        start = start[:start.index("\ndef ")]
-        self.assertLess(start.index("task_attempt_migrations.migrate("), start.index("_settle_ledger("))
-        self.assertLess(start.index("_settle_ledger("), start.index(".sweep("))
+    def test_no_attempt_migration_is_left(self):
+        self.assertFalse((PKG_ROOT / "ag2_sparrow" / "task_attempt_migrations.py").exists())
+        for name in ("task_attempts.py", "remote_gateway_bridge.py"):
+            src = (PKG_ROOT / "ag2_sparrow" / name).read_text()
+            for word in ("task_attempt_migrations", "SCHEMA", '"schema"', "_legacy_failure"):
+                self.assertNotIn(word, src, name)
 
     def test_finish_keeps_a_record_that_moved_to_another_generation(self):
         a = self.mk()
@@ -552,7 +367,7 @@ class Attempts(unittest.TestCase):
 
     def test_a_wake_attempt_is_retired_only_after_its_identity_is_saved(self):
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
-        for failing in ("relay-wake-items", "relay-wake-episodes", "relay-task-attempts"):
+        for failing in ("relay-wake-items", "relay-wake-episodes", "relay-task-attempts-v2"):
             with self.subTest(failing=failing):
                 self.state = Path(tempfile.mkdtemp())
                 a = self.mk()
@@ -573,7 +388,7 @@ class Attempts(unittest.TestCase):
 
     def test_an_unreadable_record_is_never_read_as_a_moved_attempt(self):
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
-        for name in ("relay-task-attempts", "relay-wake-episodes", "relay-wake-items"):
+        for name in ("relay-task-attempts-v2", "relay-wake-episodes", "relay-wake-items"):
             for broken in ("malformed", "unreadable", "not-a-dict"):
                 with self.subTest(name=name, broken=broken):
                     self.state = Path(tempfile.mkdtemp())
@@ -606,7 +421,7 @@ class Attempts(unittest.TestCase):
 
     def test_an_unreadable_record_is_never_rewritten_and_its_item_is_unknown(self):
         wake = {"blocker_episode_id": "ep1", "resolved_blockers": []}
-        for name in ("relay-task-attempts", "relay-wake-items"):
+        for name in ("relay-task-attempts-v2", "relay-wake-items"):
             with self.subTest(name=name):
                 self.state = Path(tempfile.mkdtemp())
                 a = self.mk()
@@ -630,7 +445,7 @@ class Attempts(unittest.TestCase):
         a.fence("tsk_C", {"error_code": "task_cancelled"})
         real = a._save_json
         no_ledger = unittest.mock.patch.object(a, "_save_json", side_effect=lambda p, d: (
-            False if p.name.startswith("relay-task-attempts") else real(p, d)))
+            False if p.name.startswith("relay-task-attempts-v2") else real(p, d)))
         with no_ledger:
             self.assertFalse(a.ack_settled("tsk_L"))
             self.assertFalse(a.mark_dispatch_lost("tsk_S", "failed"))
@@ -642,7 +457,7 @@ class Attempts(unittest.TestCase):
         self.assertTrue(a.cancel_ack("tsk_C"))
         self.assertTrue(a.ack_settled("tsk_L"))
         self.assertEqual(a.fence("tsk_S", {"error_code": "stale_execution_generation"})["new"], True)
-        (self.state / "relay-task-attempts.json").write_text("{x")
+        (self.state / "relay-task-attempts-v2.json").write_text("{x")
         self.assertFalse(a.ack_settled("tsk_L"), "unreadable is not settled")
 
     def test_a_legacy_ack_wait_that_cannot_be_ended_still_holds(self):
