@@ -378,7 +378,7 @@ Sutando checkout around it sends neither field.
   either ack path carrying a fencing `error_code` (`stale_execution_generation`, `task_cancelled`,
   `task_not_found`, `task_already_terminal`, on a 404 or a 409) fences the attempt, retires its
   pending ack and, for a published task, stops the core (below) — except a stale older lease
-  when a newer serve of the same task is pending here, which that serve's ack decides.
+  when a newer serve of the same task is held here, which that serve's ack decides.
 - **`POST /v1/tasks/heartbeat`** `{worker_id, tasks:[{task_id, worker_id, execution_generation}]}`
   is sent every 15 s for every attempt with a generation, for as long as the bridge holds it, even
   while the client heartbeat (60 s) is backing off: it is the only way a Stop reaches a running
@@ -392,9 +392,7 @@ Sutando checkout around it sends neither field.
   dropping it as completed elsewhere. A
   `task_errors` entry of `stale_execution_generation`, `task_not_found` or
   `task_already_terminal` fences the attempt (its result is settled, never posted), and the first
-  also stops the core. That stop is withdrawn, if the core has not taken it yet, when a newer
-  generation of the task is acked here. If the core took it already, the newer attempt it then
-  leaves with no result and no queued task file is posted as `status: failed` with `no_send`. The other
+  also stops the core. A stop names the local run it is for, so it never stops a later run. The other
   two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
   broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
@@ -407,7 +405,7 @@ Sutando checkout around it sends neither field.
   only if it has taken it up), and it is cancel-acked at once. A 404 disables the per-task beat.
 - **Results** add `execution_generation` and `worker_id`; a fenced attempt's result is settled
   without a post. A result written before its task's ack named the lease waits for it. On a broker that has
-  ever named a lease (`state/relay-broker-contract.json`) it keeps waiting, until the ack lands,
+  ever named a lease (recorded in the ledger) it keeps waiting, until the ack lands,
   the attempt is fenced, or the server closes the task; on one never seen to, it waits 120 s and
   is then posted without lease fields, still gated on the journal records that name the task. A
   task served again before its ack keeps its first publication time as the journal boundary. A result answered `409 task_already_terminal | stale_execution_generation |
@@ -421,20 +419,40 @@ Sutando checkout around it sends neither field.
   run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
   here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
   ordinary task, as before.
-- With `REMOTE_TASK_LIFECYCLE_V2=1`, each serve records its `lease_id` with the attempt, and an ack's
-  answer (accepted, `not leased`, or a fencing refusal) or a beat's error acts on the attempt only
-  while it still holds that serve; an answer about an earlier serve changes nothing. An attempt
-  awaiting a newer serve's ack does not beat.
-- With `REMOTE_TASK_LIFECYCLE_V2=1`, the result drain first pins the file it will deliver as a hard
-  link under `results/.delivering/`, and every step of that delivery (attachments, Stop, settle,
-  publish) uses the pinned bytes. A reply written at the result's name after that is a new result;
-  one that arrives after the task's lease closed is kept in `results/undelivered/` for review. A
-  task id is not retired while its pin is held, so the results directory must support hard links.
-  When a newer generation is acked, an earlier generation's failure result that was published but
-  never sent is taken back from the outbox; an ack that finds it sending is retried.
-- The attempt ledger is `state/relay-task-attempts-v2.json`. The `relay-task-attempts.json` an
-  earlier bridge wrote is not read or upgraded; start logs that it is ignored, and attempts in
-  flight across that upgrade are not resumed.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, each served task runs as a **local run**: the core's task file and
+  result are named by the run's id. The first run of a task keeps the task's local id; each later
+  one is `<local id>~~<n>` (`src/local_task_protocol.py`, `run_task_id` / `split_run_id`; no local id
+  contains `~~`, so the split is exact). A run id is allocated and saved before its task file is
+  published and is never used again. A result at an id with no live run of its task is moved to
+  `results/undelivered/`, never posted for the task's current run.
+- A run is bound to one execution generation once it can execute. A serve under a new lease for a
+  task whose run is already published is **held**: nothing is published, and its ack decides. If
+  the ack names the run's own generation (a lost ack re-served), the lease moves onto the run and
+  nothing re-runs. If it names a newer generation, the earlier run is stopped (its untaken task file
+  withdrawn, else a cancel naming that run), every effect it claimed is settled first under its
+  own operation id, and the generation gets a new run of its own, published from the held serve.
+  An answer that the earlier lease is gone, while a serve is held, is left to the held serve's ack.
+  A wake is a new run too, even under the same generation; a replay of the same episode reuses
+  its run and publishes nothing.
+- Every change to a task's attempt is one transition under that task's lock, committed to
+  `state/relay-task-ledger.json` under a file lock (re-read, compared, written to a temp file,
+  fsynced, renamed, directory fsynced). A remote effect (an ack, a cancel-ack, a result) is
+  claimed in one transition, made with no lock held, and committed in another only while the exact
+  claim still owns the exact run and generation. Its operation id rides the request as
+  `Idempotency-Key` and every retry reuses it; a result's outbox item records it. An effect whose
+  outcome is unknown (a timeout, a crash) keeps its claim and is reconciled under the same id. Each
+  start takes the ledger over with a new epoch, and a bridge whose epoch is gone makes no further
+  claim or call and stops polling. A ledger that cannot be locked, read or written is never written
+  over, and nothing that depends on it moves.
+- The result drain pins the file it will deliver as a hard link under `results/.delivering/` and
+  claims it for the run and generation in the same transition, before any effect (attachments,
+  Stop, settle, publish). A reply written at the result's name after that is a new result; one that
+  arrives after the task's lease closed is kept in `results/undelivered/` for review. A task id is
+  not retired while its pin is held, so the results directory must support hard links. Each
+  result is delivered on a worker of its own, so a send that hangs holds no other task's result.
+- Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
+  upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
+  resumed.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room
