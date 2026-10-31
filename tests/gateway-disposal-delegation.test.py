@@ -1227,7 +1227,7 @@ class BridgeDelegates(unittest.TestCase):
         self.assertIn("_retire_orphan", self.calls_in("_quarantine_orphan"))
         self.assertIn("_retire_orphan", self.calls_in("_reconcile_orphan_results"))
         self.assertIn("retire_generation", self.calls_in("_archive_result"))
-        for site in ("_post_ready_results", "_reconcile_orphan_results"):
+        for site in ("_deliver_ready", "_reconcile_orphan_results"):
             self.assertIn("_archive_result", self.calls_in(site))
 
     def test_an_unsent_reply_at_a_delivered_id_is_ruled_by_the_outbox_owner(self):
@@ -1281,7 +1281,7 @@ class BridgeDelegates(unittest.TestCase):
               "_write_owner_activity", "refresh_routing", "_durable_write", "_write_task",
               "_append_log_file", "_archive_task_file", "_archive_resolved_review",
               "_retry_review_control_results", "_post_proactive", "_recover_orphan_proactive",
-              "_retire_proactive", "_send_proactive", "_drop_staged", "_retract_generation",
+              "_retire_proactive", "_send_proactive", "_drop_staged", "_stop_run", "_drop_reserve",
               "_withdraw_closed"}
 
     def movers(self):

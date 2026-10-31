@@ -4179,13 +4179,13 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
             adopted = False
     if adopted:
         if isinstance(rec, dict):
-            _reserve_path(wire_tid).unlink(missing_ok=True)
+            _drop_reserve(wire_tid)
             _log(f"task {wire_tid}: re-served under the generation its run holds — the lease moves to the "
                  "run; nothing re-executes")
         return "stale" if rec in ("stale", "generation") else _ack_recorded(rec, gen)
     if not _reconcile_earlier_run(wire_tid):
-        _log_backoff((wire_tid, "earlier-run-effects"), f"task {wire_tid}: generation {gen} waits while its "
-                     "earlier run's effects may still be under way")
+        _log_backoff((wire_tid, "earlier-run-effects"), f"task {wire_tid}: its newer generation waits while "
+                     "the earlier run's effects may still be under way")
         return "unrecorded"
     try:
         context = task_attempts.serve_context(json.loads(_reserve_path(wire_tid).read_text()))
@@ -4195,13 +4195,13 @@ def _decide_held_serve(wire_tid: str, claim, doc, gen, open_turn: bool) -> str:
         if t.rec is task_attempts.UNKNOWN or not t.holds_claim(claim):
             return "unrecorded"
         earlier = t.rec.get("run")
-        if not _stop_run(t, earlier, f"generation {gen} of this task runs as its own run"):
+        if not _stop_run(t, earlier, "a newer generation of this task runs as its own run"):
             return "unrecorded"
         rec = t.switch_run(claim, doc, context, _reenroll_identity() or None, open_turn=open_turn)
     if not isinstance(rec, dict):
         return "unrecorded"
-    _log(f"task {wire_tid}: generation {gen} gets its own run {rec['run']}; the earlier run {earlier} is "
-         "stopped and its result is never posted for it")
+    _log(f"task {wire_tid}: generation {rec['execution_generation']} gets its own run {rec['run']}; the "
+         f"earlier run {earlier} is stopped and its result is never posted for it")
     return _ack_recorded(rec, gen)
 
 
@@ -4304,7 +4304,7 @@ def _ack_fenced(tid: str, claim, raw: str, published: bool) -> bool:
             if not (t.abandon_serve() and t.release_claim(claim)):
                 return True
             _forget_pending_ack(tid, lease_id)
-            _reserve_path(wire_tid).unlink(missing_ok=True)
+            _drop_reserve(wire_tid)
             if code == "stale_execution_generation":
                 _log(f"task ack for {tid}: its held re-serve was refused ({code}) — the run goes on")
                 return True
@@ -4408,7 +4408,7 @@ def _publish_owed_run(wire_tid: str, inflight: "set[str]") -> None:
         return
     with _ATTEMPTS.transition(wire_tid) as t:
         if t.rec.get("owed_publish") == run and t.put(owed_publish=None):
-            _reserve_path(wire_tid).unlink(missing_ok=True)
+            _drop_reserve(wire_tid)
 
 
 def _hold_in_flight(inflight: "set[str]", tids: "set[str]") -> bool:
@@ -5661,6 +5661,11 @@ def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tupl
 
 def _reserve_path(wire_tid: str) -> Path:
     return _STATE / f"relay-reserves{_INST_SUFFIX}" / f"{wire_tid}.json"
+
+
+def _drop_reserve(wire_tid: str) -> None:
+    """The held serve is decided: its saved task is no longer needed."""
+    _reserve_path(wire_tid).unlink(missing_ok=True)
 
 
 def _hold_reserve(t, first: str, task: dict, lease: "str | None") -> "tuple[str, None, bool] | None":

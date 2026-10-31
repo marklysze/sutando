@@ -12,7 +12,7 @@ lease and run). The rule fires once; a second match, or none by exit, is reporte
   stall  hold the matching call until the sentinel file is removed, then pass it through.
 
 Usage (all on the rig, at the exact head under test):
-  python3 tests/rig/lifecycle-fault-launcher.py --fault crash --kind ack --task <broker id> \\
+  python3 scripts/witness/lifecycle-fault-launcher.py --fault crash --kind ack --task <broker id> \\
       --lease <lease id> [--generation N|none] [--run <local run id>] --report <file.jsonl> \\
       [--sentinel <file>] [-- <bridge args>]
 

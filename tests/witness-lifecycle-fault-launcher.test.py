@@ -1,4 +1,4 @@
-"""The rig fault launcher's rule (tests/rig/lifecycle-fault-launcher.py): it fires on exactly the
+"""The rig fault launcher's rule (scripts/witness/lifecycle-fault-launcher.py): it fires on exactly the
 claimed effect it names, passes every other call through unchanged, and reports a second match.
 
 Run:
@@ -11,7 +11,7 @@ import types
 import unittest
 from pathlib import Path
 
-PATH = Path(__file__).resolve().parent / "rig" / "lifecycle-fault-launcher.py"
+PATH = Path(__file__).resolve().parents[1] / "scripts" / "witness" / "lifecycle-fault-launcher.py"
 spec = importlib.util.spec_from_file_location("lifecycle_fault_launcher", PATH)
 launcher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(launcher)
@@ -42,10 +42,10 @@ class Launcher(unittest.TestCase):
         real_sleep = launcher.time.sleep
         launcher.time.sleep = lambda s: sentinel.unlink(missing_ok=True)     # the operator releases it
         self.addCleanup(setattr, launcher.time, "sleep", real_sleep)
-        self.mod._req("POST", "/v1/tasks/task-a/ack", {"id": "task-a"}, operation_id="ack-1")    # another kind
-        self.mod._req("POST", "/v1/results", {"id": "task-b", "execution_generation": 2})          # another task
-        self.mod._req("POST", "/v1/results", {"id": "task-a", "execution_generation": 1})          # no such claim
-        self.assertEqual(rule.matches, [])
+        self.mod._req("POST", "/v1/tasks/task-a/ack", {"id": "task-a"}, operation_id="ack-1")
+        self.mod._req("POST", "/v1/results", {"id": "task-b", "execution_generation": 2})
+        self.mod._req("POST", "/v1/results", {"id": "task-a", "execution_generation": 1})
+        self.assertEqual(rule.matches, [], "another kind, another task, a generation never claimed")
         self.assertEqual(len(self.sent), 3, "unmatched calls go through unchanged")
         self.mod._req("POST", "/v1/results", {"id": "task-a", "execution_generation": 2})
         self.assertEqual([m["op"] for m in rule.matches], ["result-1"])
