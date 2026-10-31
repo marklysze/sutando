@@ -421,6 +421,17 @@ Sutando checkout around it sends neither field.
   run without its answer. Without turn context, for an `ack_first` wake, or for an episode already run
   here, it is left unacked, whether or not this node saw its first attempt. With the flag off it is an
   ordinary task, as before.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, each serve records its `lease_id` with the attempt, and an ack's
+  answer (accepted, `not leased`, or a fencing refusal) or a beat's error acts on the attempt only
+  while it still holds that serve; an answer about an earlier serve changes nothing. An attempt
+  awaiting a newer serve's ack does not beat.
+- With `REMOTE_TASK_LIFECYCLE_V2=1`, the result drain first pins the file it will deliver as a hard
+  link under `results/.delivering/`, and every step of that delivery (attachments, Stop, settle,
+  publish) uses the pinned bytes. A reply written at the result's name after that is a new result;
+  one that arrives after the task's lease closed is kept in `results/undelivered/` for review. A
+  task id is not retired while its pin is held, so the results directory must support hard links.
+  When a newer generation is acked, an earlier generation's failure result that was published but
+  never sent is taken back from the outbox; an ack that finds it sending is retried.
 
 With `REMOTE_TASK_TURN_CONTEXT=1` too, the ack writes the attempt's read-only turn file
 `state/turns/<task_id>_g<gen>_<ulid>.json` (`src/agent_turn.py`), which the MCP proxy binds room

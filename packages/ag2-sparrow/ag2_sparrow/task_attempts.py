@@ -75,7 +75,8 @@ WAKE_TURN_RULE = (
     "again, starting it with `[no-send]` when there is nothing to post.")
 
 _MUTEX = threading.Lock()
-# wake_item() when its records cannot be read: no delivery is attempted and nothing is decided.
+# An attempt whose record cannot be read (an unreadable ledger, or an entry that is not a record):
+# it is held, and nothing is posted, settled, retired or swept for it.
 UNKNOWN = "<unknown>"
 # A record without it predates generation-stamped debts: it is held untouched until migrated.
 SCHEMA = 2
@@ -178,7 +179,10 @@ class TaskAttempts:
             if data is None:
                 self.log(f"task {wire_tid}: {self.path.name} unreadable — not written")
                 return {}, False
-            old = data.get(wire_tid)
+            old = _entry_of(data, wire_tid)
+            if old is UNKNOWN:
+                self.log(f"task {wire_tid}: its attempt record is not a record — not written")
+                return {}, False
             rec = {**(old or {"schema": SCHEMA}), **fields}
             for k in DEBTS:
                 if isinstance(fields.get(k), dict) and "gen" not in fields[k]:
@@ -187,7 +191,16 @@ class TaskAttempts:
             return rec, self._save(data)
 
     def get(self, wire_tid: str) -> dict:
-        return dict(self._load().get(wire_tid) or {})
+        """For inspection only (the bridge reads through `entry`): the record, {} when there is none."""
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            raise ValueError(f"attempt record {wire_tid} cannot be read")
+        return rec or {}
+
+    def entry(self, wire_tid: str) -> "dict | None | str":
+        """The attempt's record, None when there is none, or UNKNOWN when it cannot be read. Every
+        reader goes through this, so all of them agree on what a damaged ledger means."""
+        return _entry_of(self._read_json(self.path), wire_tid)
 
     def worker_id(self) -> str:
         """One lease-holder id per install, the same on ack, beats, results and cancel-ack. One that
@@ -211,10 +224,11 @@ class TaskAttempts:
     def ack_fields(self) -> dict:
         return {"worker_id": self.worker_id(), "protocol_version": PROTOCOL_VERSION}
 
-    def remember_task(self, wire_tid: str, task: dict) -> bool:
-        """Room context for the turn file, and the moment the task was published: until the ack
-        names the generation, the task's result waits and its room actions are unbound. False when
-        it could not be saved: the task is not queued or acked."""
+    def remember_task(self, wire_tid: str, task: dict, lease: "str | None" = None) -> bool:
+        """Room context for the turn file, the moment the task was published, and the lease it was
+        served under: until the ack names the generation, the task's result waits and its room
+        actions are unbound, and only an answer about that lease acts on the record. False when it
+        could not be saved: the task is not queued or acked."""
         def s(*keys):
             for k in keys:
                 v = task.get(k)
@@ -222,27 +236,33 @@ class TaskAttempts:
                     return v
             return None
         with self.lock:                 # a serve is a transition: no settlement straddles it
-            return self._merge(wire_tid, dict(
+            rec = self.entry(wire_tid)
+            published = rec.get("published_at") if isinstance(rec, dict) else None
+            return self._merge(wire_tid, dict(   # an unreadable record is refused by the write
                 room_id=s("source_room_id", "channel_id"), thread_root_id=s("thread_root"),
                 source_event_id=s("source_event_id", "source_message_id", "event_id"),
-                source_kind=s("source_kind", "interaction_type"), awaiting_ack=True,
-                published_at=self.get(wire_tid).get("published_at") or self.now()))[1]
+                source_kind=s("source_kind", "interaction_type"), awaiting_ack=True, lease_id=lease,
+                published_at=published or self.now()))[1]
 
     def record_ack(self, wire_tid: str, response, agent_mxid: str | None = None,
-                   open_turn: bool = True) -> dict | None:
-        """Store the generation the ack reported; publish the turn file when turn context is on
-        and `open_turn` (the task can still run)."""
+                   open_turn: bool = True, lease: "str | None" = None) -> dict | None:
+        """Store the generation the ack of the serve under `lease` reported; publish the turn file
+        when turn context is on and `open_turn` (the task can still run). The caller has matched
+        the serve under the attempts lock."""
         if not isinstance(response, dict):
-            self.ack_settled(wire_tid)
+            self.ack_settled(wire_tid, lease)
             return None
         gen = response.get("execution_generation")
         if type(gen) is not int or gen < 1:
-            self.ack_settled(wire_tid)
+            self.ack_settled(wire_tid, lease)
             return None
         if not self.broker_names_leases():
             # Before the same-generation return, so a re-ack repairs a contract write that failed.
             self._save_json(self._contract_path, {"names_lease_generation": True})
-        rec = self.get(wire_tid)
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            return None
+        rec = rec or {}
         if rec.get("execution_generation") == gen and (rec.get("turn_id") or not self.turn_context
                                                        or not open_turn):
             return self._update(wire_tid, awaiting_ack=False)
@@ -292,12 +312,13 @@ class TaskAttempts:
         """One beat for every live attempt; returns the fencing errors it was answered with."""
         if self._task_beat_disabled:
             return []
-        data = self._load()
-        tasks = []
+        data = self._read_json(self.path)
+        tasks, leases = [], {}
         for tid in sorted(wire_tids):
-            rec = data.get(tid) or {}
-            if not _beats(rec):
+            rec = _entry_of(data, tid)
+            if not isinstance(rec, dict) or not _beats(rec):
                 continue
+            leases[tid] = rec.get("lease_id")
             item = {"task_id": tid, "worker_id": self.worker_id(),
                     "execution_generation": rec["execution_generation"]}
             if phase:
@@ -322,15 +343,15 @@ class TaskAttempts:
             return []
         errors = resp.get("task_errors") if isinstance(resp, dict) else None
         sent = {t["task_id"]: t["execution_generation"] for t in tasks}
-        # Each error names the generation its beat was sent for: it may act only on that one.
-        return [{**e, "beat_generation": sent.get(e.get("task_id"))} for e in errors or []
-                if isinstance(e, dict) and e.get("error_code") in FENCING_CODES]
+        # Each error names the serve and generation its beat was sent for: it acts only on those.
+        return [{**e, "beat_generation": sent.get(e.get("task_id")), "beat_lease": leases.get(e.get("task_id"))}
+                for e in errors or [] if isinstance(e, dict) and e.get("error_code") in FENCING_CODES]
 
     def dispatch_lost_due(self, wire_tid: str, live: bool, last_activity: "float | None") -> bool:
         """True once this attempt has had no live dispatch (no task file, result or claim) and no
         turn activity for DISPATCH_LOST_S: the core will never answer it, so beats must not hold it."""
-        rec = self.get(wire_tid)
-        if not _beats(rec):
+        rec = self.entry(wire_tid)
+        if not isinstance(rec, dict) or not _beats(rec):
             return False
         if live:
             if rec.get("missing_since") is not None:
@@ -347,7 +368,8 @@ class TaskAttempts:
         """True once the core engaged this attempt's queued task file (a turn row newer than the file)
         and then wrote no turn row or result while it is not mid-turn: STALLED_S when the core reads
         idle, STALLED_UNOBSERVED_S when its motion is unknown, never while it reads moving."""
-        if not _beats(self.get(wire_tid)) or queued_at is None or last_activity is None:
+        rec = self.entry(wire_tid)
+        if not isinstance(rec, dict) or not _beats(rec) or queued_at is None or last_activity is None:
             return False
         if core_motion == "moving":
             return False
@@ -359,37 +381,36 @@ class TaskAttempts:
         return self._set(wire_tid, dispatch_lost={"body": body})
 
     def records(self) -> "dict | None":
-        """Every attempt record, or None when the ledger cannot be read."""
+        """Every attempt, as `entry` reads it (a record or UNKNOWN); None when the ledger cannot be read."""
         data = self._read_json(self.path)
-        return None if data is None else {t: r for t, r in data.items() if isinstance(r, dict)}
+        return None if data is None else {t: _entry_of(data, t) for t in data}
 
     def owing(self) -> "set[str] | None":
-        """Every task whose record still owes work; None when the ledger cannot be read."""
+        """Every task whose record still owes work or cannot be read; None when the ledger cannot be read."""
         data = self.records()
-        return None if data is None else {t for t, r in data.items() if _owes(r)}
+        return None if data is None else {t for t, r in data.items() if r is UNKNOWN or _owes(r)}
 
     def holds(self, wire_tid: str) -> bool:
-        """Whether this attempt must stay in flight: it beats, owes work or awaits its migration.
-        A ledger that cannot be read holds every attempt: unknown is not released."""
-        data = self._read_json(self.path)
-        if data is None or not isinstance(data.get(wire_tid, {}), dict):
+        """Whether this attempt must stay in flight: it beats, owes work, awaits its migration or
+        cannot be read. Unknown is never released."""
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
             return True
-        rec = data.get(wire_tid) or {}
-        return (_beats(rec) and not self._task_beat_disabled) or _owes(rec)
+        return bool(rec) and ((_beats(rec) and not self._task_beat_disabled) or _owes(rec))
 
     def beating(self, wire_tids) -> bool:
         """Whether any of these attempts is due per-task beats."""
         if self._task_beat_disabled:
             return False
-        data = self._load()
-        return any(_beats(data.get(t) or {}) for t in wire_tids)
+        data = self._read_json(self.path)
+        return any(isinstance(r, dict) and _beats(r) for r in (_entry_of(data, t) for t in wire_tids))
 
     def fence(self, wire_tid: str, error: dict, **extra) -> dict:
         """Mark the attempt fenced, with `extra` fields in the same write. The caller stops the core's
         work on it when `cancel` is set; `unsaved` when nothing was recorded and nothing may act on it."""
         code = str(error.get("error_code") or "")
-        rec = self.get(wire_tid)
-        if rec.get("fenced") == code:
+        rec = self.entry(wire_tid)
+        if isinstance(rec, dict) and rec.get("fenced") == code:
             return {"new": False, "cancel": False}
         if not self._set(wire_tid, fenced=code, awaiting_ack=False,
                          cancel_requested_generation=error.get("cancel_requested_generation"),
@@ -402,8 +423,8 @@ class TaskAttempts:
     def request_stop(self, wire_tid: str, error: dict, stop_ctl: "str | None" = None) -> bool:
         """A Stop reported by a beat: a request, not a fence, so a result the core still writes is
         delivered. True the first time it is recorded, when the caller asks the core to stop."""
-        rec = self.get(wire_tid)
-        if rec.get("stop_requested") or rec.get("fenced"):
+        rec = self.entry(wire_tid)
+        if not isinstance(rec, dict) or rec.get("stop_requested") or rec.get("fenced"):
             return False
         owed = {"owed_ctl": {"id": stop_ctl, "reason": "task_cancelled"}} if stop_ctl else {}
         if not self._set(wire_tid, stop_requested=True, stop_ctl=stop_ctl, **owed,
@@ -426,7 +447,10 @@ class TaskAttempts:
     def stop_by_result(self, wire_tid: str, body: str, no_send: bool) -> "bool | None":
         """A result with nothing to deliver while a Stop is pending confirms the Stop: None when it
         does not apply, else whether the cancel-ack landed (False is retried by the next pass)."""
-        rec = self.get(wire_tid)
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            return False
+        rec = rec or {}
         if not (rec.get("stop_requested") or rec.get("stop_confirmed")) or (body.strip() and not no_send):
             return None
         if rec.get("stop_requested"):
@@ -435,8 +459,8 @@ class TaskAttempts:
         return self.cancel_ack(wire_tid)
 
     def cancel_ack(self, wire_tid: str) -> bool:
-        rec = self.get(wire_tid)
-        if rec.get("fenced") != "task_cancelled" and not rec.get("stop_confirmed"):
+        rec = self.entry(wire_tid)
+        if not isinstance(rec, dict) or (rec.get("fenced") != "task_cancelled" and not rec.get("stop_confirmed")):
             return False
         body = {"worker_id": self.worker_id(),
                 "cancel_requested_generation": rec.get("cancel_requested_generation"),
@@ -456,25 +480,31 @@ class TaskAttempts:
 
     # ── result ───────────────────────────────────────────────────────────
     def result_fields(self, wire_tid: str) -> dict:
-        rec = self.get(wire_tid)
-        gen = rec.get("execution_generation")
+        rec = self.entry(wire_tid)
+        gen = rec.get("execution_generation") if isinstance(rec, dict) else None
         return ({"execution_generation": gen, "worker_id": self.worker_id()}
                 if type(gen) is int else {})
 
-    def ack_settled(self, wire_tid: str) -> bool:
-        """The ack is answered without a generation (a legacy broker): nothing to wait for. False
-        when that could not be recorded."""
-        data = self._read_json(self.path)
-        if data is None:
-            return False
-        return not (data.get(wire_tid) or {}).get("awaiting_ack") or self._set(wire_tid, awaiting_ack=False)
+    def ack_settled(self, wire_tid: str, lease: "str | None" = None) -> bool:
+        """The ack of the serve under `lease` is answered without a generation (a legacy broker, or
+        the lease is gone): nothing to wait for. An answer about another serve changes nothing.
+        False when the record cannot be read or the change could not be recorded."""
+        with self.lock:
+            rec = self.entry(wire_tid)
+            if rec is UNKNOWN:
+                return False
+            if not rec or not rec.get("awaiting_ack") or not same_serve(rec, lease):
+                return True
+            return self._set(wire_tid, awaiting_ack=False)
 
     def result_hold(self, wire_tid: str) -> "str | None":
         """Why this result must wait for its ack, or None when it may go now. A broker known to
         name leases is never assumed legacy because one ack went unanswered: the result waits
         until the ack lands, the attempt is fenced, or the server closes the task."""
-        rec = self.get(wire_tid)
-        if not rec.get("awaiting_ack") or rec.get("fenced"):
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            return "its attempt record cannot be read"
+        if not rec or not rec.get("awaiting_ack") or rec.get("fenced"):
             return None
         if self.now() - float(rec.get("published_at", 0)) < ACK_HOLD_MAX_S:
             return "its ack has not named the lease yet"
@@ -493,7 +523,10 @@ class TaskAttempts:
     def result_decision(self, wire_tid: str, body: str, no_send: bool, identity=None):
         """The turn gate's ruling on this result, or None when the attempt has no turn. `identity` is
         the result file's (`result_ready.ResultIdentity`): only it can show who wrote the file."""
-        rec = self.get(wire_tid)
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            return agent_turn.ResultDecision(agent_turn.DEFER, {}, "its attempt record cannot be read")
+        rec = rec or {}
         if rec.get("fenced") in ("task_cancelled", "cancel_confirmed", "stale_execution_generation",
                                  "task_already_terminal", "task_not_found"):
             return agent_turn.ResultDecision(agent_turn.SETTLE, {}, f"attempt fenced ({rec['fenced']})")
@@ -522,12 +555,16 @@ class TaskAttempts:
         wake's episode (as seen) and then its item are saved before the attempt is retired. False
         only when one of those writes failed or a record could not be read: the attempt is kept,
         and the caller keeps its result live to retry."""
-        with self.lock, _MUTEX:
+        with _MUTEX:
             data = self._read_json(self.path)
             if data is None:
                 self.log(f"task {wire_tid}: {self.path.name} unreadable — attempt kept")
                 return False
-            rec = data.get(wire_tid) or {}
+            rec = _entry_of(data, wire_tid)
+            if rec is UNKNOWN:
+                self.log(f"task {wire_tid}: its attempt record is not a record — attempt kept")
+                return False
+            rec = rec or {}
             if attempt is not None and any(rec.get(k) != attempt.get(k) for k in IDENTITY):
                 if attempt.get("turn_id"):
                     self._close_turn(attempt["turn_id"])
@@ -573,7 +610,11 @@ class TaskAttempts:
             return None
         if episode in wakes.get(wire_tid, []):
             return None
-        rec = self.get(wire_tid)
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
+            self.log(f"task {wire_tid}: wake {episode} not run, its attempt record cannot be read")
+            return None
+        rec = rec or {}
         if rec.get("wake_episode") != episode:
             if rec and rec.get("schema") != SCHEMA:
                 self.log(f"task {wire_tid}: wake {episode} not run, its record awaits its migration")
@@ -588,7 +629,11 @@ class TaskAttempts:
                 if data is None:
                     self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
                     return None
-                data[wire_tid] = {**data.get(wire_tid, {"schema": SCHEMA}), "wake_episode": episode,
+                cur = _entry_of(data, wire_tid)
+                if cur is UNKNOWN:
+                    self.log(f"task {wire_tid}: wake {episode} not saved — left unacked for a re-serve")
+                    return None
+                data[wire_tid] = {**(cur or {"schema": SCHEMA}), "wake_episode": episode,
                                   "turn_id": None, "issued_at": None, "execution_generation": None,
                                   "fenced": None, "published_at": None, "hold_reported": None}
                 if not self._save(data):
@@ -600,10 +645,10 @@ class TaskAttempts:
         """The outbox item for a woken attempt's result, distinct from the first attempt's: the open
         wake's, else a settled wake's until its task leaves flight (its result may still be live).
         UNKNOWN when the records that decide it cannot be read."""
-        data = self._read_json(self.path)
-        if data is None:
+        rec = self.entry(wire_tid)
+        if rec is UNKNOWN:
             return UNKNOWN
-        episode = (data.get(wire_tid) or {}).get("wake_episode")
+        episode = (rec or {}).get("wake_episode")
         if episode:
             return f"{wire_tid}.wake-{episode}"
         items = self._read_json(self._wake_items_path)
@@ -615,10 +660,15 @@ class TaskAttempts:
     def close_finished_turns(self, live_wire_tids) -> int:
         """Close every open turn whose task is no longer in flight, or which a newer generation of its
         task replaced: the retry for a close the journal lock deferred. Attempts are left as they are."""
-        live, data, closed = set(live_wire_tids), self._load(), 0
+        live, data, closed = set(live_wire_tids), self._read_json(self.path), 0
+        if data is None:
+            return 0
         for p in agent_turn.open_turns(self.state_dir):
             task = (agent_turn.read_turn_context(p) or {}).get("task_id")
-            current = (data.get(task) or {}).get("turn_id")
+            rec = _entry_of(data, task)
+            if rec is UNKNOWN:
+                continue
+            current = (rec or {}).get("turn_id")
             if task not in live or (current and current != p.stem):
                 self._close_turn(p.stem)
                 if p.exists():
@@ -676,7 +726,7 @@ class TaskAttempts:
         hold. An attempt is aged from its ack, or from its first publication when no ack answered.
         Not being listed is never a terminal status: only a beat's or an ack's answer fences."""
         listed = {t["task_id"]: t for t in server_tasks}
-        data = self._load()
+        data = {t: r for t, r in (self.records() or {}).items() if isinstance(r, dict)}
         now = self.now()
         unlisted = sorted(t for t in local_wire_tids if t not in listed and t in data
                         and now - float(data[t].get("acked_at", data[t].get("published_at", now)))
@@ -762,6 +812,21 @@ def file_identity(path: Path) -> list:
     return list(identity_of(path)[1])
 
 
+def _entry_of(data: "dict | None", wire_tid) -> "dict | None | str":
+    if data is None:
+        return UNKNOWN
+    if wire_tid not in data:
+        return None
+    rec = data[wire_tid]
+    return dict(rec) if isinstance(rec, dict) else UNKNOWN
+
+
+def same_serve(rec: dict, lease: "str | None") -> bool:
+    """Whether an answer about the serve under `lease` is about the serve this record holds. A record
+    saved before serves were named in it matches any lease."""
+    return "lease_id" not in rec or rec["lease_id"] == lease
+
+
 def owns_result(rec: dict, identity) -> bool:
     """Whether the result file with `identity` is the failure this attempt's record wrote: the
     record names the file it created, so a core answer is never taken for it, whatever its text.
@@ -788,12 +853,13 @@ def _owes(rec) -> bool:
 
 
 # What one attempt is: a record that differs in any of these has moved on to another attempt.
-IDENTITY = ("execution_generation", "attempt", "turn_id", "wake_episode")
+IDENTITY = ("execution_generation", "attempt", "turn_id", "wake_episode", "lease_id")
 
 
 def _beats(rec: dict) -> bool:
+    # A record awaiting a newer serve's ack holds no live lease to beat for until that ack.
     return (type(rec.get("execution_generation")) is int and not rec.get("fenced")
-            and not rec.get("dispatch_lost"))
+            and not rec.get("dispatch_lost") and not rec.get("awaiting_ack"))
 
 
 def last_activity(state_dir: Path, task_id: str) -> "float | None":

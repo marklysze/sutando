@@ -119,10 +119,9 @@ class Attempts(unittest.TestCase):
         a.sweep(set())
         self.assertEqual((bool(a.get("tsk_A")), bool(a.get("tsk_B"))), (True, False))
 
-    def migrate(self, a, ids=None, failure=("body", None)):
-        ids = ids or iter(f"ctl-{i}" for i in range(10))
+    def migrate(self, a, failure=("body", None)):
         return task_attempt_migrations.migrate(
-            a, self.tasks, local_tid=lambda t: t, new_ctl=lambda: next(ids), failure_of=lambda t: failure,
+            a, self.tasks, local_tid=lambda t: t, failure_of=lambda t: failure,
             log=self.logs.append)
 
     @property
@@ -146,8 +145,10 @@ class Attempts(unittest.TestCase):
         self.assertTrue(self.migrate(a, failure=("body of lost", None)))
         got = a._load()
         self.assertEqual(got["lost"]["dispatch_lost"], {"body": "body of lost", "gen": 1, "file": None})
-        self.assertEqual((got["stop"]["stop_ctl"], got["stop"]["owed_ctl"]["id"]), ("ctl-0", "ctl-0"))
-        self.assertEqual((got["stale"]["fence_ctl"], got["stale"]["owed_ctl"]["id"]), ("ctl-1", "ctl-1"))
+        # A control the record does not name, and none queued or claimed: it may have run already.
+        self.assertEqual((got["stop"]["stop_ctl"], got["stop"].get("owed_ctl")), (None, None))
+        self.assertEqual((got["stale"]["fence_ctl"], got["stale"].get("owed_ctl")), (None, None))
+        self.assertEqual(list(self.tasks.iterdir()), [], "no cancel is minted")
         self.assertEqual(got["closed"]["owed_close"]["gen"], 1)
         self.assertFalse(task_attempts._owes(got["done"]), "a confirmed cancel owes nothing")
         self.assertTrue(self.migrate(a), "idempotent")
@@ -201,7 +202,7 @@ class Attempts(unittest.TestCase):
         queue = self.state / "queue"
 
         def migrate():
-            return task_attempt_migrations.migrate(a, queue, local_tid=lambda t: t, new_ctl=lambda: "c",
+            return task_attempt_migrations.migrate(a, queue, local_tid=lambda t: t,
                                                    failure_of=lambda t: ("b", None), log=self.logs.append)
         queue.write_text("not a directory")
         self.assertIsNone(migrate(), "a queue that is a file cannot be read")
@@ -275,7 +276,7 @@ class Attempts(unittest.TestCase):
         def unreadable(t):
             raise task_attempt_migrations.Unknown(t)
         self.assertIsNone(task_attempt_migrations.migrate(
-            a, self.tasks, local_tid=lambda t: t, new_ctl=lambda: "c", failure_of=unreadable,
+            a, self.tasks, local_tid=lambda t: t, failure_of=unreadable,
             log=self.logs.append))
         self.assertEqual(a._load(), base)
 
@@ -299,7 +300,7 @@ class Attempts(unittest.TestCase):
         a = self.mk()
         a.path.write_text(json.dumps({"stop": {"execution_generation": 1, "stop_requested": True}}))
         self.assertIsNone(task_attempt_migrations.migrate(
-            a, self.state / "gone" / "tasks", local_tid=lambda t: t, new_ctl=lambda: "c",
+            a, self.state / "gone" / "tasks", local_tid=lambda t: t,
             failure_of=lambda t: ("b", None), log=self.logs.append), "an unmounted workspace is not empty")
 
     def test_older_marker_shapes_carry_the_records_generation(self):
@@ -719,6 +720,44 @@ class Attempts(unittest.TestCase):
         self.assertTrue(lines[-1].startswith("task: CANCEL_INSTRUCTION: stop processing task-x "))
         self.assertIn(f"source: {task_attempts.CONTROL_SOURCE}", lines)
 
+    # ── one typed reader: every method holds an entry it cannot read ──
+    def test_every_reader_holds_an_entry_that_is_not_a_record(self):
+        for damage in ("damaged", None, [], 0, False):
+            with self.subTest(damage=damage):
+                a = self.mk(turn_context=True)
+                a.path.write_text(json.dumps({"tsk_A": damage}))
+                self.assertIs(a.entry("tsk_A"), task_attempts.UNKNOWN)
+                self.assertEqual(a.result_hold("tsk_A"), "its attempt record cannot be read")
+                self.assertEqual(a.result_decision("tsk_A", "body", False).action, task_attempts.agent_turn.DEFER)
+                self.assertIs(a.stop_by_result("tsk_A", "", True), False)
+                self.assertTrue(a.fence("tsk_A", {"error_code": "task_cancelled"}).get("unsaved"))
+                self.assertIs(a.finish("tsk_A"), False)
+                self.assertIsNone(a.open_wake("tsk_A", {"blocker_episode_id": "e1"}))
+                self.assertEqual(a.wake_item("tsk_A"), task_attempts.UNKNOWN)
+                self.assertFalse(a.remember_task("tsk_A", {"id": "tsk_A"}))
+                self.assertEqual(json.loads(a.path.read_text()), {"tsk_A": damage}, "never rewritten")
+
+    def test_a_turn_whose_record_cannot_be_read_is_left_open(self):
+        a = self.mk(turn_context=True)
+        a.remember_task("tsk_A", {"id": "tsk_A"})
+        turn = a.record_ack("tsk_A", _ack(1))["turn_id"]
+        a.path.write_text(json.dumps({"tsk_A": "damaged"}))
+        self.assertEqual(a.close_finished_turns(set()), 0)
+        self.assertFalse(task_attempts.agent_turn.is_closed(self.state, turn))
+
+    def test_a_result_settled_for_an_earlier_serve_keeps_the_newer_one(self):
+        a = self.mk()
+        a.remember_task("tsk_A", {"id": "tsk_A"}, lease="L1")
+        a.record_ack("tsk_A", _ack(1), lease="L1")
+        ruled = a.get("tsk_A")
+        a.remember_task("tsk_A", {"id": "tsk_A"}, lease="L2")             # served again, same generation
+        self.assertTrue(a.finish("tsk_A", ruled))
+        self.assertEqual(a.get("tsk_A").get("lease_id"), "L2", "only the settled serve is retired")
+
+    def test_a_record_saved_before_serves_were_named_matches_any_lease(self):
+        self.assertTrue(task_attempts.same_serve({"execution_generation": 1}, "L9"))
+        self.assertFalse(task_attempts.same_serve({"lease_id": None}, "L9"))
+        self.assertTrue(task_attempts.same_serve({"lease_id": "L9"}, "L9"))
 
 class FailurePaths(unittest.TestCase):
     """Every failure costs one pass and a log line; none raises into the bridge."""
