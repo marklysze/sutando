@@ -22,6 +22,7 @@ this launcher. Not part of the product; nothing imports it.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import importlib.util
 import json
@@ -63,12 +64,17 @@ class Rule:
         if target != self.task:
             return None
         claim = self.claim_of(record, op, payload)
-        if not claim or claim.get("kind") != ("ack" if self.kind == "ack" else self.kind):
+        if not claim or claim.get("kind") != self.kind:
             return None
+        # An ack's claim names the serve it answers; any other effect is the record's current lease.
+        lease = claim.get("serve") if self.kind == "ack" else (record or {}).get("lease_id")
+        identity = {"task": target, "op": claim["op"], "kind": claim["kind"], "run": claim.get("run"),
+                    "execution_generation": claim.get("execution_generation"),
+                    "wake_episode": claim.get("wake_episode"), "lease_id": lease, "epoch": claim.get("epoch")}
         want = {"lease_id": self.lease, "execution_generation": self.generation, "run": self.run}
-        if any(v is not None and v != "*" and claim.get(k) != (None if v == "none" else v) for k, v in want.items()):
+        if any(v is not None and v != "*" and identity[k] != (None if v == "none" else v) for k, v in want.items()):
             return None
-        return claim
+        return identity
 
 
 def _sha256(path: Path) -> str:
@@ -77,7 +83,7 @@ def _sha256(path: Path) -> str:
 
 def _report(path: Path, line: dict) -> None:
     with open(path, "a") as fh:
-        fh.write(json.dumps({"at": time.time(), **line}, sort_keys=True) + "\n")
+        fh.write(json.dumps({"at": time.time(), **line}, sort_keys=True, default=str) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -142,7 +148,8 @@ def main(argv=None) -> None:
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     identity = {"event": "loaded", "head": head, "loader": str(LOADER), "loader_sha256": _sha256(LOADER),
                 "module_file": str(Path(mod._IMPL).resolve()), "module_sha256": _sha256(Path(mod._IMPL)),
-                "runtime_identity": mod.RUNTIME_IDENTITY, "rule": vars(args) | {"generation": generation}}
+                "runtime_identity": mod.RUNTIME_IDENTITY,
+                "rule": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()} | {"generation": generation}}
     print(json.dumps(identity, sort_keys=True, default=str), flush=True)
     _report(args.report, identity)
     install(mod, rule, args.fault, args.report, args.sentinel)
@@ -150,7 +157,6 @@ def main(argv=None) -> None:
     def zero_matches():
         if not rule.matches:
             _report(args.report, {"event": "FAIL: the rule never matched"})
-    import atexit
     atexit.register(zero_matches)
     mod.__name__ = "__main__"
     mod.VOICE_ROOM_VERIFIER.start()
