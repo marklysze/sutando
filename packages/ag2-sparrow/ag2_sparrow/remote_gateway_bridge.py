@@ -3437,7 +3437,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
         body.update(_ATTEMPTS.ack_fields())
     try:
         doc = _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=_ACK_TIMEOUT_S)
-        if not _record_attempt(wire_tid, doc):
+        if not _record_attempt(wire_tid, doc, lease=lease_id):
             _log_backoff((tid, "ack-unrecorded"), f"ack_first task {tid}: accepted, but its generation "
                          "could not be recorded — kept staged, retrying")
             return "retry"

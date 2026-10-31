@@ -1246,6 +1246,18 @@ class Hooks(unittest.TestCase):
         self.ran(tid)
         self.posted_once_under_its_generation(fake, tid, inflight)
 
+    def test_a_leased_ack_first_task_ends_its_ack_wait_and_its_reply_is_posted(self):
+        tid = "task-af-leased"
+        fake = self.use(FakeGateway(**{"/v1/results": {"ok": True}, f"/v1/tasks/{tid}/ack": _ack(tid, 1)}))
+        inflight = set()
+        self.assertTrue(gw._take_ack_first(_task(tid, ack_first=True, lease_id="LA"), inflight, {}))
+        self.assertEqual(fake.posted("/ack")[0]["lease_id"], "LA")
+        rec = gw._ATTEMPTS.get(tid)
+        self.assertFalse(rec.get("awaiting_ack"), "the ack of the serve that holds the lease is recorded")
+        self.assertEqual(rec["execution_generation"], 1)
+        self.ran(tid)
+        self.posted_once_under_its_generation(fake, tid, inflight)
+
     def test_beat_fences_and_stops_act_only_once_recorded(self):
         for code in ("stale_execution_generation", "task_cancelled"):
             with self.subTest(code=code):
