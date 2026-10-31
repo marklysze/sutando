@@ -251,6 +251,11 @@ describe('a change runs on the first call, then the model says what it did', () 
 		assert.equal((f.calls.find(c => c.name === 'room.action.execute')!.args as { arguments: { invitee: string } }).arguments.invitee, '@chi:ag2.space');
 		assert.deepEqual(await runAction({ action: 'room.commons.summon', arguments_json: '{"kind":"board"}', room: '!r:ag2.space' }, f.deps), { ok: false, error: 'no_invitee' });
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.summon/);
+		// Phone 2026-10-30 22:12Z: "summon me to Commons bug 复现步骤" was sent with kind markdown, so the phone opened the Doc list, not the page.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /for a named document, kind is that page's own kind from search_commons \(markdown-a1b2c3d4\), never the bare surface \(markdown\)/);
+		// Phone/desktop 2026-10-30 22:0xZ: the call service drew the page list on the agent's own call tile and the agent said it was "on your screen".
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /never draw a page, a list or its contents on your own call screen or any display of yours/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /never call show_in_live: it puts text on your call video, not on the user's screen/);
 	});
 
 	it('an approval the room requires is said', async () => {
